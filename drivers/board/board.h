@@ -69,6 +69,7 @@ enum {
 	HAKIOS_HAS_TOUCH_GT9889    = 1u << 22,  /* a Goodix GT9889 (GT9886 family, "Normandy") on I2C, wired as touch-i2c { }
 	                                         * says, the same section as the FT5x06's (board/gt9889.c) */
 	HAKIOS_HAS_WIFI_WCN3990    = 1u << 27,  /* a WCN3990 run through an SM7150's modem, as the Pixel 4a has it (board/sm7150_mpss.c) */
+	HAKIOS_HAS_GPU_A618        = 1u << 28,  /* an SM7150's Adreno 618, as the Pixel 4a has it (board/adreno_a618.c) */
 	HAKIOS_HAS_CPUFREQ_SCMI = 1u << 16,     /* CPU performance queries via SCMI */
 	HAKIOS_HAS_HAPTIC_PMIC_LDO = 1u << 25,  /* a vibration motor on a PMIC's vibrator LDO, wired as vibrator { } says
 	                                         * (board/haptic_ldo.c) */
