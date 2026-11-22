@@ -82,7 +82,7 @@ diff --git a/bsd/conf/Makefile.arm64 b/bsd/conf/Makefile.arm64
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,59 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -108,6 +108,62 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c         optional config_cpu_counters
@@ -96,6 +96,9 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 +bsd/dev/board/fts.c	standard
 +bsd/dev/board/ft5x06.c	standard
 +bsd/dev/board/gt9889.c	standard
++bsd/dev/board/sm7150_rpmh.c	standard
++bsd/dev/board/sm7150_wlan_util.c	standard
++bsd/dev/board/sm7150_mpss.c	standard
 +bsd/dev/board/cputop.c	standard
 +bsd/dev/board/buttons.c	standard
 +bsd/dev/board/rtc.c	standard

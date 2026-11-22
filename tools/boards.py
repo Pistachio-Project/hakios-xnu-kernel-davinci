@@ -198,6 +198,7 @@ FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virt
                  'touch-goodix': ('pins', 'clocks', 'rpmh'), 'touch-ft3658u': ('pins', 'clocks', 'rpmh'),
                  'touch-ft5x06': ('pins',),      # (and rpmh, if its touch_i2c names a supply: feature_needs())
                  'touch-gt9889': ('pins',),      # (likewise)
+                 'wifi-wcn3990': ('spmi',),
                  'speaker-aw88261': ('pins', 'clocks', 'rpmh', 'smmu'), 'haptic-aw86927': ('pins',),
                  'imu-lsm6dso': ('pins',), 'imu-bmi160': ('pins',),
                  'adsp': ('rpmh', 'ipc'), 'wifi-wcn6750': ('rpmh', 'pins', 'spmi', 'ipc', 'smmu'), 'mic-wcd938x': ('pins', 'lpass')}
@@ -221,6 +222,7 @@ FEATURE_BOOTARGS = {
     'touch-ft3658u': 'touchscreen=1',
     'touch-ft5x06': 'touchscreen=-1 looks; touchscreen=1',
     'touch-gt9889': 'touchscreen=-1 looks; touchscreen=1',
+    'wifi-wcn3990': 'mpss=1 (wlanprobe=8: the Wi-Fi after the modem)',
     'speaker-aw88261': 'speaker_probe=N looks; sound=N with adsp=1',
     'haptic-aw86927': 'haptic=N',
     'haptic-pmic-ldo': 'haptic_ldo=1 looks; haptic_ldo=3 is the motor for Darwin',
