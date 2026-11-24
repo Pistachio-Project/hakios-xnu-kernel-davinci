@@ -283,8 +283,9 @@ struct hakios_board {
 
 	/*
 	 * A touch controller on I2C (board: touch-i2c { }): two of the SoC's pins for its bus, driven by hand, its
-	 * address there, its interrupt and reset, its supplies and what its reports can say. For the feature
-	 * "touch-ft5x06" (board/ft5x06.c) or "touch-gt9889" (board/gt9889.c); a board has one.
+	 * address there, its interrupt and reset, its supplies and what its reports can say (and, if the board says so, the
+	 * serial engine the bus is). For the feature "touch-ft5x06" (board/ft5x06.c) or "touch-gt9889" (board/gt9889.c); a
+	 * board has one.
 	 */
 	struct {
 		uint8_t sda, scl;               /* its I2C bus's two lines */
@@ -296,6 +297,11 @@ struct hakios_board {
 		                                 * this driver's to switch (always on, or switched by the pin above) */
 		uint16_t analog_mv;             /* what the analog supply is asked for, in millivolts; 0 without one */
 		uint32_t max_x, max_y;          /* the largest coordinates the controller reports */
+		/* Optional, all or none: the bus is a serial engine (board/geni_i2c.h) and not the two pins by hand. 0: by hand. */
+		uint32_t serial_engine;         /* the engine's registers */
+		uint32_t m_ahb_clock, s_ahb_clock, se_clock;    /* offsets in the clock controller (clocks { } gcc), as touch { } has them */
+		uint32_t vote_register;
+		uint8_t vote[5];
 	} touch_i2c;
 
 	/* Bluetooth H4 wiring (board: bluetooth { }); GCC offsets are explicit, including the RCG. */

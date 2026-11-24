@@ -41,7 +41,8 @@ The brightness (`backlight { }`), the thermal floors (`thermal { }`), the PMIC's
 needs `spmi { }` in the SoC file) and the partition that may be written (`storage { }`) are not
 features: a board has them by giving the section. `display-scan` is for a command-mode panel only.
 `touch-ft5x06` and `touch-gt9889` need `rpmh { }` in the SoC file as well when its `touch-i2c { }` names a regulator
-(`io-supply`, `analog-supply` with `analog-millivolts`): a supply that is always on is not named.
+(`io-supply`, `analog-supply` with `analog-millivolts`): a supply that is always on is not named. They need
+`gcc` in `clocks { }` there when it names a serial engine (`serial-engine`, `clocks`, `vote-register`, `votes`).
 
 "nothing" is what the checker asks for, not what the driver needs of the phone. `modem-sm7325` has
 where an SM7325 keeps its shared memory, its command database and the modem's memory in its code

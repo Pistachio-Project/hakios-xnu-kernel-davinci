@@ -1038,6 +1038,24 @@ class Generate(Sandbox):
         self.assertIn('two different names of RPMh regulators', wired(io_supply='"L8A"'))
         self.assertEqual(wired(io_supply='"ldoa8"', analog_supply='"ldoa17"', analog_millivolts='<3008>'), '')
         self.assertIn('.io_supply = "ldoa8", .analog_supply = "ldoa17", .analog_mv = 3008,', boards.table_text(*boards.load()))
+        # the serial engine the bus is: four keys together (or none); the plain section has no such lines in the table
+        self.assertNotIn('.serial_engine', boards.table_text(*boards.load()).split('.touch_i2c')[1].split('},')[0])
+        engine = {'serial_engine': '<0xa84000>', 'clocks': '<0x1800c 0x18010 0x18864>', 'vote_register': '<0x5200c>',
+                  'votes': '<18 19 20 21 29>'}
+        self.assertIn('serial-engine, clocks, vote-register and votes go together', wired(serial_engine='<0xa84000>'))
+        self.assertIn('serial-engine, clocks, vote-register and votes go together', wired(**{**engine, 'votes': ''}))
+        self.assertEqual(wired(**engine), '')
+        table = boards.table_text(*boards.load())
+        for line in ('.serial_engine = 0x00a84000,', '.m_ahb_clock = 0x1800c, .s_ahb_clock = 0x18010, .se_clock = 0x18864,',
+                     '.vote_register = 0x5200c, .vote = { 18, 19, 20, 21, 29 },'):
+            self.assertIn(line, table)
+        self.assertIn('serial-engine is where the engine\'s registers are', wired(**{**engine, 'serial_engine': '<0xa84010>'}))
+        self.assertIn('serial-engine is where the engine\'s registers are', wired(**{**engine, 'serial_engine': '<0>'}))
+        self.assertIn('vote-register is an offset in the clock controller', wired(**{**engine, 'vote_register': '<0x5200d>'}))
+        self.assertIn('clocks are three different offsets', wired(**{**engine, 'clocks': '<0x1800c 0x18010>'}))
+        self.assertIn('clocks are three different offsets', wired(**{**engine, 'clocks': '<0x1800c 0x1800c 0x18864>'}))
+        self.assertIn('votes are five different bits', wired(**{**engine, 'votes': '<18 19 20 21 32>'}))
+        self.assertIn('votes are five different bits', wired(**{**engine, 'votes': '<18 19 20 21 21>'}))
         # a board has one touch controller: this driver's feature beside another's is refused
         path.write_text(path.read_text().replace('"touch-ft5x06"', '"touch-ft5x06", "touch-ft3658u"'))
         self.assertIn('features "touch-ft3658u", "touch-ft5x06" are drivers of different touch controllers: a board has one', self.problems())
@@ -2135,7 +2153,7 @@ class Repository(unittest.TestCase):
                                       ['gen', '--out', str(out)],
                                       capture_output=True, text=True, env={**os.environ, **environment})
                 self.assertEqual(done.returncode, 0, done.stderr)
-                self.assertIn('phone-buses, phone-cmd, phone-gt9889, phone-i2c, phone-keys, phone-scmi, phone-video', done.stdout)
+                self.assertIn('phone-buses, phone-cmd, phone-gt9889, phone-gt9889-geni, phone-i2c, phone-keys, phone-scmi, phone-video', done.stdout)
                 self.assertIn('.name = "phone-cmd"', (out / 'board_table.h').read_text())
         finally:
             shutil.rmtree(out)

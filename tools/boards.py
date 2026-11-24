@@ -146,11 +146,13 @@ BOARD_SCHEMA = {
               'bus_pins': ([int], True),
               'interrupt': (int, True), 'reset': (int, True), 'io_supply': (str, True), 'analog_supply': (str, False),
               'analog_enable': (int, False), 'vendor_pins': ([int], False), 'coordinates': ([int], False)},
-    # a touch controller on two of the SoC's pins as I2C (board/ft5x06.c, board/gt9889.c): nothing of a serial engine's
+    # a touch controller on two of the SoC's pins as I2C (board/ft5x06.c, board/gt9889.c); serial_engine, clocks, vote_register
+    # and votes together (as touch has them) name the engine the bus is, for board/geni_i2c.h: without them, the pins by hand
     'touch_i2c': {'sda': (int, True), 'scl': (int, True), 'interrupt': (int, True), 'reset': (int, True),
                   'address': (int, True), 'contacts': (int, True), 'coordinates': ([int], True),
                   'io_supply': (str, False), 'analog_supply': (str, False), 'analog_millivolts': (int, False),
-                  'analog_enable': (int, False)},
+                  'analog_enable': (int, False), 'serial_engine': (int, False), 'clocks': ([int], False),
+                  'vote_register': (int, False), 'votes': ([int], False)},
     'bluetooth': {'serial_engine': (int, True), 'wrapper': (int, True), 'clocks': ([int], True),
                   'clock_source': (int, True), 'vote_register': (int, True), 'votes': ([int], True),
                   'uart_pins': ([int], True), 'uart_function': (int, True), 'enable_ppid': (int, True),
@@ -336,6 +338,9 @@ def feature_needs(feature, board, soc):
     if feature in ('touch-ft5x06', 'touch-gt9889') and isinstance(wired, dict) and ('io_supply' in wired or 'analog_supply' in wired) and \
             'rpmh' not in soc:
         needs.append(f'[rpmh] in {soc_file} (its [touch_i2c] names a supply, which is asked of RPMh)')
+    if feature in ('touch-ft5x06', 'touch-gt9889') and isinstance(wired, dict) and 'serial_engine' in wired and \
+            not (isinstance(soc.get('clocks'), dict) and 'gcc' in soc['clocks']):
+        needs.append(f'gcc in [clocks] of {soc_file} (its [touch_i2c] names a serial engine, whose clocks are voted for there)')
     spmi, display = soc.get('spmi'), soc.get('display')
     if feature in WRITES_TO_PMIC and isinstance(spmi, dict) and 'channels' not in spmi:
         needs.append(f'channels in [spmi] of {soc_file}')
@@ -405,7 +410,8 @@ def features_text():
             'needs `[spmi]` in the SoC file) and the partition that may be written (`[storage]`) are not',
             'features: a board has them by giving the section. `display-scan` is for a command-mode panel only.',
             '`touch-ft5x06` and `touch-gt9889` need `[rpmh]` in the SoC file as well when its `[touch_i2c]` names a regulator',
-            '(`io_supply`, `analog_supply` with `analog_millivolts`): a supply that is always on is not named.',
+            '(`io_supply`, `analog_supply` with `analog_millivolts`): a supply that is always on is not named. They need',
+            '`gcc` in `[clocks]` there when it names a serial engine (`serial_engine`, `clocks`, `vote_register`, `votes`).',
             '',
             '"nothing" is what the checker asks for, not what the driver needs of the phone. `modem-sm7325` has',
             'where an SM7325 keeps its shared memory, its command database and the modem\'s memory in its code',
@@ -786,6 +792,20 @@ def load(problems=None):
             if len(set(names)) != len(names) or any(not re.fullmatch(r'[a-z0-9.]{1,7}', name) for name in names):
                 problems.add(f'{rel} [touch_i2c]', 'io_supply and analog_supply are two different names of RPMh regulators, as the '
                              'command database has them ("ldoc2": up to 7 lower-case letters, digits and dots)')
+            engine_keys = [key for key in ('serial_engine', 'clocks', 'vote_register', 'votes') if key in wired]
+            if engine_keys and len(engine_keys) != 4:
+                problems.add(f'{rel} [touch_i2c]', 'serial_engine, clocks, vote_register and votes go together: the engine the bus is on, '
+                             'its clocks in the clock controller and their votes (tools/qupclocks.py prints the last three), or none of them')
+            elif engine_keys:
+                if wired['serial_engine'] == 0 or wired['serial_engine'] & 0xfff:
+                    problems.add(f'{rel} [touch_i2c]', 'serial_engine is where the engine\'s registers are: a page\'s address, not 0')
+                if not 0 < wired['vote_register'] < 0x100000 or wired['vote_register'] & 3:
+                    problems.add(f'{rel} [touch_i2c]', 'vote_register is an offset in the clock controller: a register\'s, not 0')
+                if len(wired['clocks']) != 3 or any(not 0 < offset < 0x100000 for offset in wired['clocks']) or \
+                        len(set(wired['clocks'])) != 3 or wired['clocks'][2] > 0x100000 - 0xc0:
+                    problems.add(f'{rel} [touch_i2c]', 'clocks are three different offsets in the clock controller: the two bus clocks, the engine\'s own')
+                if len(wired['votes']) != 5 or any(not 0 <= bit <= 31 for bit in wired['votes']) or len(set(wired['votes'])) != 5:
+                    problems.add(f'{rel} [touch_i2c]', 'votes are five different bits of the vote register, 0 to 31')
         amps = data.get('speaker')
         if amps is not None:
             wires = [amps['sda'], amps['scl']] + list(amps['interrupts']) + list(amps['sound_pins'])
@@ -1163,6 +1183,15 @@ def table_text(socs, boards):
                 f'.analog_enable = {wired.get("analog_enable", -1)},',
                 f'\t\t\t{supplies.strip() + " " if supplies else ""}.analog_mv = {wired.get("analog_millivolts", 0)},',
                 f'\t\t\t.max_x = {wired["coordinates"][0]}, .max_y = {wired["coordinates"][1]},',
+            ]
+            if 'serial_engine' in wired:
+                out += [
+                    f'\t\t\t.serial_engine = {wired["serial_engine"]:#010x},',
+                    f'\t\t\t.m_ahb_clock = {wired["clocks"][0]:#x}, .s_ahb_clock = {wired["clocks"][1]:#x}, '
+                    f'.se_clock = {wired["clocks"][2]:#x},',
+                    f'\t\t\t.vote_register = {wired["vote_register"]:#x}, .vote = {{ {", ".join(str(bit) for bit in wired["votes"])} }},',
+                ]
+            out += [
                 '\t\t},',
             ]
         amps = board.get('speaker')

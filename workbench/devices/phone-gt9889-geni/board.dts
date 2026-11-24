@@ -1,0 +1,32 @@
+/dts-v1/;
+
+// The phone of phone-gt9889 with the serial engine its bus is named too, as davinci's board.dts has it (qupv3_se7_i2c:
+// engine 7 of QUP wrapper 1). For the test of the engine as I2C (workbench/geni_i2c_test.c).
+/ {
+	name = "phone-gt9889-geni";
+	description = "Test phone, its Goodix GT9889 on a serial engine as I2C";
+	soc = "soc-gt9889-geni";
+
+	features = "touch-gt9889";
+
+	backlight {
+		type = "soft";
+	};
+
+	touch-i2c {
+		sda = <6>;
+		scl = <7>;
+		interrupt = <9>;
+		reset = <8>;
+		address = <0x5d>;
+		contacts = <10>;
+		coordinates = <1079 2339>;
+		analog-supply = "ldoc6";
+		analog-millivolts = <3000>;
+		analog-enable = <5>;
+		serial-engine = <0x00a84000>;
+		clocks = <0x1800c 0x18010 0x18864>;
+		vote-register = <0x5200c>;
+		votes = <18 19 20 21 29>;
+	};
+};

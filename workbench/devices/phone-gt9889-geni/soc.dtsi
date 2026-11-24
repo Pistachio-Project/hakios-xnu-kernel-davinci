@@ -1,0 +1,23 @@
+/dts-v1/;
+
+// A made-up chip for the test of a Goodix GT9889 on I2C (workbench/geni_i2c_test.c): the SoC's pins, RPMh and the clock controller,
+// at addresses where no real chip has them, and nothing else.
+/ {
+	name = "soc-gt9889-geni";
+	description = "A made-up chip for the tests, with pins, RPMh and a clock controller only";
+
+	pins {
+		tlmm = <0x03400000>;
+	};
+
+	clocks {
+		gcc = <0x00100000>;
+	};
+
+	rpmh {
+		cmd-db = <0x85fe0000>;
+		cmd-db-size = <0x20000>;
+		rsc = <0x1a200000>;
+		tcs-offset = <0xd00>;
+	};
+};

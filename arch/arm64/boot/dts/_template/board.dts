@@ -125,6 +125,15 @@
 		// analog-supply = "ldoa17";    // optional: its analog supply (vdd-supply) the same way, with what it is asked for:
 		// analog-millivolts = <3008>;  // ... the regulator's voltage in the device tree, 2600 to 3600
 		// analog-enable = <78>;        // optional: a GPIO that switches its analog supply on, high
+		// Optional, all four or none: the bus is a serial engine of the SoC's (board/geni_i2c.h), driven through its FIFO,
+		// and not the two pins by hand. The driver uses it only if the engine's firmware is I2C and its clock gives 19.2 MHz,
+		// and otherwise says so and drives the pins by hand as without these keys. The same keys as touch { }'s; needs
+		// clocks { gcc } in soc.dtsi; the engine's node is the bus's (qupv3_seN_i2c).
+		// serial-engine = <0x00a84000>; // the bus's node: reg (qupv3_se7_i2c: i2c@a84000)
+		// clocks = <0x1800c 0x18010 0x18864>; // the wrapper's two bus clocks and the engine's own: each one's halt_reg
+		// vote-register = <0x5200c>;   // the enable_reg of those clocks
+		// votes = <18 19 20 21 29>;    // ... and enable_mask of the wrapper's core_2x, core, the two bus clocks and the
+		//                              // engine's, as bit numbers (tools/qupclocks.py gcc-SOC.c WRAPPER ENGINE prints the three lines)
 	// };
 	// The same section is the feature "touch-gt9889"'s: a Goodix GT9889 ("goodix,gt9889" node, the vendor's
 	// goodix_driver_gt9886), a board lists one of the two. Its keys are the node's: address = reg (0x5d);
