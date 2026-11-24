@@ -36,11 +36,12 @@ struct cpufreq_hw_layout {
 	uint16_t limit;         /* what LMh allows now, times 19.2 MHz */
 	uint16_t limit_mask;
 	uint16_t extent;        /* past the last register read or written: a group's block is at least so big */
+	uint16_t core_ctrl;     /* the OSM's CORE_DCVS_CTRL (vendor clk-cpu-osm.c): [0] each core votes in its own row register; 0: none */
 };
 
 static const struct cpufreq_hw_layout cpufreq_hw_layouts[] = {
-	[HAKIOS_CPUFREQ_EPSS] = { "EPSS", 0x0, 0x100, 4, 0x320, 0x020, 0xff, 0x324 },
-	[HAKIOS_CPUFREQ_OSM] = { "OSM", 0x0, 0x110, 32, 0x920, 0x704, 0x3ff, 0x924 },
+	[HAKIOS_CPUFREQ_EPSS] = { "EPSS", 0x0, 0x100, 4, 0x320, 0x020, 0xff, 0x324, 0 },
+	[HAKIOS_CPUFREQ_OSM] = { "OSM", 0x0, 0x110, 32, 0x920, 0x704, 0x3ff, 0x940, 0xbc },
 };
 
 /* the layout of the board's block (EPSS's for a value the table does not know: that is what the SoC file's default is) */
@@ -67,6 +68,20 @@ cpufreq_hw_map_size(const struct hakios_board *board)
 	uint32_t extent = cpufreq_hw_layout(board)->extent;
 
 	return board->cpufreq.epss_domain_size > extent ? board->cpufreq.epss_domain_size : extent;
+}
+
+/*
+ * how many row registers a vote for a group is written to, given the word read at the layout's core_ctrl: 1, the group's
+ * (Linux's qcom-cpufreq-hw writes this one only); on an OSM whose per-core DCVS is on (the vendor's clk-cpu-osm.c reads
+ * the bit at probe and then writes each core's own register, perf_state + 4 * core, the core's number in the group) one for
+ * every core of the group, else the cores whose registers were not written would keep their old vote.
+ */
+static inline unsigned
+cpufreq_hw_votes(const struct hakios_board *board, unsigned group, uint32_t ctrl)
+{
+	unsigned cores = group < HAKIOS_CPU_GROUPS ? board->cpufreq.domain_cores[group] : 0;
+
+	return (ctrl & 1) && cores > 1 ? (cores < 8 ? cores : 8) : 1;
 }
 
 /* the offset of a row of the table (bounded: never past the table's last) */

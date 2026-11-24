@@ -84,8 +84,13 @@ reads, and a group whose enable register (0x0) says the hardware is not in charg
 Linux leaves it. **Not done yet**, for want of a phone to see them on: leaving out the rows the table's core-count field
 marks as turbo (Linux does, and keeps the last one as a boost it does not use by default) -- the log says each
 group's counts (`cpufreq: group N: the rows' core counts ...`), so that a phone's run tells whether its top rows are
-such -- and per-core DCVS (0xb0: a group
-whose cores each vote, where only the first is written here). `cpufreq=1` raises every group to its top row and
+such. Per-core DCVS is done as the vendor's
+`clk-cpu-osm.c` (the SM6150/SM7150 kernel) does it: the OSM's control word at 0xbc, bit 0 set, means each core votes in its
+own row register (0x920 + 4 * the core's number in the group), and then every core of the group is written
+(`cpufreq_hw_votes`); clear, the one register as before. Each group's enable word, control word and row wanted are
+logged (`cpufreq: group N: enable ...`) for a phone's run to say. On an SM7150 the firmware fills the OSM and the vendor
+kernel only reads its tables; it never looks at the enable word, so a group that reads clear is left alone here on Linux's
+authority, not the vendor's. `cpufreq=1` raises every group to its top row and
 leaves it there for the loader; `scmi_perf=2` asks its domains back to the levels they were found at, and `ddr=` gives
 its vote back, at the run's end.
 

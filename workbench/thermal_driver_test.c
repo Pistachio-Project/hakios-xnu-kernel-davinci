@@ -80,6 +80,9 @@ hakios_test_rd(vm_offset_t a)
 		if (off == 0) {
 			return enabled[d];
 		}
+		if (off == 0xbc) {
+			return 0;                       /* (CORE_DCVS_CTRL: the cores vote together, one row register) */
+		}
 		if (off == 0x704) {
 			return lmh[d] | 0x7000;         /* (above [9:0], something else) */
 		}
