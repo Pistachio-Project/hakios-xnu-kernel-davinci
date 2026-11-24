@@ -336,6 +336,36 @@ bus_take(void)
 
 static struct geni_i2c geni;
 static bool geni_mapped;
+static bool geni_pins;                  /* the bus's two pins given to the engine (their function), to be given back */
+
+/*
+ * The engine reaches the bus only through the pins' QUP function: the firmware may leave them as GPIOs (davinci's
+ * gpio6/7 were function 0 at entry, and the engine's first transfer failed). Android's active state for the bus
+ * (qupv3_se7_i2c_active: function qup11, 2 mA, bias-disable; the board pulls the lines up) is function 1 of those
+ * pins in the vendor's pinctrl-sdmmagpie.c; the pins as found are given back when the engine is put back.
+ */
+#define ENGINE_PIN_CFG          (1u << 2)       /* [5:2] function 1, [1:0] no pull, [8:6] 2 mA */
+
+static void
+engine_pins_give(void)
+{
+	bus_record();
+	wr(GPIO_CFG(i2c_bus.sda), ENGINE_PIN_CFG);
+	wr(GPIO_CFG(i2c_bus.scl), ENGINE_PIN_CFG);
+	__atomic_store_n(&geni_pins, true, __ATOMIC_SEQ_CST);
+}
+
+static void
+engine_pins_back(void)
+{
+	if (__atomic_load_n(&geni_pins, __ATOMIC_SEQ_CST)) {
+		__atomic_store_n(&geni_pins, false, __ATOMIC_SEQ_CST);
+		wr(GPIO_CFG(i2c_bus.sda), bus_found_cfg[0]);
+		wr(GPIO_CFG(i2c_bus.scl), bus_found_cfg[1]);
+		wr(GPIO_IO(i2c_bus.sda), bus_found_io[0]);
+		wr(GPIO_IO(i2c_bus.scl), bus_found_io[1]);
+	}
+}
 static bool geni_on;                    /* the engine is the bus: set up for it, its votes taken */
 
 static bool
@@ -381,11 +411,20 @@ engine_take(void)
 {
 	const char *why;
 
+	uint32_t use = 1;
+
 	if (!HAS_ENGINE || !engine_map()) {
 		return;
 	}
+	/* boot-arg gt9889_geni=0: the pins by hand although the board names an engine (to tell the bus from the chip) */
+	if (PE_parse_boot_argn("gt9889_geni", &use, sizeof(use)) && use == 0) {
+		say("gt9889: gt9889_geni=0: the serial engine at %#x is not used: the pins by hand\n", WIRED->serial_engine);
+		return;
+	}
+	engine_pins_give();
 	why = geni_i2c_open(&geni, ENGINE_HZ);
 	if (why != NULL) {
+		engine_pins_back();
 		say("gt9889: the serial engine at %#x is not used: %s: the pins by hand\n", WIRED->serial_engine, why);
 		return;
 	}
@@ -402,6 +441,7 @@ engine_put_back(void)
 		__atomic_store_n(&geni_on, false, __ATOMIC_SEQ_CST);
 		geni_i2c_close(&geni);
 	}
+	engine_pins_back();
 }
 
 /* one transaction through the engine, its end noted for the run's end */

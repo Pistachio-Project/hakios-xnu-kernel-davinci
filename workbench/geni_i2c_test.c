@@ -675,7 +675,10 @@ look_writes_nothing(void)
 
 /* ---- scenarios: the driver ---------------------------------------------------------------------------------------------- */
 
-#define BUS_AS_FOUND    (1u << 2 | 3u)
+/* the bus's pins as davinci's firmware leaves them: GPIOs (function 0, pull 1), not the engine's function, which the
+ * driver gives them while it uses the engine (function 1, no pull: the vendor's qupv3_se7_i2c_active) and takes back */
+#define BUS_AS_FOUND    (0u << 2 | 1u)
+#define BUS_FOR_ENGINE  (1u << 2)
 #define RESET_AS_FOUND  (1u << 9 | 2u << 6)
 
 static void
@@ -735,12 +738,19 @@ posted_at(uint32_t x, uint32_t y)
 	return found;
 }
 
+/* while the engine is the bus its pins carry the engine's function; before and after, they are as the firmware left them */
 static void
-pins_not_touched(const char *when)
+pins_given_to_engine(const char *when)
 {
-	CHECK(tlmm_pin_writes[6] == 0 && tlmm_pin_writes[7] == 0, "%s: the bus's pins left to the engine's function: %u, %u writes", when,
-	    tlmm_pin_writes[6], tlmm_pin_writes[7]);
-	CHECK(model.cfg[6] == BUS_AS_FOUND && model.cfg[7] == BUS_AS_FOUND, "%s: the bus's pins as found", when);
+	CHECK(model.cfg[6] == BUS_FOR_ENGINE && model.cfg[7] == BUS_FOR_ENGINE, "%s: the bus's pins in the engine's function (%#x, %#x)",
+	    when, model.cfg[6], model.cfg[7]);
+}
+
+static void
+pins_as_found(const char *when)
+{
+	CHECK(model.cfg[6] == BUS_AS_FOUND && model.cfg[7] == BUS_AS_FOUND, "%s: the bus's pins as found (%#x, %#x)", when,
+	    model.cfg[6], model.cfg[7]);
 }
 
 /* touchscreen=1 on a board that names the engine: the report read through it, the engine and the votes given back at the end */
@@ -762,12 +772,12 @@ driver_uses_the_engine(void)
 	CHECK(engine.gated == 0, "no access to the engine with its clocks off: %u", engine.gated);
 	CHECK(engine.msgs[0].opcode == 1 && engine.msgs[0].length == 2 && (engine.msgs[0].params & 4) && engine.msgs[0].address == 0x5d,
 	    "the first message is the register's two bytes, no stop");
-	pins_not_touched("running");
+	pins_given_to_engine("running");
 	hakios_gt9889_quiesce();
 	CHECK(gcc_regs[VOTE_REG / 4] == FOUND_VOTE, "at the end the votes withdrawn: %#x", gcc_regs[VOTE_REG / 4]);
 	CHECK(kept_changed() == 0, "and the engine's registers as found: %u differ", kept_changed());
 	CHECK(logged("powered off"), "said: %s", log_text);
-	pins_not_touched("at the end");
+	pins_as_found("at the end");
 }
 
 /* an engine that is not I2C: said, the engine and the votes as found, the pins driven by hand (and nobody there to answer) */
@@ -847,7 +857,7 @@ run_ends_in_a_stalled_transfer(void)
 	CHECK(engine.cancels >= 1, "cancelled: %u", engine.cancels);
 	CHECK(gcc_regs[VOTE_REG / 4] == FOUND_VOTE, "the votes withdrawn: %#x", gcc_regs[VOTE_REG / 4]);
 	CHECK(kept_changed() == 0, "the registers as found: %u differ", kept_changed());
-	pins_not_touched("at the end");
+	pins_as_found("at the end");
 }
 
 /* nobody at the address: the NACK said as nobody answering, as by hand */
@@ -861,7 +871,7 @@ driver_nobody_answers(void)
 	CHECK(logged("gt9889: nobody answers at 0x5d"), "said: %s", log_text);
 	CHECK(nacks >= 1, "the engine said NACK: %u", nacks);
 	CHECK(gcc_regs[VOTE_REG / 4] == FOUND_VOTE && kept_changed() == 0, "powered off: the votes withdrawn, the registers as found");
-	pins_not_touched("nobody");
+	pins_as_found("nobody");
 	hakios_gt9889_quiesce();
 }
 
