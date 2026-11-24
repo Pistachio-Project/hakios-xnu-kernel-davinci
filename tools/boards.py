@@ -79,7 +79,7 @@ CAMCC_SOURCES = ('pll0_even_source', 'pll0_odd_source', 'pll2_source')
 # the layouts of the cores' frequency hardware (board/cpufreq_hw.h): EPSS (the default), the OSM's firmware before it;
 # and how far into a group's block each reaches (its last register, the row wanted, and 4)
 CPUFREQ_BLOCKS = ('epss', 'osm')
-CPUFREQ_EXTENT = {'epss': 0x324, 'osm': 0x924}
+CPUFREQ_EXTENT = {'epss': 0x324, 'osm': 0x940}
 
 TLMM_TILES_MOST = 4     # the room board.h's pins.tile has; a tile is a block of the pin controller with its own offset
 

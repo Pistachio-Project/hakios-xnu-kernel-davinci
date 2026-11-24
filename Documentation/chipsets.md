@@ -108,4 +108,4 @@ reg of `qcom,ufshc`); both are read.
   bus of a version 8 arbiter is not known either (`bus = <1>` with `channel-map` is refused).
 - eMMC storage, and UFS 4 hosts' vendor registers beyond what JEDEC lays out.
 - The flash LED of PMICs other than the PM8350C and the PM6150L.
-- The table's core-count field and per-core DCVS of the cores' frequency block ([drivers.md](drivers.md)).
+- The table's core-count field (turbo rows) of the cores' frequency block ([drivers.md](drivers.md)).

@@ -25,7 +25,9 @@ static struct {
 	uint32_t table[GROUPS][ROWS];   /* [31:30] the clock source, [7:0] the multiple of 19.2 MHz */
 	uint32_t wanted[GROUPS];
 	uint32_t enable[GROUPS];        /* [0]: the hardware is in charge of the group's clock */
-	unsigned writes[GROUPS], elsewhere;
+	uint32_t ctrl[GROUPS];          /* the OSM's CORE_DCVS_CTRL (0xbc): [0] each core votes in its own register, perf_at + 4 * core */
+	uint32_t core_vote[GROUPS][8];  /* those registers, from core 1 (core 0's is wanted[]) */
+	unsigned writes[GROUPS], core_writes[GROUPS], elsewhere;
 } epss;
 
 /* the group whose block ADDRESS is in, and where in it; GROUPS for none */
@@ -67,6 +69,12 @@ hakios_test_rd(vm_offset_t address)
 		if (offset == 0) {
 			return epss.enable[group];
 		}
+		if (epss.perf_at == 0x920 && offset == 0xbc) {
+			return epss.ctrl[group];
+		}
+		if (epss.perf_at == 0x920 && offset > epss.perf_at && offset < epss.perf_at + 32 && (offset & 3) == 0) {
+			return epss.core_vote[group][(offset - epss.perf_at) / 4];
+		}
 	}
 	epss.elsewhere++;
 	fprintf(stderr, "MODEL: a read at %#lx, where nothing of the frequency block is\n", (unsigned long)address);
@@ -82,6 +90,12 @@ hakios_test_wr(vm_offset_t address, uint32_t value)
 	if (group < GROUPS && offset == epss.perf_at) {
 		epss.wanted[group] = value;
 		epss.writes[group]++;
+		return;
+	}
+	if (group < GROUPS && epss.perf_at == 0x920 && epss.ctrl[group] & 1 && offset > epss.perf_at && offset < epss.perf_at + 32 &&
+	    (offset & 3) == 0) {
+		epss.core_vote[group][(offset - epss.perf_at) / 4] = value;
+		epss.core_writes[group]++;
 		return;
 	}
 	epss.elsewhere++;
@@ -220,6 +234,49 @@ another_soc(void)
 	CHECK(epss.writes[2] + epss.writes[3] == 0, "it has no third group");
 	CHECK(logged("group 0 (6 of our cores)") && logged("group 1 (2 of our cores)"), "six and two: %s", log_text);
 	CHECK(epss.elsewhere == 0, "%u accesses where nothing of the block is", epss.elsewhere);
+}
+
+/*
+ * An SM7150 (the Mi 9T): the OSM of the vendor kernel's clk-cpu-osm.c, six A55s and two A76s. The boot firmware fills the tables
+ * and the kernel only reads them (no LUT is patched there); the vendor driver never looks at the enable word, but does at
+ * CORE_DCVS_CTRL, and with its bit set every core votes in its own register (0x920 + 4 * core). Here the A76s' group
+ * has it set: both of its cores' votes are raised, the A55s' (clear) are one register as before.
+ */
+static void
+sm7150_like(void)
+{
+	static const uint8_t a55[] = { 30, 40, 53, 65, 78, 89, 91 };   /* ... 1747 MHz */
+	static const uint8_t a76[] = { 37, 49, 63, 80, 94, 104, 115 }; /* ... 2208 MHz */
+
+	phone("phone-keys", 8);
+	table(0, sizeof(a55), a55);
+	table(1, sizeof(a76), a76);
+	epss.ctrl[1] = 1;
+	epss.wanted[1] = 0;
+	epss.core_vote[1][1] = 0;
+	boot_args = "cpufreq=1 cpu_gov=0 park_small=0";
+	hakios_cpufreq_init();
+	CHECK(epss.wanted[0] == 7 && epss.core_writes[0] == 0, "the A55s' one register: row %u, %u more", epss.wanted[0], epss.core_writes[0]);
+	CHECK(epss.wanted[1] == 7 && epss.core_vote[1][1] == 7 && epss.core_writes[1] == 1, "the A76s' two: %u %u (%u)", epss.wanted[1],
+	    epss.core_vote[1][1], epss.core_writes[1]);
+	CHECK(logged("group 1: enable 0x1, per-core control 0x1, row wanted 0"), "the words said: %s", log_text);
+	CHECK(logged("group 1 (2 of our cores): row 0 -> 7 of the frequency table, 2208 MHz"), "2208 MHz: %s", log_text);
+	CHECK(epss.elsewhere == 0, "%u accesses where nothing of the block is", epss.elsewhere);
+}
+
+/* the same, as the phone looked: the A76s' group says its hardware is not in charge -- nothing of it is written, per core or not */
+static void
+sm7150_perf_not_in_charge(void)
+{
+	phone("phone-keys", 8);
+	epss.enable[1] = 0;
+	epss.ctrl[1] = 1;
+	boot_args = "cpufreq=1 cpu_gov=0 park_small=0";
+	hakios_cpufreq_init();
+	CHECK(epss.writes[1] + epss.core_writes[1] == 0, "nothing written");
+	CHECK(logged("group 1 (2 of our cores): the hardware is not in charge of its clock: left alone"), "said: %s", log_text);
+	CHECK(logged("group 1: enable 0, per-core control 0x1"), "and the words: %s", log_text);
+	CHECK(epss.wanted[0] == 7, "the A55s raised: %u", epss.wanted[0]);
 }
 
 /* each group's rows' core counts said, and rows of count 1 (Linux's turbo rows) named as such; nothing else changes */
@@ -547,7 +604,7 @@ main(int argc, char **argv)
 {
 	static const struct { const char *name; void (*run)(void); } scenarios[] = {
 		{ "every_group", every_group }, { "one_core", one_core }, { "some_cores", some_cores }, { "another_soc", another_soc },
-		{ "not_in_charge", not_in_charge }, { "core_counts_said", core_counts_said }, { "odd_tables", odd_tables }, { "off_by_default", off_by_default }, { "not_listed", not_listed },
+		{ "not_in_charge", not_in_charge }, { "sm7150_like", sm7150_like }, { "sm7150_perf_not_in_charge", sm7150_perf_not_in_charge }, { "core_counts_said", core_counts_said }, { "odd_tables", odd_tables }, { "off_by_default", off_by_default }, { "not_listed", not_listed },
 		{ "unknown_board", unknown_board }, { "governor_starts", governor_starts }, { "governor_row_past_the_table", governor_row_past_the_table },
 		{ "governor_goes_down_slowly", governor_goes_down_slowly }, { "governor_goes_up_at_once", governor_goes_up_at_once },
 		{ "governor_quiesced", governor_quiesced }, { "governor_leaves_a_shared_group", governor_leaves_a_shared_group },

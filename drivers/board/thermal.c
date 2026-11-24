@@ -224,6 +224,17 @@ read_table(unsigned d)
 	}
 }
 
+/* a group's row, to each register that holds a vote of the group's (board/cpufreq_hw.h: one, but per-core DCVS's every core's) */
+static void
+apply_row(unsigned d, uint32_t row)
+{
+	unsigned votes = cpufreq_hw_votes(this_board, d, layout->core_ctrl ? rd(epss[d] + layout->core_ctrl) : 0);
+
+	for (unsigned core = 0; core < votes; core++) {
+		wr(epss[d] + layout->perf_state + 4 * core, row);
+	}
+}
+
 static void
 apply(uint32_t s)
 {
@@ -235,7 +246,7 @@ apply(uint32_t s)
 				row_now[d] = row;
 			}
 		} else if (epss[d] != 0 && row != row_now[d]) {
-			wr(epss[d] + layout->perf_state, row);
+			apply_row(d, row);
 			row_now[d] = row;
 		}
 	}
@@ -455,7 +466,7 @@ hakios_thermal_quiesce(void)
 	}
 	for (unsigned d = 0; d < TH_DOMAINS; d++) {
 		if (epss[d] != 0 && row_now[d] != top_row[d]) {
-			wr(epss[d] + layout->perf_state, top_row[d]);
+			apply_row(d, top_row[d]);
 			row_now[d] = top_row[d];
 		}
 	}

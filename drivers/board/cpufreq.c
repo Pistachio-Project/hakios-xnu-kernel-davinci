@@ -50,12 +50,30 @@ static const struct cpufreq_hw_layout *layout = &cpufreq_hw_layouts[HAKIOS_CPUFR
 
 /* a group's block mapped, or 0 when the hardware is not in charge of the group's clock (Linux refuses such a group too) */
 static vm_offset_t
-domain_map(uint32_t domain)
+base_of(uint32_t domain)
 {
 	const struct hakios_board *board = hakios_board();
-	vm_offset_t base = ml_io_map(cpufreq_hw_domain(board, domain), cpufreq_hw_map_size(board));
+
+	return ml_io_map(cpufreq_hw_domain(board, domain), cpufreq_hw_map_size(board));
+}
+
+static vm_offset_t
+domain_map(uint32_t domain)
+{
+	vm_offset_t base = base_of(domain);
 
 	return (rd(base + layout->enable) & 1) ? base : 0;
+}
+
+/* the row wanted of a group, written to every register that holds a vote of the group's (cpufreq_hw_votes: one, but per-core DCVS's) */
+static void
+vote(vm_offset_t base, uint32_t domain, uint32_t row)
+{
+	unsigned votes = cpufreq_hw_votes(hakios_board(), domain, layout->core_ctrl ? rd(base + layout->core_ctrl) : 0);
+
+	for (unsigned core = 0; core < votes; core++) {
+		wr(base + layout->perf_state + 4 * core, row);
+	}
 }
 
 /*
@@ -117,13 +135,17 @@ raise_domain(uint32_t domain, uint32_t cores)
 	vm_offset_t base;
 
 	base = domain_map(domain);
+	/* (for a phone's log, whichever way it goes: the words that say who is in charge, and the row wanted as the boot loader left it) */
+	tell("cpufreq: group %u: enable %#x, per-core control %#x, row wanted %u\n", domain,
+	    rd(base_of(domain) + layout->enable), layout->core_ctrl ? rd(base_of(domain) + layout->core_ctrl) : 0,
+	    rd(base_of(domain) + layout->perf_state));
 	if (base == 0) {
 		tell("cpufreq: group %u (%u of our cores): the hardware is not in charge of its clock: left alone\n", domain, cores);
 		return;
 	}
 	top = table_top(base, &top_khz, counts);
 	was = rd(base + layout->perf_state);
-	wr(base + layout->perf_state, top);
+	vote(base, domain, top);
 	sleep_ms(20);
 	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz\n", domain, cores, was, top,
 	    top_khz / 1000);
@@ -480,7 +502,7 @@ static void
 gov_set(struct gov_group *g, uint32_t row)
 {
 	if (row != g->row) {
-		wr(g->base + layout->perf_state, row);
+		vote(g->base, (uint32_t)(g - gov), row);
 		g->row = row;
 	}
 }
@@ -581,7 +603,7 @@ gov_quiesce(void)
 {
 	for (uint32_t d = 0; d < CPUFREQ_GROUPS; d++) {
 		if (gov[d].base != 0) {
-			wr(gov[d].base + layout->perf_state, gov[d].top);
+			vote(gov[d].base, d, gov[d].top);
 		}
 	}
 	gov_on = false;

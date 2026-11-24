@@ -329,7 +329,7 @@ class Check(Sandbox):
 
     def test_the_frequency_block_holds_together(self):
         self.soc('\t\tepss-domain-size = <0x1000>;\n', '\t\tblock = "osm";\n\t\tepss-domain-size = <0x800>;\n')
-        self.assertIn('epss-domain-size 0x800 is smaller than a group\'s registers of the OSM layout reach (0x924)',
+        self.assertIn('epss-domain-size 0x800 is smaller than a group\'s registers of the OSM layout reach (0x940)',
                       self.problems())
         self.soc('\t\tepss-domain-size = <0x800>;\n', '\t\tepss-domain-size = <0x1400>;\n')
         self.assertEqual(self.problems(), '')
