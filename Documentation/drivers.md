@@ -119,6 +119,7 @@ side to see it by.
 | `bsd/dev/board/mic.c` | The microphones on a WCD938x codec, through the DSP. | `mic-wcd938x` / `mic=N` with `adsp=1` | part; the codec's reset pin is data (`mic { }`), and so are the LPASS blocks and the SoundWire pins (`lpass { }`) |
 | `bsd/dev/board/speaker.c` | Two Awinic AW88261 amplifiers on I2C. | `speaker-aw88261` / `speaker_probe=` | part; the bus's pins, each amplifier's address and interrupt and the sound's four pins are data (`speaker { }`) |
 | `bsd/dev/board/haptic.c` | An Awinic AW86927 vibration motor driver. | `haptic-aw86927` / `haptic=` | part; which pins it is on and the motor's calibration are data (`haptic { }`) |
+| `bsd/dev/board/haptic_ldo.c` | A vibration motor on a PMIC's vibrator LDO (`qcom,qpnp-vibrator-ldo`); Darwin's haptics through `/dev/hakios-haptic` as `haptic.c`'s. | `haptic-pmic-ldo` / `haptic_ldo=` | part; where the LDO is on the PMICs' bus and its voltage are data (`spmi { }`, `vibrator { }`) |
 | `bsd/dev/board/torch.c` | The flash LED module of a PM8350C. | `torch-pm8350c` / `torch=` | part; the arbiter and where the module is on the PMICs' bus are data (`spmi { }`, `torch { }`) |
 | `bsd/dev/board/camera.c` | cameras on an SM7325 as the board's `camera { }` wires them: sensors (four chips known), CSI, ISP. | `camera-sm7325` / `cam=` | part; each sensor's wiring and supplies, and which is Darwin's back and front camera, are data (`camera { }`), as are where the camera's clocks are in its clock controller and how its PLLs are configured (the SoC file's `camera { }`) |
 | `bsd/dev/board/virtio_sound.c` | QEMU's sound device as the sink. | QEMU only | any (QEMU) |
@@ -208,6 +209,7 @@ says what each test covers and what it leaves out.
 | `board/torch.c` | `torch_driver_test.c` | the PMIC arbiter with a flash module behind it |
 | `board/battery.c` | `battery_driver_test.c` | the page the loader writes the battery's state into |
 | `board/haptic.c` | `haptic_driver_test.c` | the SoC's pins with an I2C chip on them |
+| `board/haptic_ldo.c` | `haptic_ldo_driver_test.c` | the PMIC arbiter with a vibrator LDO behind it |
 | `board/imu.c` | `imu_driver_test.c` | the SoC's pins with an LSM6DSO on them, or a BMI160 |
 | `board/speaker.c` | `speaker_driver_test.c` | the pins with two amplifiers, a configuration file |
 | `board/guard.c` | `guard_test.c` | (none: tones in, samples out) |

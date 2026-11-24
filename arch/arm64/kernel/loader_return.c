@@ -56,6 +56,7 @@ extern void hakios_mpss_stop(void);
 extern void hakios_mpss_quiesce(void);
 extern void hakios_ddr_quiesce(void);
 extern void hakios_haptic_quiesce(void);
+extern void hakios_haptic_ldo_quiesce(void);
 extern void hakios_imu_quiesce(void);
 extern void hakios_goodix_quiesce(void);
 extern void hakios_fts_quiesce(void);
@@ -591,6 +592,7 @@ loader_return(void)
 	hakios_mpss_quiesce();         /* nor the modem */
 	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
 	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
+	hakios_haptic_ldo_quiesce();   /* ... or the motor on a PMIC's LDO switched off, if it was on */
 	hakios_imu_quiesce();          /* the motion sensor's chip powered down, if it was switched on */
 	hakios_goodix_quiesce();       /* the Goodix touch controller's polling stopped, the chip powered down, if it was powered up */
 	hakios_fts_quiesce();          /* the FocalTech touch controller's polling stopped and the chip powered off, likewise */

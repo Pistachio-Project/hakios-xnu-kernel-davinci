@@ -183,6 +183,11 @@ F:	drivers/iokit/BoardHaptics.cpp
 T:	workbench/haptic_driver_test.c
 K:	haptic-aw86927; haptic=
 
+HAPTICS ON A PMIC'S LDO
+F:	drivers/board/haptic_ldo.c
+T:	workbench/haptic_ldo_driver_test.c
+K:	haptic-pmic-ldo; haptic_ldo=
+
 IMAGES
 F:	tools/image.py
 F:	arch/arm64/boot/mkboot.py

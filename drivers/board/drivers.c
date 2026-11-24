@@ -141,6 +141,9 @@ hakios_drivers_init(void)
 	if (CONFIG_HAPTIC) {
 		hakios_haptic_init();  /* boot-arg haptic=N: the vibration motor */
 	}
+	if (CONFIG_HAPTIC_PMIC_LDO) {
+		hakios_haptic_ldo_init();  /* boot-arg haptic_ldo=N: the vibration motor on a PMIC's LDO; after the keys' driver, which holds the arbiter's lock */
+	}
 	if (CONFIG_IMU_LSM6DSO) {
 		hakios_imu_init();  /* boot-arg sensors=N: the motion sensor, the phone's orientation */
 	}

@@ -68,6 +68,8 @@ enum {
 	HAKIOS_HAS_TOUCH_GT9889    = 1u << 22,  /* a Goodix GT9889 (GT9886 family, "Normandy") on I2C, wired as touch-i2c { }
 	                                         * says, the same section as the FT5x06's (board/gt9889.c) */
 	HAKIOS_HAS_CPUFREQ_SCMI = 1u << 16,     /* CPU performance queries via SCMI */
+	HAKIOS_HAS_HAPTIC_PMIC_LDO = 1u << 24,  /* a vibration motor on a PMIC's vibrator LDO, wired as vibrator { } says
+	                                         * (board/haptic_ldo.c) */
 };
 
 /* how the panel's light is set (bsd/dev/board/backlight.c) */
@@ -238,6 +240,12 @@ struct hakios_board {
 		uint8_t interrupt;              /* low when the chip has something to say (only looked at) */
 		uint8_t f0_calibration;         /* what Android's driver found for this motor's resonance (its trim register) */
 	} haptic;
+
+	/* the vibration motor on a PMIC's vibrator LDO (board: vibrator { }); a peripheral as in buttons { } */
+	struct {
+		uint16_t peripheral;            /* the LDO's registers ("qcom,qpnp-vibrator-ldo", reg 0x5300 of slave 1: 0x153) */
+		uint32_t volt_uv;               /* its supply while the motor runs: the device tree's "qcom,vib-ldo-volt-uv" */
+	} vibrator;
 
 	/*
 	 * The motion sensor (board: imu { }): an ST LSM6DSO or a Bosch BMI160 (the board's feature says which) on two
