@@ -24,7 +24,7 @@
 	// gpu-a660        an Adreno of the A660 family (642, 642L, 643, 660 ...) behind a GMU (gpu=1); needs gpu { }
 	// and these, each a driver of one part wired the way one phone has it -- list one only if your phone
 	// has that part on the same pins and bus (drivers/board/board.h, Documentation/drivers.md):
-	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-gt9889, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c, torch-pm6150l,
+	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-gt9889, speaker-aw88261, haptic-aw86927, haptic-pmic-ldo, imu-lsm6dso, imu-bmi160, torch-pm8350c, torch-pm6150l,
 	// camera-sm7325, wifi-wcn6750, mic-wcd938x, modem-sm7325, bluetooth-wcn-uart
 	// Documentation/features.md has what each needs written down first; tools/boards.py status NAME says it for
 	// this board.
@@ -194,6 +194,13 @@
 		// reset = <35>;                // the chip's node: reset-gpio
 		// interrupt = <18>;            // ... and irq-gpio
 		// f0-calibration = <0x0d>;     // Android's log at boot: "f0_cali_data = 0x0D" (per motor: read it on your phone)
+	// };
+
+	// The vibration motor on a PMIC's vibrator LDO, for the feature "haptic-pmic-ldo" (instead of the chip above):
+	// the LDO as SPMI slave << 8 | the high byte of its registers, and the supply the motor is given.
+	// vibrator {
+		// peripheral = <0x153>;        // the node "qcom,qpnp-vibrator-ldo" (vibrator@5300 under qcom,pm6150@1)
+		// volt-uv = <3000000>;         // its "qcom,vib-ldo-volt-uv"; the LDO gives 1504000 to 3544000, and the driver never goes above this
 	// };
 
 	// The motion sensor, for the feature "imu-lsm6dso": an ST LSM6DSO (or LSM6DSOX) accelerometer and gyroscope on

@@ -10,7 +10,7 @@
 	description = "Test phone, its parts wired otherwise";
 	soc = "soc-test";
 
-	features = "cpufreq-epss", "cpufreq-scmi", "ddr-rpmh", "buttons-pmic", "haptic-aw86927", "torch-pm8350c", "speaker-aw88261";
+	features = "cpufreq-epss", "cpufreq-scmi", "ddr-rpmh", "buttons-pmic", "haptic-aw86927", "haptic-pmic-ldo", "torch-pm8350c", "speaker-aw88261";
 
 	backlight {
 		type = "soft";
@@ -65,6 +65,12 @@
 		sound-pins = <120 121 122 123>;
 		sound-function = <3>;
 		tdm = <2>;                      // the tertiary TDM interface: port 0x9020, group 0x9120, bit clock 0x204
+	};
+
+	// (a vibrator LDO as well, on the third PMIC and at a lower supply than a first phone's 3 V)
+	vibrator {
+		peripheral = <0x253>;
+		volt-uv = <2800000>;
 	};
 
 	// (its PM8350C is the bus's fourth chip, not the third)

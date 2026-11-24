@@ -128,6 +128,7 @@ CAMERA_SENSOR = {'name': (str, True), 'chip': (CAMERA_CHIPS, True), 'cci': ([int
                  'reset': (int, True), 'mclk': (int, True), 'mclk_pin': (int, True), 'csiphy': (int, True),
                  'vana': (SUPPLY, False), 'vdig': (SUPPLY, False), 'vio': (SUPPLY, False),
                  'focus_motor': (('dw9800',), False), 'focus_supply': (FOCUS_SUPPLY, False), 'upside_down': (bool, False)}
+VIBRATOR_LDO_UV = (1504000, 3544000)   # the vibrator LDO's range (leds-qpnp-vibrator-ldo.c:36-37)
 CAMERA_SENSORS_MOST = 4         # (struct hakios_board's room)
 BOARD_SCHEMA = {
     '': {'name': (str, True), 'description': (str, True), 'soc': (str, True), 'features': ([str], True)},
@@ -138,6 +139,7 @@ BOARD_SCHEMA = {
     'torch': {'flash': (int, True), 'alarm': (int, True)},
     'haptic': {'sda': (int, True), 'scl': (int, True), 'reset': (int, True), 'interrupt': (int, True),
                'f0_calibration': (int, True)},
+    'vibrator': {'peripheral': (int, True), 'volt_uv': (int, True)},
     'imu': {'sda': (int, True), 'scl': (int, True), 'interrupt': (int, True), 'address': (int, True),
             'full_scale': (int, True), 'mount': ([str], True)},
     'touch': {'serial_engine': (int, True), 'clocks': ([int], True), 'vote_register': (int, True), 'votes': ([int], True),
@@ -185,7 +187,7 @@ KEY_WITH_UNDERSCORE = re.compile(r'(?<![\w.])(' + '|'.join(sorted(
      if '_' in key} | {key for key in CAMERA_SENSOR if '_' in key}, key=len, reverse=True)) + r')(?![\w(=])')
 # what a feature needs of the SoC file: a board cannot list a feature its SoC has no addresses for
 FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virtio': ('virtio',), 'cpufreq-scmi': ('scmi_perf',), 'cpufreq-epss': ('cpufreq',), 'display-scan': ('display',), 'buttons-pmic': ('spmi',),
-                 'torch-pm8350c': ('spmi',), 'torch-pm6150l': ('spmi',), 'ddr-rpmh': ('rpmh',),
+                 'torch-pm8350c': ('spmi',), 'torch-pm6150l': ('spmi',), 'haptic-pmic-ldo': ('spmi',), 'ddr-rpmh': ('rpmh',),
                  'camera-sm7325': ('spmi', 'pins', 'clocks', 'rpmh', 'smmu', 'camera'),
                  'gpu-a660': ('adreno', 'clocks', 'rpmh'),
                  # the part drivers that drive the SoC's pins, switch a bus's clocks on in the GCC, ask RPMh
@@ -198,7 +200,7 @@ FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virt
                  'adsp': ('rpmh', 'ipc'), 'wifi-wcn6750': ('rpmh', 'pins', 'spmi', 'ipc', 'smmu'), 'mic-wcd938x': ('pins', 'lpass')}
 # ... and the stream of the SMMU that a part's DMA comes in on: [stream ID, mask], from the device tree's iommus
 STREAM_OF = {'speaker-aw88261': 'audio_stream', 'wifi-wcn6750': 'wifi_stream', 'camera-sm7325': 'camera_stream'}
-WRITES_TO_PMIC = ('bluetooth-wcn-uart', 'torch-pm8350c', 'torch-pm6150l', 'camera-sm7325')    # ... these through the arbiter's channels as well
+WRITES_TO_PMIC = ('bluetooth-wcn-uart', 'torch-pm8350c', 'torch-pm6150l', 'haptic-pmic-ldo', 'camera-sm7325')    # ... these through the arbiter's channels as well
 # The boot arguments that start a feature's driver, as a porter is to try them: the level that only looks
 # first where there is one. (Documentation/boot-args.md has every argument; a test holds these names to it.)
 FEATURE_BOOTARGS = {
@@ -218,6 +220,7 @@ FEATURE_BOOTARGS = {
     'touch-gt9889': 'touchscreen=-1 looks; touchscreen=1',
     'speaker-aw88261': 'speaker_probe=N looks; sound=N with adsp=1',
     'haptic-aw86927': 'haptic=N',
+    'haptic-pmic-ldo': 'haptic_ldo=1 looks; haptic_ldo=3 is the motor for Darwin',
     'imu-lsm6dso': 'sensors=1 looks; sensors=2 follows the orientation',
     'imu-bmi160': 'sensors=1 looks; sensors=2 follows the orientation',
     'torch-pm8350c': 'torch=1 looks; torch=3 is the light for Darwin',
@@ -231,7 +234,7 @@ FEATURE_BOOTARGS = {
 PART_DRIVERS = ('bluetooth', 'touch', 'speaker', 'haptic', 'imu', 'torch', 'camera', 'wifi', 'mic', 'modem')
 # ... and of the board's own file
 FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'gpu-a660': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch', 'torch-pm6150l': 'torch',
-                          'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
+                          'haptic-aw86927': 'haptic', 'haptic-pmic-ldo': 'vibrator', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
                           'touch-ft3658u': 'touch', 'touch-ft5x06': 'touch_i2c', 'touch-gt9889': 'touch_i2c', 'camera-sm7325': 'camera', 'imu-lsm6dso': 'imu',
                           'imu-bmi160': 'imu'}
 # ... and what a controller's driver uses of [touch] beyond what every one needs
@@ -802,6 +805,14 @@ def load(problems=None):
                 if not 0 < torch[key] <= 0xfff or torch[key] & 0xff == 0:
                     problems.add(f'{rel} [torch]', f'{key} = {torch[key]:#x}: SPMI slave << 8 | the high byte of the '
                                  "peripheral's registers (0x2ee: slave 2, registers 0xee00)")
+        ldo = data.get('vibrator')
+        if ldo is not None:
+            if not 0 < ldo['peripheral'] <= 0xfff or ldo['peripheral'] & 0xff == 0:
+                problems.add(f'{rel} [vibrator]', f'peripheral = {ldo["peripheral"]:#x}: SPMI slave << 8 | the high byte of the '
+                             "LDO's registers (0x153: slave 1, registers 0x5300)")
+            if not VIBRATOR_LDO_UV[0] <= ldo['volt_uv'] <= VIBRATOR_LDO_UV[1]:
+                problems.add(f'{rel} [vibrator]', f'volt-uv = {ldo["volt_uv"]}: what the LDO can give is '
+                             f'{VIBRATOR_LDO_UV[0]} to {VIBRATOR_LDO_UV[1]} uV (the vendor driver\'s QPNP_VIB_LDO_VMIN_UV, VMAX_UV)')
         keys = data.get('buttons')
         if keys is not None:
             for key in ('pon', 'volume_up'):
@@ -1161,6 +1172,9 @@ def table_text(socs, boards):
                        f'.interrupt = {{ {amps["interrupts"][0]}, {amps["interrupts"][1]} }},\n\t\t\t'
                        f'.sound_pin = {{ {", ".join(str(pin) for pin in amps["sound_pins"])} }}, '
                        f'.sound_function = {amps["sound_function"]}, .tdm = {amps.get("tdm", 0)} }},')
+        ldo = board.get('vibrator')
+        if ldo:
+            out.append(f'\t\t.vibrator = {{ .peripheral = {ldo["peripheral"]:#05x}, .volt_uv = {ldo["volt_uv"]} }},')
         torch = board.get('torch')
         if torch:
             out.append(f'\t\t.torch = {{ .flash = {torch["flash"]:#05x}, .temp_alarm = {torch["alarm"]:#05x} }},')
@@ -1558,7 +1572,8 @@ def new_board(name, soc_name, dts=None, panel=None, description=None, moved=Fals
         out.comment(*title)
         out.node(node, commented)
         for key, value in values:
-            out.prop(boardfile.property_line(key, value, lambda v: f'{v:#05x}' if node in ('buttons', 'torch', 'rtc') else
+            out.prop(boardfile.property_line(key, value, lambda v: f'{v:#05x}' if node in ('buttons', 'torch', 'rtc') or (node == 'vibrator' and v < 0x1000) else
+                                                     str(v) if node == 'vibrator' else  # (microvolts, in decimal)
                                                      f'{v:#010x}' if v >= 0x10000 else str(v)))
         out.end()
 
@@ -1576,6 +1591,11 @@ def new_board(name, soc_name, dts=None, panel=None, description=None, moved=Fals
         section(('The flashlight\'s part on the PMIC, for the feature "torch-pm8350c": the flash LED module and that',
                  "PMIC's temperature alarm, each as SPMI slave << 8 | the high byte of its registers."), 'torch',
                 [('flash', torch['flash']), ('alarm', torch['alarm'])])
+    ldo = board.get('vibrator', {})
+    if 'peripheral' in ldo and 'volt_uv' in ldo:
+        section(('The vibration motor on the PMIC\'s vibrator LDO, for the feature "haptic-pmic-ldo": the LDO as SPMI slave << 8 |',
+                 "the high byte of its registers, and the supply it gives the motor, in microvolts."), 'vibrator',
+                [('peripheral', ldo['peripheral']), ('volt_uv', ldo['volt_uv'])])
     bt = board.get('bluetooth', {})
     if bt:
         section(('Bluetooth H4, feature "bluetooth-wcn-uart": only values the tree associates explicitly.',

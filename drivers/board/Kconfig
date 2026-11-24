@@ -269,6 +269,13 @@ config HAPTIC
 	help
 	  The haptic driver chip on I2C and the motor Darwin plays (board/haptic.c, haptic=).
 
+config HAPTIC_PMIC_LDO
+	bool "The vibration motor on a PMIC's vibrator LDO"
+	default y
+	select QCOM_SPMI
+	help
+	  The vibrator LDO of a PMIC as the motor Darwin plays (board/haptic_ldo.c, haptic_ldo=).
+
 config IMU_LSM6DSO
 	bool "An LSM6DSO or BMI160 accelerometer on I2C: the phone's orientation"
 	default y

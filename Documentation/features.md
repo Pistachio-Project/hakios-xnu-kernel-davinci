@@ -35,6 +35,7 @@ the two the same. What each key means is in `arch/arm64/boot/dts/_template/soc.d
 | `touch-ft5x06` | `pins { }` | `touch-i2c { }`: `sda`, `scl`, `interrupt`, `reset`, `address`, `contacts`, `coordinates` | `touchscreen=-1 looks; touchscreen=1` |
 | `touch-gt9889` | `pins { }` | `touch-i2c { }`: `sda`, `scl`, `interrupt`, `reset`, `address`, `contacts`, `coordinates` | `touchscreen=-1 looks; touchscreen=1` |
 | `torch-pm6150l` | `spmi { }`: `channels` | `torch { }`: `flash`, `alarm` | `torch=1 looks; torch=3 is the light for Darwin` |
+| `haptic-pmic-ldo` | `spmi { }`: `channels` | `vibrator { }`: `peripheral`, `volt-uv` | `haptic_ldo=1 looks; haptic_ldo=3 is the motor for Darwin` |
 
 The brightness (`backlight { }`), the thermal floors (`thermal { }`), the PMIC's clock (`rtc { }`, which
 needs `spmi { }` in the SoC file) and the partition that may be written (`storage { }`) are not

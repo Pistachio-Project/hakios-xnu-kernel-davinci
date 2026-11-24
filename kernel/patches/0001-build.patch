@@ -115,6 +115,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 +bsd/dev/board/speaker.c	standard
 +bsd/dev/board/guard.c	standard
 +bsd/dev/board/haptic.c	standard
++bsd/dev/board/haptic_ldo.c	standard
 +bsd/dev/board/imu.c	standard
 +bsd/dev/board/torch.c	standard
 +bsd/dev/board/board.c	standard
