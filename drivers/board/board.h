@@ -302,6 +302,7 @@ struct hakios_board {
 		uint32_t m_ahb_clock, s_ahb_clock, se_clock;    /* offsets in the clock controller (clocks { } gcc), as touch { } has them */
 		uint32_t vote_register;
 		uint8_t vote[5];
+		const char *config;             /* the controller's configuration package: a file of fw/ in the small image; NULL: none */
 	} touch_i2c;
 
 	/* Bluetooth H4 wiring (board: bluetooth { }); GCC offsets are explicit, including the RCG. */

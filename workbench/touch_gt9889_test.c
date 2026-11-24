@@ -140,12 +140,31 @@ static unsigned hang_after, reports_since_boot;
 static volatile unsigned reports_read;          /* reads of the event byte */
 static volatile unsigned second_reads;          /* reads of the fingers after the first */
 static volatile unsigned clears;                /* the event byte written 0 */
+/* what the firmware keeps besides the report: the doze handshake, the watchdog, the command register and the configuration */
+#define DOZE_CTRL_AT    0x30f0
+#define DOZE_STATE_AT   0x3100
+#define ESD_AT          0x30f3
+#define ESD_CHECK_AT    0x3103
+#define SENSOR_AT       0x4541
+#define PID_AT          0x4535
+#define COMMAND_AT      0x6f68
+#define CONFIG_AT       0x6f78
+#define CONFIG_BYTES    784
+static volatile bool doze_held, esd_stuck;
+static unsigned sensor_id_value = 1;
+static uint8_t command_bytes[3] = { 0xff, 0, 0 };
+static uint8_t config_got[CONFIG_BYTES];
+static unsigned config_bytes_got, config_transfers, last_config_start, config_outside_doze, esd_writes, doze_writes, clears_in_doze;
+static char order[64];                          /* what the chip was told, in order: E watchdog, S start, C a piece of the configuration, F end */
+static unsigned order_len;
+static void note(char c) { if (order_len < sizeof(order) - 1) { order[order_len++] = c; } }
 static unsigned data_writes;                    /* bytes written into the chip but its registers' numbers */
 static unsigned writes_elsewhere;               /* ... into registers but the event byte's */
 
 /* the report it puts out, set by the scenario; `pending' while the host has not taken it (and `steady': it is said again) */
 static uint8_t rep[96], frame_taken[96];
 static volatile bool pending, steady;
+static unsigned report_gen, taken_gen;         /* which report the chip has now, and which the host last began to read */
 static pthread_mutex_t stage_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned ptr, last_start;                /* the register the next byte is of; the start that set it */
 
@@ -175,6 +194,8 @@ chip_state(void)
 		address_selected = pin_high(int_pin);
 		wrong_address_boots += !address_selected;
 		hung = false;
+		doze_held = false;
+		command_bytes[0] = 0xff;
 		reports_since_boot = 0;
 		ready_at = now + BOOT_NS;
 	}
@@ -208,10 +229,38 @@ chip_written(uint8_t high, uint8_t value)
 		return;
 	}
 	data_writes++;
-	if (ptr == REPORT_AT && value == 0) {
+	if (ptr == DOZE_CTRL_AT) {
+		doze_held = value == 0xaa;
+		doze_writes++;
+	} else if (ptr == ESD_AT) {
+		esd_writes++;
+		note('E');
+	} else if (ptr >= COMMAND_AT && ptr < COMMAND_AT + 3) {
+		command_bytes[ptr - COMMAND_AT] = value;
+		config_outside_doze += !doze_held;
+		if (ptr == COMMAND_AT && value == 0x80) {
+			note('S');
+			command_bytes[0] = 0x82;        /* ready for the configuration */
+		} else if (ptr == COMMAND_AT && value == 0x83) {
+			note('F');
+			command_bytes[0] = 0xff;
+		}
+	} else if (ptr >= CONFIG_AT && ptr < CONFIG_AT + CONFIG_BYTES) {
+		if (last_config_start != device.starts) {
+			last_config_start = device.starts;
+			config_transfers++;
+			note('C');
+		}
+		config_outside_doze += !doze_held;
+		config_got[ptr - CONFIG_AT] = value;
+		config_bytes_got++;
+	} else if (ptr == REPORT_AT && value == 0) {
 		clears++;
+		clears_in_doze += doze_held;
 		pthread_mutex_lock(&stage_lock);
-		if (!steady) {
+		if (taken_gen != report_gen) {
+			/* (the host took an earlier report: this one it has yet to read) */
+		} else if (!steady) {
 			pending = false;
 			tlmm_model_line(int_pin, true);
 		} else {
@@ -239,11 +288,27 @@ chip_read(uint8_t high __unused)
 	if (ptr == REPORT_AT + 12) {
 		second_reads++;
 	}
+	if (ptr == DOZE_STATE_AT) {
+		return doze_held ? 0xbb : 0;
+	}
+	if (ptr == ESD_CHECK_AT) {
+		return esd_stuck ? 0xaa : 0;
+	}
+	if (ptr == SENSOR_AT) {
+		return (uint8_t)(sensor_id_value | 0x30);       /* (the high bits are the mask's to take away) */
+	}
+	if (ptr >= PID_AT && ptr < PID_AT + 4) {
+		return (uint8_t)"9886"[ptr++ - PID_AT];
+	}
+	if (ptr >= COMMAND_AT && ptr < COMMAND_AT + 3) {
+		return command_bytes[ptr++ - COMMAND_AT];
+	}
 	if (ptr == 0x3100) {
 		return 0xbb;                    /* the doze handshake: the chip is held awake */
 	}
 	pthread_mutex_lock(&stage_lock);
 	if (ptr == REPORT_AT) {
+		taken_gen = report_gen;
 		memcpy(frame_taken, pending ? rep : (const uint8_t[sizeof(rep)]){ 0 }, sizeof(frame_taken));   /* (a frame is whole when the host starts to read it) */
 	}
 	if (ptr >= REPORT_AT && ptr < REPORT_AT + sizeof(frame_taken)) {
@@ -283,6 +348,7 @@ chip_says(const struct finger *f, unsigned n, bool again)
 	rep[3 + 8 * n] = (uint8_t)-sum;
 	steady = again;
 	pending = true;
+	report_gen++;
 	tlmm_model_line(int_pin, true);
 	tlmm_model_line(int_pin, false);        /* its interrupt line: pulled low (an edge) while a report waits */
 	pthread_mutex_unlock(&stage_lock);
@@ -304,6 +370,100 @@ one_finger(unsigned id, unsigned x, unsigned y)
 	const struct finger f = { id, x, y };
 
 	chip_says(&f, 1, true);
+}
+
+/* ---- the configuration package, as board/image.c would find it: made here, in the file's format (gt9889_config.h) ------- */
+
+static uint8_t package_bytes[2048];
+static uint64_t package_size;
+static bool package_given;                      /* the small image has the file */
+static uint8_t package_config[2][CONFIG_BYTES]; /* what each package carries (sensor ids 1 and 0) */
+
+const uint8_t *
+hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out __unused)
+{
+	if (!package_given || strcmp(dir, "fw") != 0 || strcmp(name, "goodix_gt9886_cfg_f10.bin") != 0) {
+		return NULL;
+	}
+	*size = package_size;
+	return package_bytes;
+}
+
+static void put16(uint8_t *p, unsigned v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+
+/* a configuration of 784 bytes: a head and four bags of 195, every sum 0; `seed' makes the packages differ */
+static void
+make_config(uint8_t *cfg, unsigned seed)
+{
+	unsigned at = 4;
+	uint8_t sum;
+
+	memset(cfg, 0, CONFIG_BYTES);
+	cfg[0] = (uint8_t)(0x1e + seed);
+	cfg[1] = 1;
+	cfg[2] = 4;
+	cfg[3] = (uint8_t)-(uint8_t)(cfg[0] + cfg[1] + cfg[2]);
+	for (unsigned bag = 0; bag < 4; bag++, at += 195) {
+		cfg[at] = (uint8_t)(0x40 + bag);
+		cfg[at + 1] = 192;                      /* (n: the bag is n + 3 bytes, its last the one that makes the sum 0) */
+		sum = (uint8_t)(cfg[at] + cfg[at + 1]);
+		for (unsigned i = 0; i < 192; i++) {
+			cfg[at + 2 + i] = (uint8_t)(i * 7 + seed * 31 + bag);
+			sum = (uint8_t)(sum + cfg[at + 2 + i]);
+		}
+		cfg[at + 194] = (uint8_t)-sum;
+	}
+}
+
+static void
+make_package_file(void)
+{
+	const unsigned sensor[2] = { 1, 0 }, size = 121 + CONFIG_BYTES;
+	uint8_t *file = package_bytes;
+
+	memset(package_bytes, 0, sizeof(package_bytes));
+	put16(&file[16], 20);
+	put16(&file[18], 20 + size);
+	file[9] = 2;
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t *p = &file[20 + i * size];
+		unsigned reg[11] = { 0x4542, 0x452c, 0x4535, 0x453d, 0x4541, 0, 0, 0x6f78, 0x30f3, 0x6f68, 0x4100 };
+		const unsigned length[11] = { 4, 72, 4, 4, 15, 0, 0, 0, 0, 0, 0 };
+
+		p[0] = (uint8_t)size;
+		p[1] = (uint8_t)(size >> 8);
+		memcpy(&p[4], "normandy", 8);
+		p[19] = 1;
+		p[20] = (uint8_t)sensor[i];
+		memcpy(&p[21], "9886", 4);
+		for (unsigned r = 0; r < 11; r++) {
+			put16(&p[56 + 4 * r], reg[r]);
+			p[56 + 4 * r + 2] = (uint8_t)length[r];
+		}
+		make_config(package_config[i], i + 1);
+		memcpy(&p[121], package_config[i], CONFIG_BYTES);
+	}
+	package_size = 20 + 2 * size;
+	file[0] = (uint8_t)package_size;
+	file[1] = (uint8_t)(package_size >> 8);
+	file[4] = 0;
+	for (uint64_t i = 5; i < package_size; i++) {
+		file[4] = (uint8_t)(file[4] + file[i]);
+	}
+	package_given = true;
+}
+
+/* the file as it is with one byte changed (and its own checksum made right again, unless `fix' is false) */
+static void
+damage_file(unsigned at, bool fix)
+{
+	package_bytes[at] ^= 0x5a;
+	if (fix) {
+		package_bytes[4] = 0;
+		for (uint64_t i = 5; i < package_size; i++) {
+			package_bytes[4] = (uint8_t)(package_bytes[4] + package_bytes[i]);
+		}
+	}
 }
 
 /* ---- the registers: the pins' model, with the chip on them ----------------------------------------------------------- */
@@ -716,7 +876,7 @@ brought_up_in_steps(void)
 	CHECK(pin_high(reset_pin) && (model.cfg[reset_pin] & 1u << 9), "the reset let go, driven high");
 	CHECK((model.cfg[int_pin] & (1u << 9 | 0x3c | 3u)) == 3u, "the interrupt's pin an input, pulled up: %#x", model.cfg[int_pin]);
 	CHECK(pin_high((unsigned)avdd_pin) && (model.cfg[avdd_pin] & 1u << 9), "the analog supply's pin driven high");
-	CHECK(data_writes == 0, "%u bytes written into the chip before anything was reported", data_writes);
+	CHECK(data_writes == esd_writes, "%u bytes written into the chip before anything was reported, %u the watchdog's", data_writes, esd_writes);
 	CHECK(device.driven_high == 0 && model.drove_wrong == 0 && model.elsewhere == 0, "the pins used as they are meant");
 	CHECK(mappings == 3, "the pins, RPMh and its command database mapped: %u", mappings);
 	CHECK(posts == 0, "nothing posted of a chip nobody touches: %u", posts);
@@ -942,7 +1102,7 @@ doze_handshake(void)
 	WAIT_FOR(logged("touch screen ready"), 10000);
 	one_finger(3, 5, 6);
 	WAIT_FOR(posts >= 1, 3000);
-	CHECK(posts >= 1 && writes_elsewhere >= 2, "the handshake's writes seen next to the event byte's: %u", writes_elsewhere);
+	CHECK(posts >= 1 && clears_in_doze >= 1 && doze_writes >= 2, "the event byte written inside the handshake (aa, cc): %u clears, %u writes", clears_in_doze, doze_writes);
 	quiesce();
 }
 
@@ -1035,6 +1195,96 @@ four_troubles_end_it(void)
 	powered_off("troubles without end");
 }
 
+/* the configuration package for the chip's sensor id, sent byte for byte after the watchdog's first tick, inside the doze handshake */
+static void
+package_sent_exact(void)
+{
+	make_package_file();
+	ready();
+	WAIT_FOR(logged("sent") || logged("NOT sent"), 5000);
+	CHECK(logged("configuration package for sensor id 1 (784 bytes, version 0x1f) sent"), "said: %s", log_text);
+	CHECK(config_bytes_got == CONFIG_BYTES && memcmp(config_got, package_config[0], CONFIG_BYTES) == 0, "the 784 bytes as the package has them: %u", config_bytes_got);
+	CHECK(config_transfers == 4, "in pieces of at most 254 bytes: %u transfers", config_transfers);
+	CHECK(strcmp(order, "ESCCCCF") == 0, "the watchdog, the start command, the pieces, the end command: %s", order);
+	CHECK(command_bytes[0] == 0xff && config_outside_doze == 0, "the command register free again, nothing written outside the handshake: %u", config_outside_doze);
+	CHECK(!doze_held && doze_writes >= 2, "the handshake closed: %u writes", doze_writes);
+	one_finger(2, 10, 20);
+	taken();
+	CHECK(posts == 1, "and the screen goes on being read");
+	CHECK(seen.bad == 0, "%u bad", seen.bad);
+}
+
+/* the package of the other sensor id, and none for an id nobody has a package for */
+static void
+package_by_sensor_id(void)
+{
+	make_package_file();
+	sensor_id_value = 0;
+	ready();
+	WAIT_FOR(logged("sent") || logged("NOT sent"), 5000);
+	CHECK(logged("package 0 is for sensor id 1, the chip says 0") && logged("configuration package for sensor id 0"), "said: %s", log_text);
+	CHECK(memcmp(config_got, package_config[1], CONFIG_BYTES) == 0 && memcmp(config_got, package_config[0], CONFIG_BYTES) != 0, "the second package's bytes");
+}
+
+static void
+package_for_no_sensor(void)
+{
+	make_package_file();
+	sensor_id_value = 7;
+	ready();
+	WAIT_FOR(logged("no package for this chip"), 5000);
+	CHECK(config_bytes_got == 0 && strchr(order, 'S') == NULL, "nothing sent: %s", order);
+	one_finger(2, 10, 20);
+	taken();
+	CHECK(posts == 1, "the screen is read all the same");
+}
+
+/* a file that is not whole is not used, whatever part of it it is: not a byte of it reaches the chip */
+static void
+bad_package(unsigned at, bool fix, const char *why)
+{
+	make_package_file();
+	damage_file(at, fix);
+	ready();
+	WAIT_FOR(logged("not a configuration package"), 5000);
+	CHECK(logged(why), "said '%s': %s", why, log_text);
+	CHECK(config_bytes_got == 0 && strchr(order, 'S') == NULL && order[0] == 'E', "nothing of it sent: %s", order);
+	one_finger(2, 10, 20);
+	taken();
+	CHECK(posts == 1, "the screen is read all the same");
+}
+
+static void bad_package_checksum(void) { bad_package(300, false, "the file's checksum is wrong"); }
+static void bad_package_bag(void) { bad_package(20 + 121 + 100, true, "a bag of the configuration does not add up"); }
+static void bad_package_head(void) { bad_package(20 + 121 + 1, true, "the configuration's head does not add up"); }
+static void bad_package_length(void) { bad_package(0, true, "the length in the file is not the file's"); }
+static void bad_package_offsets(void) { bad_package(19, true, "the offsets of the packages are not in order"); }
+
+static void
+package_absent(void)
+{
+	ready();
+	WAIT_FOR(logged("no fw/goodix_gt9886_cfg_f10.bin in the small image"), 5000);
+	CHECK(config_bytes_got == 0 && order[0] == 'E' && order[1] == 0, "only the watchdog fed: %s", order);
+	one_finger(2, 10, 20);
+	taken();
+	CHECK(posts == 1, "the screen is read all the same");
+}
+
+/* the watchdog: fed after the reset, checked and fed every five seconds, said (not acted on) when the tick stays */
+static void
+esd_ticks(void)
+{
+	ready();
+	CHECK(esd_writes >= 1, "fed after the reset: %u", esd_writes);
+	WAIT_FOR(esd_writes >= 3 && seen.esd_ticks >= 2, 15000);
+	CHECK(esd_writes >= 3 && seen.esd_failed == 0 && !logged("watchdog check"), "fed again each time, nothing wrong: %u writes, %u failed", esd_writes, seen.esd_failed);
+	esd_stuck = true;
+	WAIT_FOR(seen.esd_failed >= 1, 10000);
+	CHECK(logged("watchdog check found the tick still there"), "said: %s", log_text);
+	CHECK(boots == 1 && !logged("looks in a row"), "and the chip not reset for it");
+}
+
 /* the run's end while polling: no more reads, nothing posted, the chip powered off and the pins as found */
 static void
 run_ends_while_polling(void)
@@ -1087,7 +1337,12 @@ main(int argc, char **argv)
 		{ "one_finger_down_moves_up", one_finger_down_moves_up }, { "several_fingers", several_fingers },
 		{ "mirrored", mirrored }, { "reports_not_believed", reports_not_believed }, { "firmware_request", firmware_request },
 		{ "dozing_is_not_trouble", dozing_is_not_trouble }, { "edge_latched_read_promptly", edge_latched_read_promptly },
-		{ "doze_handshake", doze_handshake }, { "silent_finger_lifted", silent_finger_lifted },
+		{ "doze_handshake", doze_handshake },
+		{ "package_sent_exact", package_sent_exact }, { "package_by_sensor_id", package_by_sensor_id },
+		{ "package_for_no_sensor", package_for_no_sensor }, { "bad_package_checksum", bad_package_checksum },
+		{ "bad_package_bag", bad_package_bag }, { "bad_package_head", bad_package_head },
+		{ "bad_package_length", bad_package_length }, { "bad_package_offsets", bad_package_offsets },
+		{ "package_absent", package_absent }, { "esd_ticks", esd_ticks }, { "silent_finger_lifted", silent_finger_lifted },
 		{ "reset_brings_it_back", reset_brings_it_back }, { "four_troubles_end_it", four_troubles_end_it },
 		{ "run_ends_while_polling", run_ends_while_polling }, { "run_ends_in_bring_up", run_ends_in_bring_up },
 	};

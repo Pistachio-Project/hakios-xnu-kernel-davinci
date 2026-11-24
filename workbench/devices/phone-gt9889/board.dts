@@ -25,5 +25,6 @@
 		analog-supply = "ldoc6";
 		analog-millivolts = <3000>;
 		analog-enable = <5>;
+		config = "goodix_gt9886_cfg_f10.bin";
 	};
 };

@@ -7,6 +7,9 @@
 #   tools/qemu-root.sh OUT.img
 #   tools/qemu-kernel.sh --ramdisk OUT.img --boot-args rd=md0 KERNEL
 #
+# QEMU_ROOT_FW=DIR: its files into fw/ of the image, where the drivers look for firmware (board/image.c): e.g. the touch
+# screen's configuration package, firmware/davinci/fw/goodix_gt9886_cfg_f10.bin.
+#
 # XNU_CLANG_DIR: the directory of clang and ld64.lld (default: where clang is found).
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -25,6 +28,10 @@ done
 "$L/ld64.lld" -arch arm64 -platform_version 2 16.5 16.5 -e _start -no_adhoc_codesign -no_fixup_chains \
 	-o "$W/init.lld" "${objects[@]}"
 mkdir -p "$W/root/sbin" "$W/root/dev" "$W/root/etc" "$W/root/mnt" "$W/root/tmp"
+if [ -n "${QEMU_ROOT_FW:-}" ]; then
+	mkdir -p "$W/root/fw"
+	cp "$QEMU_ROOT_FW"/* "$W/root/fw/"
+fi
 printf '%s\n' "This root was made by tools/qemu-root.sh: an APFS image of nothing of Apple's, with" \
 	"/sbin/launchd, which is tools/qemu-init/, and /dev, where the kernel mounts devfs." > "$W/root/etc/motd"
 python3 "$HERE/kernel/host/llvm/place-kernel.py" --program "$W/init.lld" "$W/root/sbin/launchd" > /dev/null

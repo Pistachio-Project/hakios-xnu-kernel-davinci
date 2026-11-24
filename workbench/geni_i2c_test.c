@@ -105,7 +105,7 @@ static unsigned chip_address = 0x5d;
 static uint8_t rep[96];
 static volatile bool pending;
 static unsigned ptr;
-static volatile unsigned reports_read, clears, other_writes, nacks;
+static volatile unsigned reports_read, clears, other_writes, nacks, watchdog_fed;
 static uint8_t scratch[0x100];          /* a register far from the report, to read and write whatever */
 
 static uint8_t
@@ -140,6 +140,8 @@ chip_write(const uint8_t *bytes, unsigned count)
 		if (ptr == REPORT_AT && bytes[i] == 0) {
 			clears++;
 			pending = false;
+		} else if (ptr == 0x30f3 && bytes[i] == 0xaa) {
+			watchdog_fed++;                 /* (the driver's watchdog, after the reset) */
 		} else if (ptr < sizeof(scratch)) {
 			scratch[ptr] = bytes[i];
 			other_writes++;
@@ -310,6 +312,13 @@ hakios_test_wr(vm_offset_t address, uint32_t value)
 static struct post { uint32_t type, finger, x, y; } posted[512];
 static volatile unsigned posts;
 static pthread_mutex_t post_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* (board/image.c: no configuration package in this test's image) */
+const uint8_t *
+hakios_image_file(const char *dir __unused, const char *name __unused, uint64_t *size __unused, int *disk_out __unused)
+{
+	return NULL;
+}
 
 void
 hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)

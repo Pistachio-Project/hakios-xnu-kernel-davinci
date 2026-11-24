@@ -152,7 +152,7 @@ BOARD_SCHEMA = {
                   'address': (int, True), 'contacts': (int, True), 'coordinates': ([int], True),
                   'io_supply': (str, False), 'analog_supply': (str, False), 'analog_millivolts': (int, False),
                   'analog_enable': (int, False), 'serial_engine': (int, False), 'clocks': ([int], False),
-                  'vote_register': (int, False), 'votes': ([int], False)},
+                  'vote_register': (int, False), 'votes': ([int], False), 'config': (str, False)},
     'bluetooth': {'serial_engine': (int, True), 'wrapper': (int, True), 'clocks': ([int], True),
                   'clock_source': (int, True), 'vote_register': (int, True), 'votes': ([int], True),
                   'uart_pins': ([int], True), 'uart_function': (int, True), 'enable_ppid': (int, True),
@@ -806,6 +806,9 @@ def load(problems=None):
                     problems.add(f'{rel} [touch_i2c]', 'clocks are three different offsets in the clock controller: the two bus clocks, the engine\'s own')
                 if len(wired['votes']) != 5 or any(not 0 <= bit <= 31 for bit in wired['votes']) or len(set(wired['votes'])) != 5:
                     problems.add(f'{rel} [touch_i2c]', 'votes are five different bits of the vote register, 0 to 31')
+        if isinstance(wired, dict) and 'config' in wired and not re.fullmatch(r'[A-Za-z0-9._-]{1,63}', wired['config']):
+            problems.add(f'{rel} [touch_i2c]', 'config is the name of a file of fw/ in the small image (the controller\'s configuration '
+                         'package, from fw-NAME/): letters, digits, dots, dashes and underscores, up to 63')
         amps = data.get('speaker')
         if amps is not None:
             wires = [amps['sda'], amps['scl']] + list(amps['interrupts']) + list(amps['sound_pins'])
@@ -1191,6 +1194,8 @@ def table_text(socs, boards):
                     f'.se_clock = {wired["clocks"][2]:#x},',
                     f'\t\t\t.vote_register = {wired["vote_register"]:#x}, .vote = {{ {", ".join(str(bit) for bit in wired["votes"])} }},',
                 ]
+            if 'config' in wired:
+                out.append(f'\t\t\t.config = {c_string(wired["config"])},')
             out += [
                 '\t\t},',
             ]

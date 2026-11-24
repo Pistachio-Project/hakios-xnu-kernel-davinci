@@ -136,6 +136,10 @@
 		//                              // engine's, as bit numbers (tools/qupclocks.py gcc-SOC.c WRAPPER ENGINE prints the three lines;
 		//                              // WRAPPER and ENGINE from the node's se-clk, GCC_QUPV3_WRAPw_Se_CLK: a node's "seN" label is
 		//                              // the chip-wide number, not the engine's within its wrapper)
+		// config = "goodix_gt9886_cfg_f10.bin"; // optional, touch-gt9889: the controller's configuration package, a file of fw/ in
+		//                              // the small image (fw-NAME/ when it is built): the vendor's kernel has it compiled in
+		//                              // (firmware/*.ihex), made binary. After each reset the driver sends the package for the
+		//                              // chip's sensor id; without the key or the file the chip keeps what it has (and may not scan)
 	// };
 	// The same section is the feature "touch-gt9889"'s: a Goodix GT9889 ("goodix,gt9889" node, the vendor's
 	// goodix_driver_gt9886), a board lists one of the two. Its keys are the node's: address = reg (0x5d);

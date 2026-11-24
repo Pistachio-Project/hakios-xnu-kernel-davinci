@@ -65,6 +65,12 @@
  * and where the latch could not be armed the line's level and the old idle looks are what is used. The pin's interrupt
  * registers are given back as found. gt9889_doze=1 brackets the event byte's write with the vendor's doze handshake.
  *
+ * After each reset (and the chip's answer): the watchdog's tick (0xAA into 0x30F3, again every 5 s with a look at 0x3103; a
+ * failed check is said, nothing more) and, if the board's touch-i2c names a `config' file of fw/ in the small image, the
+ * vendor's configuration package for the chip's sensor id, whole-checked first (gt9889_config.h) and sent by the vendor's
+ * command sequence inside its doze handshake. The chip scans nothing without it (found on the phone). A missing or
+ * invalid file is said and the chip left as it is.
+ *
  * What a report costs: the bus is driven by hand at 100 kHz at most with a core spun for it (i2c_gpio.h). The 12
  * bytes of a look are some 130 bits, about 1.4 ms; idle the chip is looked at every fourth tick (31 times a second:
  * 4 % of a core), with a finger down 125 times a second (a sixth of a core and more with more fingers). A serial
@@ -98,6 +104,7 @@
 #include "board.h"
 #include "log.h"
 #include "gt9889_report.h"
+#include "gt9889_config.h"
 
 static vm_offset_t tlmm, rsc, cmd_db;
 
@@ -130,7 +137,7 @@ gt9889_wait_us(uint32_t us)
 
 #define POLL_MS                 8       /* the interrupt line is looked at 125 times a second */
 #define LATCHLESS_TICKS         125     /* with the latch armed and no edge: the chip is asked once a second */
-#define DOZE_TRIES              20
+#define WRITE_MAX               254     /* the vendor's transfers: 256 bytes with the register's number */
 #define IDLE_LOOKS              4       /* ... and the chip asked on every fourth look whatever the line says (this file's head: interrupt) */
 #define LIFT_US                 250000  /* nothing believable for so long: the fingers are lifted */
 #define TROUBLE_LOOKS           125     /* so many looks in a row without a report: the chip is reset */
@@ -514,27 +521,40 @@ regs_read(uint16_t reg, uint8_t *values, unsigned count)
 	return answered;
 }
 
-/* one byte into a register: the event byte's 0 (and the doze handshake's), which says the report was taken (the only write this file makes) */
+/* `count' bytes into the registers from `reg' on (one transaction) */
 static bool
-reg_write(uint16_t reg, uint8_t value)
+regs_write(uint16_t reg, const uint8_t *values, unsigned count)
 {
 	bool done;
 
 	if (geni_on) {
-		const uint8_t at[3] = { (uint8_t)(reg >> 8), (uint8_t)reg, value };
+		uint8_t out[2 + WRITE_MAX];
 
-		return engine_transfer(at, sizeof(at), NULL, 0);
+		out[0] = (uint8_t)(reg >> 8);
+		out[1] = (uint8_t)reg;
+		memcpy(&out[2], values, count);
+		return engine_transfer(out, 2 + count, NULL, 0);
 	}
 	if (!bus_take()) {
 		return false;
 	}
-	done = address_register(reg) && i2c_gpio_write(&i2c_bus, value);
+	done = address_register(reg);
+	for (unsigned i = 0; done && i < count; i++) {
+		done = i2c_gpio_write(&i2c_bus, values[i]);
+	}
 	i2c_gpio_stop(&i2c_bus);
 	bus_give_back();
 	if (!done) {
 		failed = not_acknowledged;
 	}
 	return done;
+}
+
+/* one byte into a register: the event byte's 0, the doze handshake's and the commands' bytes */
+static bool
+reg_write(uint16_t reg, uint8_t value)
+{
+	return regs_write(reg, &value, 1);
 }
 
 static struct { bool down; uint32_t x, y; } contact[GT9889_CONTACTS];
@@ -551,31 +571,56 @@ fingers_down(void)
 	return down;
 }
 
-/* The vendor's doze handshake (goodix_ts_i2c.c:522-587): 0xAA into 0x30F0, the chip says 0xBB in 0x3100, later 0xCC. */
+/*
+ * The vendor's doze handshake (goodix_ts_i2c.c goodix_set_i2c_doze_mode(), 522-587): 0xAA into 0x30F0, the chip says 0xBB
+ * in 0x3100 (asked again every 10 ms, 0xAA again if it says neither), and later 0xCC into 0x30F0. The vendor's reads and
+ * writes outside its interrupt handler are each inside one; the report's own read is not.
+ */
 #define GT9889_REG_DOZE         0x30f0
 #define GT9889_REG_DOZE_STATE   0x3100
-static uint32_t doze;                   /* gt9889_doze=1 */
+#define DOZE_TRIES              10
+static uint32_t doze;                   /* gt9889_doze=1: the event byte's write inside it as well */
+
+static bool
+doze_hold(void)
+{
+	uint8_t state = 0;
+
+	(void)reg_write(GT9889_REG_DOZE, 0xaa);
+	gt9889_wait_us(1000);
+	for (unsigned i = 0; i < DOZE_TRIES; i++) {
+		state = 0;
+		if (regs_read(GT9889_REG_DOZE_STATE, &state, 1) && state == 0xbb) {
+			return true;
+		}
+		if (state != 0xaa) {
+			(void)reg_write(GT9889_REG_DOZE, 0xaa);
+		}
+		wait_ms(10);
+	}
+	return false;
+}
+
+static void
+doze_release(void)
+{
+	for (unsigned i = 0; i < DOZE_TRIES; i++) {
+		if (reg_write(GT9889_REG_DOZE, 0xcc)) {
+			return;
+		}
+		gt9889_wait_us(1000);
+	}
+}
 
 /* the event byte written 0 (the chip waits for that before the next report), inside the handshake if asked for */
 static void
 doze_ack(void)
 {
-	bool held = false;
-	uint8_t state = 0;
+	bool held = (doze & 1) && doze_hold();
 
-	if (doze & 1) {
-		if (reg_write(GT9889_REG_DOZE, 0xaa)) {
-			for (unsigned i = 0; i < DOZE_TRIES && !held; i++) {
-				held = regs_read(GT9889_REG_DOZE_STATE, &state, 1) && state == 0xbb;
-				if (!held) {
-					gt9889_wait_us(1000);
-				}
-			}
-		}
-	}
 	(void)reg_write(GT9889_REG_REPORT, 0);
 	if (held) {
-		(void)reg_write(GT9889_REG_DOZE, 0xcc);
+		doze_release();
 	}
 }
 
@@ -611,7 +656,7 @@ report_read(uint8_t *report, unsigned *bytes)
 
 static uint32_t flip, trace;
 static uint32_t panel_x, panel_y;       /* the largest coordinates: the board's */
-static struct { uint32_t looks, reports, bad, reads_failed, positions, idle_misses, requests, raw_dumped; } seen;
+static struct { uint32_t looks, reports, bad, reads_failed, positions, idle_misses, requests, raw_dumped, esd_ticks, esd_failed; } seen;
 
 static void
 report(const struct gt9889_frame *frame)
@@ -783,6 +828,235 @@ identify(unsigned tries)
 	return true;
 }
 
+/* ---- the chip's configuration and its watchdog ------------------------------------------------------------------ */
+
+/*
+ * What the vendor's driver does after a reset and the chip does not do without: the watchdog fed (goodix_hw_reset()'s
+ * tail, goodix_ts_i2c.c:1495-1520: 0xAA into the esd register, then every GOODIX_ESD_CHECK_INTERVAL = 5 s again, the
+ * check reading 0x3103: 0xAA still there, or no answer, is the firmware not running: goodix_ts_core.c:1379-1420), and the
+ * configuration package for this chip's sensor sent (goodix_send_config(), goodix_ts_i2c.c:894-1150). Without the
+ * package the firmware has no panel configuration and scans nothing (found on the phone: no interrupt edge but the boot
+ * report's). All inside the doze handshake, as the vendor's generic reads and writes are.
+ */
+#define GT9889_REG_ESD          0x30f3
+#define GT9889_REG_ESD_CHECK    0x3103
+#define GT9889_REG_COMMAND      0x6f68
+#define GT9889_REG_CONFIG       0x6f78
+#define ESD_TICK                0xaa
+#define ESD_TICKS               (5000 / POLL_MS)
+#define CMD_READY               0xff
+#define CMD_START_SEND          0x80
+#define CMD_END_SEND            0x83
+#define CMD_PREPARE_OK          0x82
+#define CMD_FREE_TRIES          10
+#define CMD_READY_TRIES         30
+
+extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);   /* board/image.c */
+
+static struct gt9889_config package_file;
+static bool package_tried;
+static bool esd_on;
+static uint16_t esd_reg = GT9889_REG_ESD;
+
+#define going()                 __atomic_load_n(&leaving, __ATOMIC_SEQ_CST)
+
+/* the board's file of fw/ in the small image, parsed and checked, once */
+static void
+package_load(void)
+{
+	const uint8_t *file;
+	uint64_t size = 0;
+	const char *wrong;
+
+	if (package_tried || WIRED->config == NULL) {
+		return;
+	}
+	package_tried = true;
+	file = hakios_image_file("fw", WIRED->config, &size, NULL);
+	if (file == NULL) {
+		say("gt9889: no fw/%s in the small image: the chip keeps the configuration it has, and may not scan\n", WIRED->config);
+		return;
+	}
+	wrong = gt9889_config_parse(file, size, &package_file);
+	if (wrong != NULL) {
+		say("gt9889: fw/%s (%u bytes) is not a configuration package: %s; not used\n", WIRED->config, (unsigned)size, wrong);
+		package_file.count = 0;
+		return;
+	}
+	say("gt9889: fw/%s: %u packages, each checked\n", WIRED->config, package_file.count);
+}
+
+static bool
+command_send(uint16_t reg, uint8_t command)
+{
+	const uint8_t bytes[3] = { command, 0, (uint8_t)(0 - command) };
+
+	return regs_write(reg, bytes, sizeof(bytes));
+}
+
+/* until the command register says it is free (0xff) */
+static bool
+command_free(uint16_t reg)
+{
+	uint8_t value = 0;
+
+	for (unsigned i = 0; i < CMD_FREE_TRIES && !going(); i++) {
+		if (regs_read(reg, &value, 1) && value == CMD_READY) {
+			return true;
+		}
+		wait_ms(10);
+	}
+	return false;
+}
+
+/* until the chip answers a command with `right' (goodix_wait_cfg_cmd_ready()): the command sent again if it says something else */
+static bool
+command_answered(uint16_t reg, uint8_t right, uint8_t sent)
+{
+	uint8_t value[3];
+
+	for (unsigned i = 0; i < CMD_READY_TRIES && !going(); i++) {
+		if (!regs_read(reg, value, sizeof(value))) {
+			return false;
+		}
+		if (value[0] == right) {
+			return true;
+		}
+		if (value[0] != sent && !command_send(reg, sent)) {
+			return false;
+		}
+		wait_ms(10);
+	}
+	return false;
+}
+
+/* the package the chip's sensor id, hardware id (and firmware mask) say (goodix_get_reg_and_cfg()); NULL if none */
+static const struct gt9889_package *
+package_select(void)
+{
+	for (unsigned i = 0; i < package_file.count && !going(); i++) {
+		const struct gt9889_package *k = &package_file.package[i];
+		uint8_t sensor = 0, pid[8] = { 0 }, mask[9] = { 0 };
+
+		if (!regs_read(k->sensor_reg, &sensor, 1)) {
+			say("gt9889: package %u: the sensor id (0x%04x) not read: %s\n", i, k->sensor_reg, failed);
+			return NULL;
+		}
+		if (k->sensor_mask != 0) {
+			sensor &= k->sensor_mask;
+		}
+		if (sensor != k->sensor_id) {
+			say("gt9889: package %u is for sensor id %u, the chip says %u\n", i, k->sensor_id, sensor);
+			continue;
+		}
+		if (k->fw_mask_reg != 0 && k->fw_mask[0] != 0) {
+			if (!regs_read(k->fw_mask_reg, mask, sizeof(mask))) {
+				return NULL;
+			}
+			if (memcmp(mask, k->fw_mask, sizeof(mask)) != 0) {
+				say("gt9889: package %u: the firmware mask is not the chip's\n", i);
+				continue;
+			}
+		}
+		if (!regs_read(k->pid_reg, pid, k->pid_length)) {
+			say("gt9889: package %u: the hardware id (0x%04x) not read: %s\n", i, k->pid_reg, failed);
+			return NULL;
+		}
+		if (memcmp(pid, k->pid, k->pid_length) != 0) {
+			say("gt9889: package %u is for hardware id %.4s, the chip says %.4s\n", i, (const char *)k->pid, (const char *)pid);
+			continue;
+		}
+		if (k->cfg_type == 1) {
+			return k;
+		}
+	}
+	return NULL;
+}
+
+/* the configuration into the chip (goodix_send_large_config()): the command register free, 0x80, its 0x82, the bytes, 0x83, free */
+static bool
+package_send(const struct gt9889_package *k)
+{
+	if (!command_free(k->command_reg)) {
+		say("gt9889: the command register (0x%04x) is not free (0xff)\n", k->command_reg);
+		return false;
+	}
+	if (!command_send(k->command_reg, CMD_START_SEND) || !command_answered(k->command_reg, CMD_PREPARE_OK, CMD_START_SEND)) {
+		say("gt9889: the chip does not take the configuration (0x%04x does not say 0x82)\n", k->command_reg);
+		return false;
+	}
+	for (unsigned at = 0; at < k->length; at += WRITE_MAX) {
+		unsigned n = k->length - at < WRITE_MAX ? k->length - at : WRITE_MAX;
+
+		if (!regs_write((uint16_t)(k->cfg_reg + at), &k->cfg[at], n)) {
+			say("gt9889: the configuration not written at 0x%04x: %s\n", k->cfg_reg + at, failed);
+			return false;
+		}
+	}
+	if (!command_send(k->command_reg, CMD_END_SEND) || !command_free(k->command_reg)) {
+		say("gt9889: the chip does not finish with the configuration (0x%04x not 0xff after 0x83)\n", k->command_reg);
+		return false;
+	}
+	return true;
+}
+
+/* the watchdog's first tick, after a reset */
+static void
+esd_init(void)
+{
+	if (!reg_write(esd_reg, ESD_TICK)) {
+		say("gt9889: the watchdog (0x%04x) not fed: %s\n", esd_reg, failed);
+	}
+	esd_on = true;
+}
+
+/* every five seconds (goodix_esd_check(), goodix_ts_esd_work()): looked at, said if it did not run, fed again */
+static void
+esd_tick(void)
+{
+	uint8_t value = 0;
+	bool read = regs_read(GT9889_REG_ESD_CHECK, &value, 1);
+
+	seen.esd_ticks++;
+	if (!read || value == ESD_TICK) {
+		if (seen.esd_failed++ < 4) {
+			say("gt9889: the watchdog check %s (0x%04x%s%02x): the firmware may not be running\n", read ? "found the tick still there" : "was not answered",
+			    GT9889_REG_ESD_CHECK, read ? " = 0x" : "", value);
+		}
+	}
+	(void)reg_write(esd_reg, ESD_TICK);
+}
+
+/* After a reset and an answer from the chip: the watchdog, then the configuration if the board has one and the file is whole. */
+static void
+chip_start(void)
+{
+	const struct gt9889_package *k;
+	bool held, sent;
+
+	esd_init();
+	package_load();
+	if (package_file.count == 0 || going()) {
+		return;
+	}
+	held = doze_hold();
+	if (!held) {
+		say("gt9889: the chip does not say it is awake (0xbb in 0x%04x): going on\n", GT9889_REG_DOZE_STATE);
+	}
+	k = package_select();
+	if (k == NULL) {
+		say("gt9889: no package for this chip: nothing sent\n");
+	} else {
+		esd_reg = k->esd_reg;
+		sent = package_send(k);
+		say("gt9889: configuration package for sensor id %u (%u bytes, version 0x%02x) %s\n", k->sensor_id, k->length, k->cfg[0],
+		    sent ? "sent" : "NOT sent");
+	}
+	if (held) {
+		doze_release();
+	}
+}
+
 static uint32_t steps = 5;              /* gt9889_steps=N */
 
 /* Steps 1 to 4 (this file's head): the chip ready to be read, not there (for a reason said), or the steps asked for made. */
@@ -908,6 +1182,9 @@ poll_once(unsigned tick)
 	bool armed = __atomic_load_n(&latch_armed, __ATOMIC_SEQ_CST), edge = false, down = fingers_down() != 0, asked, got;
 	uint64_t now;
 
+	if (esd_on && tick % ESD_TICKS == 0) {
+		esd_tick();
+	}
 	if (armed) {
 		/* the latch is cleared before the read, so that an edge during it is the next report's */
 		edge = gpio_edge_latched(PIN_INT);
@@ -989,6 +1266,7 @@ poll_once(unsigned tick)
 			if (!identify(IDENTITY_TRIES)) {
 				return false;
 			}
+			chip_start();
 			trouble.failures = 0;
 		}
 	}
@@ -1045,6 +1323,7 @@ gt9889_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 		return;
 	}
+	chip_start();
 	done();
 	say("gt9889: step 5: touch screen ready, %u x %u, %u fingers; the interrupt line (gpio%u) is looked at every %u ms (%s)\n", panel_x,
 	    panel_y, contacts, PIN_INT, POLL_MS, latch_armed ? "its falling edges latched" : "by its level");
