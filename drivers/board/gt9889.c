@@ -23,7 +23,12 @@
  *              no finger is down and the line is high is expected of a dozing chip: it is not counted as trouble
  *
  *   I2C        done by hand (board/i2c_gpio.h) on the board's two pins, taken for each transaction and given back as
- *              they were found: this kernel drives no serial engine as I2C. Registers are 16 bits, the high byte first
+ *              they were found. Registers are 16 bits, the high byte first. If the board names the serial engine the
+ *              bus is (touch-i2c { serial-engine, clocks, vote-register, votes }) the engine does it instead
+ *              (board/geni_i2c.h: its FIFO mode, 400 kHz, the vendor's rate), the pins left to its function: only when
+ *              its firmware reads as I2C and its clock gives 19.2 MHz (said, and the pins by hand otherwise; no firmware
+ *              is ever loaded into it). Which of the two it is, is said at step 4; the look-only level (below) reads the
+ *              engine's state (protocol, clocks) and writes none of it
  *   interrupt  the chip's INT: low for a report (the vendor's trigger is falling-edge, DT goodix,irq-flags = 2, so the line
  *              may only pulse and a look at it every 8 ms may miss one): so the report block is also read every
  *              fourth look whatever the line says, and at every look while a finger is down
@@ -56,7 +61,7 @@
  * What a report costs: the bus is driven by hand at 100 kHz at most with a core spun for it (i2c_gpio.h). The 12
  * bytes of a look are some 130 bits, about 1.4 ms; idle the chip is looked at every fourth tick (31 times a second:
  * 4 % of a core), with a finger down 125 times a second (a sixth of a core and more with more fingers). A serial
- * engine as I2C would cost a hundredth of that, and is the first thing to write once this has been seen to work.
+ * engine as I2C (above) costs a hundredth of that, where the board has one and it is I2C.
  *
  * Fingers that fall silent: a finger is lifted once the chip has said nothing believable for a quarter of a second
  * (LIFT_US). After 125 looks in a row that were to find a report and did not the chip is reset and looked at again,
@@ -145,6 +150,7 @@ gt9889_wait_us(uint32_t us)
 #define PIN_AVDD                ((unsigned)WIRED->analog_enable)        /* high = analog supply on (if the board has one) */
 #define HAS_AVDD                (WIRED->analog_enable >= 0)
 #define ADDRESS                 (WIRED->address)
+#define HAS_ENGINE              (WIRED->serial_engine != 0)     /* the board names a serial engine as the bus */
 
 /* a pin as it is, in words (as board/imu.c says its pins) */
 static void
@@ -264,6 +270,7 @@ supply_off(const char *name, uint32_t *asked)
 
 static struct i2c_gpio i2c_bus;          /* (its two pins: the board's, at the start) */
 static const char not_at_rest[] = "the I2C bus is not at rest", not_acknowledged[] = "nobody acknowledged";
+static const char engine_failed[] = "the serial engine reports an error";
 static const char *failed = not_acknowledged;   /* why the last transfer did not go through: one of the two */
 static unsigned refusals_said;
 
@@ -316,6 +323,102 @@ bus_take(void)
 	return false;
 }
 
+/* ---- the same bus through a serial engine (board/geni_i2c.h), where the board names one ----------------------------------- */
+
+#define GENI_I2C_SAY            say
+#define GENI_I2C_WAIT_US        gt9889_wait_us
+#include "geni_i2c.h"
+
+#define GCC_PHYS                (hakios_board()->clocks.gcc)    /* the SoC file's clocks { } */
+#define GCC_SIZE                0x100000UL      /* (as far as tools/boards.py lets touch-i2c { } reach) */
+#define SE_SIZE                 0x4000UL
+#define ENGINE_HZ               400000          /* the vendor's rate for the bus (i2c-qcom-geni.c's default) */
+
+static struct geni_i2c geni;
+static bool geni_mapped;
+static bool geni_on;                    /* the engine is the bus: set up for it, its votes taken */
+
+static bool
+engine_map(void)
+{
+	if (!geni_mapped) {
+		if (GCC_PHYS == 0) {
+			say("gt9889: the board names a serial engine but the SoC file has no clock controller (clocks { gcc }): by hand\n");
+			return false;
+		}
+		geni.se = ml_io_map(WIRED->serial_engine, SE_SIZE);
+		geni.gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
+		geni.m_ahb = WIRED->m_ahb_clock;
+		geni.s_ahb = WIRED->s_ahb_clock;
+		geni.se_clock = WIRED->se_clock;
+		geni.vote_register = WIRED->vote_register;
+		for (unsigned i = 0; i < 5; i++) {
+			geni.vote[i] = WIRED->vote[i];
+		}
+		geni_mapped = true;
+	}
+	return true;
+}
+
+/* touchscreen=-1: what the engine is, said; nothing written, nothing voted */
+static void
+engine_look(void)
+{
+	if (HAS_ENGINE && engine_map()) {
+		say("gt9889: the board names the serial engine at %#x as the bus (looked at only; the pins are read by hand below)\n",
+		    WIRED->serial_engine);
+		if (geni_i2c_look(&geni)) {
+			say("gt9889: the engine's firmware is I2C: touchscreen=1 would use it\n");
+		} else {
+			say("gt9889: the engine is not known to be I2C: touchscreen=1 would drive the pins by hand\n");
+		}
+	}
+}
+
+/* Step 4's bus: the engine if the board names one and it can be used, else the pins by hand. */
+static void
+engine_take(void)
+{
+	const char *why;
+
+	if (!HAS_ENGINE || !engine_map()) {
+		return;
+	}
+	why = geni_i2c_open(&geni, ENGINE_HZ);
+	if (why != NULL) {
+		say("gt9889: the serial engine at %#x is not used: %s: the pins by hand\n", WIRED->serial_engine, why);
+		return;
+	}
+	__atomic_store_n(&geni_on, true, __ATOMIC_SEQ_CST);
+	say("gt9889: the bus is the serial engine at %#x: I2C at %u kHz, FIFO of %u words\n", WIRED->serial_engine, ENGINE_HZ / 1000,
+	    geni.fifo_depth);
+}
+
+/* The engine's votes withdrawn and its registers as found (power_off()). */
+static void
+engine_put_back(void)
+{
+	if (__atomic_load_n(&geni_on, __ATOMIC_SEQ_CST)) {
+		__atomic_store_n(&geni_on, false, __ATOMIC_SEQ_CST);
+		geni_i2c_close(&geni);
+	}
+}
+
+/* one transaction through the engine, its end noted for the run's end */
+static bool
+engine_transfer(const uint8_t *out, unsigned out_length, uint8_t *in, unsigned in_length)
+{
+	bool done;
+
+	__atomic_store_n(&on_bus, true, __ATOMIC_SEQ_CST);
+	done = geni_i2c_transfer(&geni, ADDRESS, out, out_length, in, in_length);
+	__atomic_store_n(&on_bus, false, __ATOMIC_SEQ_CST);
+	if (!done) {
+		failed = geni_i2c_nacked(&geni) ? not_acknowledged : engine_failed;
+	}
+	return done;
+}
+
 /* a register's 16-bit number, the high byte first, sent to the chip: the start of a read or of a write */
 static bool
 address_register(uint16_t reg)
@@ -342,6 +445,11 @@ regs_read(uint16_t reg, uint8_t *values, unsigned count)
 {
 	bool answered;
 
+	if (geni_on) {
+		const uint8_t at[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
+
+		return engine_transfer(at, sizeof(at), values, count);
+	}
 	if (!bus_take()) {
 		return false;
 	}
@@ -363,6 +471,11 @@ reg_write(uint16_t reg, uint8_t value)
 {
 	bool done;
 
+	if (geni_on) {
+		const uint8_t at[3] = { (uint8_t)(reg >> 8), (uint8_t)reg, value };
+
+		return engine_transfer(at, sizeof(at), NULL, 0);
+	}
 	if (!bus_take()) {
 		return false;
 	}
@@ -503,6 +616,7 @@ power_off(void)
 	if (!__atomic_load_n(&powered, __ATOMIC_SEQ_CST)) {
 		return;                         /* (nothing was changed, or it has been put back already) */
 	}
+	engine_put_back();
 	gpio_output(PIN_RESET, false, PULL_NONE, 2);
 	if (WIRED->analog_supply != NULL) {
 		supply_off(WIRED->analog_supply, &analog_supply_at);
@@ -562,6 +676,8 @@ identify(unsigned tries)
 	if (!answered) {
 		if (failed == not_at_rest) {
 			say("gt9889: nothing read at 0x%02x: %s\n", ADDRESS, failed);
+		} else if (failed == engine_failed) {
+			say("gt9889: nothing read at 0x%02x: %s (status %#x)\n", ADDRESS, failed, geni.status);
 		} else {
 			say("gt9889: nobody answers at 0x%02x: a chip that is not there, not powered or held in reset (or at the other address "
 			    "its INT level at reset selects)\n", ADDRESS);
@@ -620,6 +736,7 @@ bring_up(void)
 		return STEPS_MADE;
 	}
 	say("gt9889: step 4: the first transfers on the I2C bus (gpio%u, gpio%u): the chip's report block\n", PIN_SDA, PIN_SCL);
+	engine_take();
 	if (!identify(IDENTITY_TRIES)) {
 		return NO_CHIP;
 	}
@@ -640,6 +757,7 @@ look(void)
 	if ((reset_cfg & CFG_OUTPUT) && !(reset_io & 2)) {
 		say("gt9889: the chip is held in reset as found (gpio%u drives low): it is not expected to answer\n", PIN_RESET);
 	}
+	engine_look();
 	say("gt9889: step 4: the chip's report block, as it was left (steps 2 and 3, its power and its reset, are not made)\n");
 	(void)identify(1);
 	say("gt9889: touchscreen=-1: nothing powered, configured or written\n");
@@ -909,7 +1027,12 @@ hakios_gt9889_quiesce(void)
 	if (tlmm == 0) {
 		return;                         /* (the thread never came as far as the pins) */
 	}
-	if (__atomic_load_n(&on_bus, __ATOMIC_SEQ_CST)) {
+	if (__atomic_load_n(&on_bus, __ATOMIC_SEQ_CST) && __atomic_load_n(&geni_on, __ATOMIC_SEQ_CST)) {
+		/* the engine was in the middle of a message: cancelled, which ends it with a stop */
+		geni_i2c_abort(&geni);
+		__atomic_store_n(&on_bus, false, __ATOMIC_SEQ_CST);
+		say("gt9889: at the run's end: a transfer cut off: the serial engine's command ended\n");
+	} else if (__atomic_load_n(&on_bus, __ATOMIC_SEQ_CST)) {
 		/* the thread stopped in the middle of a transaction, or of taking the pins: ended, the pins as the run found them */
 		i2c_gpio_stop(&i2c_bus);
 		bus_give_back();

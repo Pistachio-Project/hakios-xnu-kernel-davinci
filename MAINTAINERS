@@ -307,6 +307,8 @@ T:	workbench/qemu_helpers_test.py
 D:	Documentation/qemu.md
 
 QUALCOMM'S BUSES AND SERVICES
+F:	drivers/board/geni_clk.h
+F:	drivers/board/geni_i2c.h
 F:	drivers/board/geni_spi.h
 F:	drivers/board/i2c_gpio.h
 F:	drivers/board/tlmm.h
@@ -324,6 +326,7 @@ F:	drivers/board/qrtr_frame.h
 F:	drivers/board/qmi.c
 F:	include/board/qmi.h
 F:	include/board/qrtr.h
+T:	workbench/geni_i2c_test.c
 T:	workbench/geni_spi_test.c
 T:	workbench/i2c_gpio_test.c
 T:	workbench/tlmm_test.c

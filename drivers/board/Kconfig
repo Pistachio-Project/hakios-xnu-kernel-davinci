@@ -58,7 +58,8 @@ config QCOM_GENI
 	bool
 	select QCOM_GCC
 	help
-	  A serial engine (GENI/QUP) as SPI or UART: its firmware's registers, a transfer, a recovery (board/geni_spi.h).
+	  A serial engine (GENI/QUP) as SPI, I2C or UART: its firmware's registers, a transfer, a recovery (board/geni_spi.h,
+	  board/geni_i2c.h, and the clock rate they share, board/geni_clk.h).
 
 config QCOM_SMEM
 	bool
@@ -206,9 +207,11 @@ config TOUCH_GT9889
 	default y
 	select QCOM_TLMM
 	select QCOM_RPMH
+	select QCOM_GENI
 	help
-	  A Goodix GT9889 (GTX8 "Normandy") on two of the SoC's pins as I2C, driven by hand (board/gt9889.c, the board's
-	  "touch-gt9889" and touch-i2c { }). No firmware is uploaded and no configuration sent.
+	  A Goodix GT9889 (GTX8 "Normandy") on two of the SoC's pins as I2C, driven by hand, or through the serial engine
+	  when the board names it (board/gt9889.c, the board's "touch-gt9889" and touch-i2c { }). No firmware is uploaded
+	  and no configuration sent.
 
 config ADRENO_A6XX
 	bool "Adreno 6xx GPU (A660 family): started, and Metal's device for Darwin"

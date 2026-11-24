@@ -37,6 +37,7 @@ hardware has a test of its own in `workbench/`.
 | `board/cache.h` | Memory another master reads or writes past the caches: `hakios_cache_clean()`, `hakios_cache_flush()`, `hakios_cache_invalidate()`; `hakios_barrier()`. On a host, only the compiler is held. | — |
 | `board/tlmm.h` | The SoC's pins: `gpio_configure()`, `gpio_output()`, `gpio_set()`, `gpio_get()`; `GPIO_CFG(n)` and `TLMM_SIZE` are where the board says (a tiled controller has its pins in blocks), never `tlmm + 0x1000 n`. | `pins { }` of the SoC file |
 | `board/i2c_gpio.h` | I2C by hand on two of those pins, for a part on a bus nobody here drives: the bus taken and given back, a start, a byte out, a byte in. | — |
+| `board/geni_i2c.h` | I2C through a serial engine of the SoC's, in its FIFO mode, where the board names it (`touch-i2c { serial-engine ... }`): the engine's clocks voted for, its protocol read (never loaded), a write or a write and a read, a recovery, everything given back as found. A driver that has this and `board/i2c_gpio.h` uses the engine where it is I2C and says why it did not. | `touch-i2c { }` |
 | `board/spmi.h` | The PMICs, through the arbiter: a channel's lookup, one read, one write, what a status means. Under `hakios_spmi_lock()`. | `spmi { }` |
 | `board/cmd_db.h` | RPMh's resources by name: a supply rail and its levels, a regulator, a bus clock manager. | `rpmh { }` |
 | `board/rpmh.h` | `hakios_rpmh_send()`: a request to RPMh and the wait for it. Under `hakios_rpmh_lock()`. | `rpmh { }` |
@@ -71,7 +72,7 @@ needs it.
    the list in `workbench/run.sh`. The test puts a model of the hardware behind `rd()` and `wr()`,
    includes the driver's own file, and runs one scenario a process. Models that exist:
    `workbench/tlmm_model.h` (pins), `workbench/spmi_model.h` (the PMIC arbiter, which can also drop
-   transfers), `workbench/i2c_device_model.h` (a chip on a bus of two pins), `workbench/rsc_model.h` (RPMh's
+   transfers), `workbench/i2c_device_model.h` (a chip on a bus of two pins), `workbench/geni_i2c_test.c` (a serial engine as I2C, in its test), `workbench/rsc_model.h` (RPMh's
    sequencer), `workbench/cmd_db_image.h` (the command database). Write first the scenarios of what the
    driver must never do. Then break the driver on purpose, one line at a time, and see that a
    scenario fails each time (`workbench/mutate.sh` does it in a copy and says which scenario caught the
