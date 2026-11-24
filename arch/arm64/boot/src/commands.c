@@ -315,6 +315,30 @@ fb_command(char *cmd)
 			log_len = 0;
 			ufs_survey();
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem fwlog")) {
+			/*
+			 * "oem fwlog": the firmware's own log buffer (Mu-Silicium's "Log Buffer", 32 KB at
+			 * 0x9FFF7000 on davinci), its text into the log: what the vendor's drivers said in DXE.
+			 */
+			const volatile uint8_t *p = (const volatile uint8_t *)(uintptr_t)0x9FFF7000ull;
+
+			/* a probe build of a firmware driver may leave a marker and a status in its first 16 bytes */
+			print("firmware log: first words %x %x\n", ((const volatile uint64_t *)p)[0], ((const volatile uint64_t *)p)[1]);
+			for (unsigned i = 0, col = 0; i < 0x8000; i++) {
+				uint8_t c = p[i];
+
+				if (c == '\n' || (c >= 0x20 && c < 0x7f)) {
+					put_char((char)c);
+					col = c == '\n' ? 0 : col + 1;
+				} else if (c == '\r' || col == 0) {
+					continue;
+				} else {
+					put_char('\n');
+					col = 0;
+				}
+			}
+			print("\nfirmware log end\n");
+			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem memmap")) {
 			/* the firmware's memory map into the log (then "oem log" and fetch it) */
 			print_memory_map();
