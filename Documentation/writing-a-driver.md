@@ -35,7 +35,7 @@ hardware has a test of its own in `workbench/`.
 | `board/time.h` | `sleep_ms()`, `sleep_us()`, `spin_us()` (where nothing may sleep), `now_us()`. | — |
 | `board/kernel.h` | What of the kernel its headers do not offer to `bsd/dev`: `ml_io_map()`, `kvtophys()`, `thread_terminate()`, the loader's log, the RAM disk. | — |
 | `board/cache.h` | Memory another master reads or writes past the caches: `hakios_cache_clean()`, `hakios_cache_flush()`, `hakios_cache_invalidate()`; `hakios_barrier()`. On a host, only the compiler is held. | — |
-| `board/tlmm.h` | The SoC's pins: `gpio_configure()`, `gpio_output()`, `gpio_set()`, `gpio_get()`. | `pins { }` of the SoC file |
+| `board/tlmm.h` | The SoC's pins: `gpio_configure()`, `gpio_output()`, `gpio_set()`, `gpio_get()`; `GPIO_CFG(n)` and `TLMM_SIZE` are where the board says (a tiled controller has its pins in blocks), never `tlmm + 0x1000 n`. | `pins { }` of the SoC file |
 | `board/i2c_gpio.h` | I2C by hand on two of those pins, for a part on a bus nobody here drives: the bus taken and given back, a start, a byte out, a byte in. | — |
 | `board/spmi.h` | The PMICs, through the arbiter: a channel's lookup, one read, one write, what a status means. Under `hakios_spmi_lock()`. | `spmi { }` |
 | `board/cmd_db.h` | RPMh's resources by name: a supply rail and its levels, a regulator, a bus clock manager. | `rpmh { }` |

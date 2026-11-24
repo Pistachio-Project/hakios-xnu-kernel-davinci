@@ -10,18 +10,26 @@
  *   #define HAKIOS_TLMM tlmm
  *   #include "tlmm.h"
  *
- * Register layout: Linux drivers/pinctrl/qcom/pinctrl-msm.c.
+ * Register layout (and the tiles): Linux drivers/pinctrl/qcom/pinctrl-msm.c.
  */
 #ifndef HAKIOS_TLMM_H
 #define HAKIOS_TLMM_H
+
+#include "board.h"
 
 #ifndef HAKIOS_TLMM
 #error "say where the pins are mapped: #define HAKIOS_TLMM before including board/tlmm.h"
 #endif
 
-#define TLMM_SIZE               0x100000UL      /* 256 pins of 0x1000 each */
-#define GPIO_CFG(n)             ((HAKIOS_TLMM) + 0x1000UL * (n))        /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
-#define GPIO_IO(n)              ((HAKIOS_TLMM) + 0x1000UL * (n) + 4)    /* bit 0 in, bit 1 out */
+/*
+ * Where a pin's registers are is the board's to say (a tiled controller has them in blocks at other offsets,
+ * board.h's hakios_tlmm_offset()): a driver that computes tlmm + 0x1000 n itself is wrong on such a board.
+ * What to map is TLMM_SIZE, how many pins there are TLMM_PINS.
+ */
+#define TLMM_SIZE               hakios_tlmm_span(hakios_board())
+#define TLMM_PINS               hakios_tlmm_pins(hakios_board())
+#define GPIO_CFG(n)             ((HAKIOS_TLMM) + hakios_tlmm_offset(hakios_board(), (n)))        /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
+#define GPIO_IO(n)              ((HAKIOS_TLMM) + hakios_tlmm_offset(hakios_board(), (n)) + 4)    /* bit 0 in, bit 1 out */
 #define PULL_NONE               0
 #define PULL_DOWN               1
 #define PULL_KEEPER             2

@@ -1011,7 +1011,7 @@ step_pins(void)
 			printf("wifi: %u: %s: the board file does not say which pin it is (wifi { } pins)\n", step, what[i]);
 			continue;
 		}
-		tlmm[i].phys = hakios_board()->pins.tlmm + 0x1000 * (uint64_t)pin;
+		tlmm[i].phys = hakios_board()->pins.tlmm + hakios_tlmm_offset(hakios_board(), (unsigned)pin);
 		need(&tlmm[i]);
 		cfg = rd(tlmm[i].base + GPIO_CFG);
 		io = rd(tlmm[i].base + GPIO_IO);

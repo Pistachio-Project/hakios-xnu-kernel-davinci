@@ -966,6 +966,28 @@ class Generate(Sandbox):
         self.assertEqual(self.problems(), '')
         self.assertIn('.analog_enable = -1, .vendor_pin = { -1, -1 },', boards.table_text(*boards.load()))
 
+    def test_a_tiled_pin_controller_is_checked_and_carried_into_the_table(self):
+        pins = '\tpins {\n\t\ttlmm = <0x03400000>;\n%s\t};\n\tthermal {'
+        tiles = '\t\ttlmm-tiles = <0x100000 0x500000 0x900000>;\n'
+        self.soc('\tthermal {', pins % (tiles + '\t\ttlmm-tile-of = <2 2 1 0>;\n'))
+        self.assertEqual(self.problems(), '')
+        table = boards.table_text(*boards.load())
+        self.assertIn('.pins = { .tlmm = 0x03400000, .tile = { 0x100000, 0x500000, 0x900000 }, .tiles = 3, .gpios = 4, '
+                      '.tile_of = { 2, 2, 1, 0 } },', table)
+        # one without the other, a tile that is not there, two pins on the same registers, an offset that is not a page
+        self.soc(tiles, '')
+        self.assertIn('tlmm-tiles and tlmm-tile-of go together', self.problems())
+        self.soc('\t\ttlmm-tile-of = <2 2 1 0>;\n', '')
+        self.soc('\t\ttlmm = <0x03400000>;\n', '\t\ttlmm = <0x03400000>;\n' + tiles + '\t\ttlmm-tile-of = <2 2 3 0>;\n')
+        self.assertIn('each less than the 3 tiles', self.problems())
+        self.soc('<2 2 3 0>', '<0 0 0 0>')
+        self.assertEqual(self.problems(), '')
+        self.soc('0x100000 0x500000 0x900000>', '0x100000 0x101000 0x900000>')
+        self.soc('<0 0 0 0>', '<1 0 0 0>')      # (GPIO 0 in the second tile is GPIO 1 in the first)
+        self.assertIn('puts two GPIOs on the same registers', self.problems())
+        self.soc('0x100000 0x101000', '0x100000 0x101800')
+        self.assertIn('each a multiple of 0x1000', self.problems())
+
     def test_a_touch_controller_on_i2c_needs_its_wiring_and_rpmh_only_for_a_supply_it_names(self):
         self.board('"cpufreq-epss"', '"cpufreq-epss", "touch-ft5x06"')
         said = self.problems()
@@ -2174,7 +2196,7 @@ class Repository(unittest.TestCase):
                 self.assertTrue(re.search(rf'(?m)^\t{boards.boardfile.name_of(section)} {{', soc_template),
                                 f'the SoC template does not show {section} {{ }}')
             for key in keys:
-                self.assertTrue(re.search(rf'(?m)^\t*{boards.boardfile.name_of(key)} = ', soc_template),
+                self.assertTrue(re.search(rf'(?m)^\t*(// )?{boards.boardfile.name_of(key)} = ', soc_template),
                                 f'[{section}] {key} is not explained in the SoC template')
         # the template is a SoC file the tool takes as it is
         problems = boards.Problems()

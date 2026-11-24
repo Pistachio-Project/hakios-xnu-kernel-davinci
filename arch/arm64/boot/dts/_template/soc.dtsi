@@ -35,6 +35,12 @@
 		tlmm = <0x0f100000>;            // where GPIO 0's registers are; GPIO n's are 0x1000 n further. The pin
 		                                // controller's node (qcom,CODENAME-pinctrl): in Linux's trees its reg; in
 		                                // the vendor's, whose reg is the whole 16 MiB block, 0x100000 above it
+		// A tiled controller (the vendor's pinctrl-*.c with PINGROUP(n, WEST|NORTH|SOUTH, ...); SM7150) has GPIO n
+		// at tlmm + its tile's offset + 0x1000 n. Then tlmm is the block's start and these two say the rest
+		// (both or neither; a chip with one run of pins leaves them out):
+		// tlmm-tiles = <0x100000 0x500000 0x900000>;   // the tiles' offsets from tlmm (one to four): WEST, NORTH, SOUTH
+		// tlmm-tile-of = <2 2 2 2 1 1 ...>;            // for GPIO 0, 1, 2 ...: the number of its tile, counting from 0
+		                                // in tlmm-tiles; one cell per GPIO (not the UFS and SDC pins that follow them)
 	};
 
 	// The PMIC arbiter (qcom,spmi-pmic-arb), by its reg-names: for the features "buttons-pmic",

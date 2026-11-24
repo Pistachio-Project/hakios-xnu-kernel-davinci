@@ -1089,7 +1089,7 @@ supply_on(const struct hakios_camera_supply *s)
 	if (s->kind == HAKIOS_SUPPLY_GPIO) {
 		unsigned which = supply_gpio(s);
 
-		if (s->gpio >= TLMM_SIZE / 0x1000) {
+		if (s->gpio >= TLMM_PINS) {
 			give_up("a supply's pin past the pins there are");     /* (tools/boards.py says 0 to 255; the table is not trusted past it) */
 			return false;
 		}

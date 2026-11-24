@@ -166,8 +166,8 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 /* ---- the TDM pins ------------------------------------------------------------------------------------- */
 
 static struct block tlmm = { "pin controller", 0, 0x100000 };   /* where: the SoC file's pins { }, at the start */
-#define GPIO_CFG(n)             (0x1000u * (n))         /* [1:0] pull, [5:2] function, [8:6] drive (mA / 2 - 1), [9] output */
-#define GPIO_IO(n)              (0x1000u * (n) + 4)     /* bit 0 in, bit 1 out */
+#define GPIO_CFG(n)             hakios_tlmm_offset(hakios_board(), (n))         /* [1:0] pull, [5:2] function, [8:6] drive (mA / 2 - 1), [9] output */
+#define GPIO_IO(n)              (hakios_tlmm_offset(hakios_board(), (n)) + 4)     /* bit 0 in, bit 1 out */
 #define CFG_8MA                 (3u << 6)
 #define CFG_OUTPUT              (1u << 9)
 
@@ -1549,6 +1549,7 @@ hakios_sound_dsp_up(void)
 		return;
 	}
 	tlmm.phys = hakios_board()->pins.tlmm;
+	tlmm.size = hakios_tlmm_span(hakios_board());
 	apps_smmu.phys = hakios_board()->smmu.apps;
 	if (level > 4) {
 		level = 4;

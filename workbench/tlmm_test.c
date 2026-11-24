@@ -8,6 +8,11 @@
 #include "fakekernel.h"
 
 #include "tlmm_model.h"
+#include "board/board.h"
+
+/* the board tlmm.h asks for the pins' layout: none (as a kernel that does not know the board), or one a test sets up */
+static const struct hakios_board *the_board;
+const struct hakios_board *hakios_board(void) { return the_board; }
 
 static uint32_t rd(vm_offset_t address) { return tlmm_model_rd(address); }
 static void wr(vm_offset_t address, uint32_t value) { tlmm_model_wr(address, value); }
@@ -96,11 +101,70 @@ another_soc(void)
 	    (unsigned long)GPIO_IO(3));
 }
 
+/* SM7150's TLMM (the vendor's pinctrl-sdmmagpie.c): three tiles, GPIO 0 in the south one, 4 in the north, 31 in the west */
+static struct hakios_board sm7150;
+static const uint32_t sm7150_tiles[3] = { 0x100000, 0x500000, 0x900000 };
+static const uint8_t sm7150_tile_of[119] = {
+	2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1,
+	2, 0, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1,
+	1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 1, 0, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+};
+
+static void
+tiled_board(void)
+{
+	sm7150.pins.tlmm = 0x03400000;
+	memcpy(sm7150.pins.tile, sm7150_tiles, sizeof(sm7150_tiles));
+	sm7150.pins.tiles = 3;
+	sm7150.pins.gpios = 119;
+	memcpy(sm7150.pins.tile_of, sm7150_tile_of, sizeof(sm7150_tile_of));
+	the_board = &sm7150;
+	tlmm_model_tiled(0x03400000, sm7150_tiles, sm7150_tile_of, 119);
+	tlmm = 0x03400000;
+}
+
+/* a pin's registers are in its tile: the addresses the vendor's driver has, and the model (which has its own sum) agrees */
+static void
+tiled_addresses(void)
+{
+	tiled_board();
+	CHECK(GPIO_CFG(0) == 0x03d00000 && GPIO_IO(0) == 0x03d00004, "GPIO 0 (south): %#lx", (unsigned long)GPIO_CFG(0));
+	CHECK(GPIO_CFG(4) == 0x03904000, "GPIO 4 (north): %#lx", (unsigned long)GPIO_CFG(4));
+	CHECK(GPIO_CFG(31) == 0x0351f000, "GPIO 31 (west): %#lx", (unsigned long)GPIO_CFG(31));
+	CHECK(GPIO_CFG(118) == 0x03976000, "GPIO 118 (north): %#lx", (unsigned long)GPIO_CFG(118));
+	CHECK(TLMM_PINS == 119, "119 pins: %u", TLMM_PINS);
+	for (unsigned n = 0; n < 119; n++) {
+		gpio_output(n, n & 1, PULL_NONE, 2);
+		CHECK(model.cfg[n] & 1u << 9 && ((model.io[n] & 2) != 0) == (n & 1), "GPIO %u driven where the model has it", n);
+	}
+	CHECK(model.elsewhere == 0 && model.writes == 2 * 119, "each write in a pin's registers (%u elsewhere)", model.elsewhere);
+}
+
+/* the mapping covers the last pin's registers and no pin is outside it */
+static void
+tiled_span(void)
+{
+	uint32_t span;
+
+	tiled_board();
+	span = TLMM_SIZE;
+	for (unsigned n = 0; n < 119; n++) {
+		CHECK(hakios_tlmm_offset(the_board, n) + 0x1000 <= span, "GPIO %u inside what is mapped", n);
+	}
+	CHECK(span == 0x96e000, "the span ends with the last pin's registers (the south tile's GPIO 109): %#x", span);
+	/* a GPIO the controller has not got is nobody else's registers */
+	CHECK(hakios_tlmm_offset(the_board, 119) == 0 && hakios_tlmm_offset(the_board, 255) == 0, "no pin, no address of one");
+	the_board = NULL;
+	CHECK(TLMM_SIZE == 0x100000 && TLMM_PINS == 256, "a board that is not known has the plain 256 pins");
+}
+
 int
 main(int argc, char **argv)
 {
 	static const struct { const char *name; void (*run)(void); } scenarios[] = {
 		{ "a_function", a_function }, { "an_output", an_output }, { "an_input", an_input }, { "another_soc", another_soc },
+		{ "tiled_addresses", tiled_addresses }, { "tiled_span", tiled_span },
 	};
 
 	if (argc < 2) {

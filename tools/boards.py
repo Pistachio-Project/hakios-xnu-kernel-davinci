@@ -81,6 +81,8 @@ CAMCC_SOURCES = ('pll0_even_source', 'pll0_odd_source', 'pll2_source')
 CPUFREQ_BLOCKS = ('epss', 'osm')
 CPUFREQ_EXTENT = {'epss': 0x324, 'osm': 0x924}
 
+TLMM_TILES_MOST = 4     # the room board.h's pins.tile has; a tile is a block of the pin controller with its own offset
+
 SOC_SCHEMA = {
     '': {'name': (str, True), 'description': (str, True)},
     'platform': {'io_base': (U64, False), 'io_size': (U64, False), 'gic_dist': (U64, True), 'gic_redist': (U64, True),
@@ -98,7 +100,8 @@ SOC_SCHEMA = {
              'ee': (int, False), 'channel_map': (int, False), 'bus': (int, False)},
     'adreno': {'gpu': (int, True), 'gmu': (int, True), 'gpucc': (int, True), 'cx_misc': (int, True), 'rscc': (int, True),
                'smmu': (int, True), 'pdc': (int, True), 'qfprom': (int, True), 'tsens': (int, False)},
-    'pins': {'tlmm': (int, True)},
+    # tlmm-tiles and tlmm-tile-of (both or neither) say a tiled pin controller: see load_soc()
+    'pins': {'tlmm': (int, True), 'tlmm_tiles': ([int], False), 'tlmm_tile_of': ([int], False)},
     'smmu': {'apps': (int, True), 'audio_stream': ([int], False), 'wifi_stream': ([int], False),
              'camera_stream': ([int], False)},
     'camera': {'camcc': (int, True), 'ife': (int, True), 'csid': (int, True), 'csiphy': (int, True),
@@ -574,6 +577,22 @@ def bluetooth_problems(where, bt, problems):
         problems.add(where, 'nvm and firmware go with rampatch: the configuration is sent after the patch')
 
 
+def tiled_problems(where, pins, problems):
+    """A tiled pin controller (tlmm-tiles with tlmm-tile-of): GPIO n's registers are at tlmm + the offset of
+    its tile + 0x1000 n, and no two pins may share one (a wrong map would drive another pin)."""
+    tiles, tile_of = pins.get('tlmm_tiles'), pins.get('tlmm_tile_of')
+    if (tiles is None) != (tile_of is None):
+        problems.add(where, 'tlmm-tiles and tlmm-tile-of go together: the tiles\' offsets, and for each GPIO the number of its tile')
+    if not isinstance(tiles, list) or not isinstance(tile_of, list):
+        return
+    if not 1 <= len(tiles) <= TLMM_TILES_MOST or len(set(tiles)) != len(tiles) or any(off & 0xfff or off >= 0x1000000 for off in tiles):
+        problems.add(where, f'tlmm-tiles are one to {TLMM_TILES_MOST} different offsets from tlmm, each a multiple of 0x1000 and below 16 MiB')
+    elif not 1 <= len(tile_of) <= 255 or any(not 0 <= tile < len(tiles) for tile in tile_of):
+        problems.add(where, f'tlmm-tile-of is the tile of GPIO 0, 1, ... (one to 255 cells), each less than the {len(tiles)} tiles')
+    elif len({tiles[tile] // 0x1000 + n for n, tile in enumerate(tile_of)}) != len(tile_of):
+        problems.add(where, 'tlmm-tile-of puts two GPIOs on the same registers (tile offset + 0x1000 n)')
+
+
 def load_soc(path, problems):
     """A package's soc.dtsi, checked; None when it cannot be read."""
     if not path.exists():
@@ -585,6 +604,9 @@ def load_soc(path, problems):
         problems.add(shown(path), str(error))
         return None
     check_file(path, data, SOC_SCHEMA, problems)
+    pins = data.get('pins')
+    if isinstance(pins, dict):
+        tiled_problems(f'{shown(path)} [pins]', pins, problems)
     lpass = data.get('lpass')
     if isinstance(lpass, dict) and isinstance(lpass.get('swr_tx_pins'), list) and isinstance(lpass.get('swr_tx_slew'), list):
         pins, slew = lpass['swr_tx_pins'], lpass['swr_tx_slew']
@@ -1023,7 +1045,12 @@ def table_text(socs, boards):
                     '\t\t},']
         pins = soc.get('pins')
         if pins:
-            out.append(f'\t\t.pins = {{ .tlmm = {pins["tlmm"]:#010x} }},')
+            tiled = ''
+            if 'tlmm_tiles' in pins:
+                # (the table has the map's cells as bytes; a board with one base keeps the line it always had)
+                tiled = (f', .tile = {{ {", ".join(f"{off:#x}" for off in pins["tlmm_tiles"])} }}, .tiles = {len(pins["tlmm_tiles"])}, '
+                         f'.gpios = {len(pins["tlmm_tile_of"])}, .tile_of = {{ {", ".join(map(str, pins["tlmm_tile_of"]))} }}')
+            out.append(f'\t\t.pins = {{ .tlmm = {pins["tlmm"]:#010x}{tiled} }},')
         camera = soc.get('camera')
         if camera:
             out += ['\t\t.camera = {',
@@ -1359,7 +1386,7 @@ def show_text(data, depth=0):
     return '\n'.join(line for line in out if line) + '\n'
 
 
-COUNTS = ('cores', 'core_shift', 'ee', 'bus', 'timeout_scale', 'domain_cores')     # numbers a person counts in
+COUNTS = ('cores', 'core_shift', 'ee', 'bus', 'timeout_scale', 'domain_cores', 'tlmm_tile_of')     # numbers a person counts in
 
 
 def soc_number(key, value):

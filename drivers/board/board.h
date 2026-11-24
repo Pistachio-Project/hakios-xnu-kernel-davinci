@@ -155,7 +155,11 @@ struct hakios_board {
 
 	/* the SoC's own pins (soc: pins { }) */
 	struct {
-		uint32_t tlmm;                  /* where GPIO 0's registers are; GPIO n's are 0x1000 n further */
+		uint32_t tlmm;                  /* where GPIO 0's registers are; GPIO n's are 0x1000 n further (tiles == 0) */
+		/* a tiled controller (tlmm-tiles, tlmm-tile-of): GPIO n's are at tlmm + tile[tile_of[n]] + 0x1000 n, for n < gpios */
+		uint32_t tile[4];
+		uint8_t tiles, gpios;
+		uint8_t tile_of[255];
 	} pins;
 
 	/* the SMMU that stands between the SoC's devices and memory (soc: smmu { }); the GPU has its own (adreno { }) */
@@ -404,6 +408,44 @@ struct hakios_board {
 
 /* The board this kernel runs on; NULL when the loader named none, or one the table has not got. */
 const struct hakios_board *hakios_board(void);
+
+/*
+ * Where a GPIO's registers are from pins.tlmm, for a board with one base or a tiled one: the only place that
+ * knows (board/tlmm.h and the drivers that map the pins themselves ask here). A board that is not known (NULL)
+ * has the plain layout; a GPIO a tiled controller does not have gets offset 0, never another GPIO's registers.
+ */
+static inline uint32_t
+hakios_tlmm_offset(const struct hakios_board *board, unsigned pin)
+{
+	if (board == 0 || board->pins.tiles == 0) {
+		return 0x1000u * pin;
+	}
+	return pin < board->pins.gpios ? board->pins.tile[board->pins.tile_of[pin]] + 0x1000u * pin : 0;
+}
+
+/* how many GPIOs there are to ask about */
+static inline unsigned
+hakios_tlmm_pins(const struct hakios_board *board)
+{
+	return board == 0 || board->pins.tiles == 0 ? 256 : board->pins.gpios;
+}
+
+/* how much of the address space from pins.tlmm holds the pins' registers: what to map */
+static inline uint32_t
+hakios_tlmm_span(const struct hakios_board *board)
+{
+	uint32_t span = 0;
+
+	if (board == 0 || board->pins.tiles == 0) {
+		return 0x100000;        /* 256 pins of 0x1000 each */
+	}
+	for (unsigned pin = 0; pin < board->pins.gpios; pin++) {
+		uint32_t end = hakios_tlmm_offset(board, pin) + 0x1000;
+
+		span = end > span ? end : span;
+	}
+	return span;
+}
 
 /* Has this board the feature (one HAKIOS_HAS_*)? Never, on a board that is not known. */
 bool hakios_board_has(uint32_t feature);

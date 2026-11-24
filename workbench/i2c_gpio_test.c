@@ -30,6 +30,8 @@ static void wr(vm_offset_t address, uint32_t value) { tlmm_model_wr(address, val
 #define KERNEL 1
 static vm_offset_t tlmm;
 #define HAKIOS_TLMM tlmm
+/* board/tlmm.h asks the board where the pins are: a kernel that does not know its board has them as one run of 256 */
+const struct hakios_board *hakios_board(void) { return NULL; }
 #include "board/tlmm.h"
 #include "board/i2c_gpio.h"
 

@@ -397,8 +397,8 @@ static struct block tlmm = { "the pin controller", 0, 0x100000 };       /* where
 
 /* The codec's reset: which of the SoC's pins it is on is the board's mic { } (the codec node's reset-gpios). */
 #define RESET_PIN               ((uint32_t)hakios_board()->mic.codec_reset)
-#define TLMM_CFG_RESET          (0x1000 * RESET_PIN)
-#define TLMM_IO_RESET           (0x1000 * RESET_PIN + 4)
+#define TLMM_CFG_RESET          hakios_tlmm_offset(hakios_board(), RESET_PIN)
+#define TLMM_IO_RESET           (hakios_tlmm_offset(hakios_board(), RESET_PIN) + 4)
 
 /* "gpio83 " and what is said of it (for one line at a time: the text is the last asked for) */
 static const char *
@@ -496,6 +496,7 @@ static void
 blocks_from_board(void)
 {
 	tlmm.phys = hakios_board()->pins.tlmm;
+	tlmm.size = hakios_tlmm_span(hakios_board());
 	tx_macro.phys = hakios_board()->lpass.tx_macro;
 	va_macro.phys = hakios_board()->lpass.va_macro;
 	tx_swr.phys = hakios_board()->lpass.tx_swr;
