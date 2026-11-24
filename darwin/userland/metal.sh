@@ -18,7 +18,9 @@ export IOS_ARCH=arm64e
 mkdir -p "$OBJ"
 "$M/tools/mk-mesa.sh" > "$OBJ/mk-mesa.log" 2>&1 || { tail -20 "$OBJ/mk-mesa.log" >&2; exit 1; }
 # HAKIOS_METAL_CHIP=618: the plug-in built with the Adreno 618's tables (the Pixel 4a)
-make -s -C "$M" ios MESA=1 CHIP="${HAKIOS_METAL_CHIP:-}" IOS_ARCH=$IOS_ARCH XNUDEPS="$XNUDEPS" -j"$(nproc)"
+# HAKIOS_METAL_TARGET=out/ios/libhakios-metal.a: only the library the bundle needs (not the probe, whose fixtures ld64.lld
+# refuses: "INVALID relocation has invalid width of 8 bytes")
+make -s -C "$M" "${HAKIOS_METAL_TARGET:-ios}" MESA=1 CHIP="${HAKIOS_METAL_CHIP:-}" IOS_ARCH=$IOS_ARCH XNUDEPS="$XNUDEPS" -j"$(nproc)"
 # the archives the driver's compiler links, as components/metal/plugin/tools/compiler.mk lists them (HAKIOS_METAL_IOS_MESA_LIBS)
 MESA_LIBS=$(make -s -C "$M" -f /dev/stdin IOS_ARCH=$IOS_ARCH XNUDEPS="$XNUDEPS" print <<'MK'
 include tools/compiler.mk
