@@ -24,7 +24,7 @@
 	// gpu-a660        an Adreno of the A660 family (642, 642L, 643, 660 ...) behind a GMU (gpu=1); needs gpu { }
 	// and these, each a driver of one part wired the way one phone has it -- list one only if your phone
 	// has that part on the same pins and bus (drivers/board/board.h, Documentation/drivers.md):
-	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-gt9889, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,
+	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-gt9889, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c, torch-pm6150l,
 	// camera-sm7325, wifi-wcn6750, mic-wcd938x, modem-sm7325, bluetooth-wcn-uart
 	// Documentation/features.md has what each needs written down first; tools/boards.py status NAME says it for
 	// this board.
@@ -216,8 +216,8 @@
 		//                              // all the other way). Check it on the phone: sensors=2 says each orientation
 	// };
 
-	// The flashlight, for the feature "torch-pm8350c": the PM8350C's flash LED module and that PMIC's
-	// temperature alarm, each as SPMI slave << 8 | the high byte of its registers.
+	// The flashlight, for the feature "torch-pm8350c" (or "torch-pm6150l"): the PMIC's flash LED module and that PMIC's
+	// temperature alarm (the PM6150L's is on another slave than its flash), each as SPMI slave << 8 | the high byte of its registers.
 	// torch {
 		// flash = <0x2ee>;             // qcom,flash_led@ee00 (qcom,pm8350c-flash-led) under qcom,pm8350c@2
 		// alarm = <0x20a>;             // qcom,temp-alarm@a00 of the same PMIC

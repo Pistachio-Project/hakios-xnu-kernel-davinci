@@ -794,8 +794,162 @@ board_without_the_part(void)
 	boot_args = "torch=3";
 	hakios_torch_init();
 	usleep(200 * 1000);
-	CHECK(logged("lists no \"torch-pm8350c\""), "said in the log: %s", log_text);
+	CHECK(logged("lists no \"torch-pm8350c\" or \"torch-pm6150l\""), "said in the log: %s", log_text);
 	CHECK(spmi.transfers == 0 && spmi.elsewhere == 0, "nothing read or written");
+}
+
+/* ---- the PM6150L's module ("qcom,qpnp-flash-led-v2"): the same sequence at other registers --------------- */
+
+/* (written here from leds-qpnp-flash-v2.c, not taken from the driver's table) */
+#define V2_STATUS1      0x08
+#define V2_STATUS2      0x09
+#define V2_TIMER        0x40
+#define V2_ITARGET      0x43
+#define V2_IRES         0x47
+#define V2_STROBE       0x49
+#define V2_EN_LED       0x4c
+
+static unsigned v2_forbidden, v2_highest, v2_times_lit;
+static bool v2_too_bright;
+
+static bool
+v2_lit(void)
+{
+	return (flash_model.reg[REG_MODULE_EN] & 0x80) && (flash_model.reg[V2_EN_LED] & 0x01);
+}
+
+static void
+v2_written(struct spmi_peripheral *p, uint8_t reg, uint8_t value)
+{
+	bool was = v2_lit();
+
+	if (reg != V2_TIMER && reg != V2_ITARGET && reg != REG_MODULE_EN && reg != V2_IRES && reg != V2_STROBE && reg != V2_EN_LED) {
+		v2_forbidden++;
+		fprintf(stderr, "MODEL: a write to register 0x%02x of the flash module, which is not one of the six\n", reg);
+	}
+	if (reg == V2_ITARGET && (value & 0x7fu) > v2_highest) {
+		v2_highest = value & 0x7f;
+	}
+	p->reg[reg] = value;
+	if (v2_lit()) {
+		v2_times_lit += !was;
+		/* (channel 0's resolution is [1:0], 12.5 mA at 0; the most, 300 mA: code 23) */
+		v2_too_bright |= (p->reg[V2_IRES] & 0x03) || (p->reg[V2_ITARGET] & 0x7f) > 23;
+		p->reg[REG_RT_STS] |= 0x10;
+	} else {
+		p->reg[REG_RT_STS] &= (uint8_t)~0x10;
+	}
+}
+
+/* a davinci: the board of phone-video with this feature instead of the PM8350C's, the module as the firmware leaves it */
+static void
+phone_v2(void)
+{
+	static struct hakios_board copy;
+
+	board = "phone-video";
+	copy = *hakios_board();
+	copy.features = (copy.features & ~(uint32_t)HAKIOS_HAS_TORCH_PM8350C) | HAKIOS_HAS_TORCH_PM6150L;
+	found = &copy;
+	phone("phone-video");
+	memset(flash_model.reg, 0, sizeof(flash_model.reg));
+	flash_model.written = v2_written;
+	flash_model.reg[0x04] = 0x18;
+	flash_model.reg[0x05] = 0x03;           /* (a subtype the driver does not insist on) */
+	flash_model.reg[V2_STROBE] = 0x05;      /* a hardware strobe, and a bit that is not ours */
+	flash_model.reg[V2_TIMER] = 0x93;       /* the timer on */
+	flash_model.reg[V2_IRES] = 0x7f;        /* the resolutions of the other channels are not ours */
+	flash_model.reg[0x06] = flash_model.reg[0x07] = 0xff;   /* (the PM8350C's flags: nothing here) */
+}
+
+static void
+v2_never(void)
+{
+	CHECK(v2_forbidden == 0, "%u writes to registers that are not the module's six", v2_forbidden);
+	CHECK(v2_highest <= 23, "a current code of %u, above davinci's torch of 300 mA (23)", v2_highest);
+	CHECK(!v2_too_bright, "lit with a resolution or a target that is not the torch's");
+	CHECK(alarm_model.writes == 0 && spmi.elsewhere == 0, "the alarm written (%u), or somewhere else (%u)", alarm_model.writes, spmi.elsewhere);
+}
+
+static void
+v2_dark_at_the_end(void)
+{
+	hakios_torch_quiesce();
+	CHECK(!v2_lit() && spmi_get(&flash_model, REG_MODULE_EN) == 0 && (spmi_get(&flash_model, V2_ITARGET) & 0x7f) == 0,
+	    "the module is not as it was found: enable %#x, channels %#x, target %#x", spmi_get(&flash_model, REG_MODULE_EN),
+	    spmi_get(&flash_model, V2_EN_LED), spmi_get(&flash_model, V2_ITARGET));
+}
+
+static void
+pm6150l_look_only(void)
+{
+	phone_v2();
+	boot_args = "torch=1";
+	hakios_torch_init();
+	WAIT_FOR(logged("torch: done"), 5000);
+	CHECK(logged("is the PM6150L's flash LED module"), "named: %s", log_text);
+	CHECK(logged("a flash LED module, as Android's driver expects") && !logged("NOT WHAT WAS EXPECTED"), "its type is read");
+	CHECK(spmi.writes == 0 && spmi.denied == 0, "a look writes nothing (%u writes)", spmi.writes);
+	v2_never();
+}
+
+static void
+pm6150l_light_once(void)
+{
+	phone_v2();
+	boot_args = "torch=2 torch_secs=1";
+	hakios_torch_init();
+	WAIT_FOR(v2_lit(), 5000);
+	CHECK(v2_lit() && spmi_get(&flash_model, V2_ITARGET) == 23, "at 300 mA: target %u", spmi_get(&flash_model, V2_ITARGET));
+	CHECK((spmi_get(&flash_model, V2_IRES) & 0x03) == 0 && (spmi_get(&flash_model, V2_IRES) & 0x7c) == 0x7c,
+	    "12.5 mA on channel 0 only: %#x", spmi_get(&flash_model, V2_IRES));
+	CHECK((spmi_get(&flash_model, V2_STROBE) & 0x04) == 0 && (spmi_get(&flash_model, V2_STROBE) & 0x03) == 0x01 &&
+	    (spmi_get(&flash_model, V2_TIMER) & 0x80) == 0 && (spmi_get(&flash_model, V2_TIMER) & 0x7f) == 0x13,
+	    "strobed by software, the timer off, the rest as found: %#x %#x", spmi_get(&flash_model, V2_STROBE), spmi_get(&flash_model, V2_TIMER));
+	WAIT_FOR(logged("torch: done"), 5000);
+	CHECK(!v2_lit() && v2_times_lit == 1 && spmi.denied == 0, "dark again, lit once (%u), no write refused (%u)", v2_times_lit, spmi.denied);
+	v2_never();
+	v2_dark_at_the_end();
+}
+
+static void
+pm6150l_for_darwin(void)
+{
+	phone_v2();
+	boot_args = "torch=3";
+	hakios_torch_init();
+	WAIT_FOR(logged("THE LIGHT IS DARWIN'S"), 20000);
+	CHECK(!v2_lit() && spmi.writes == 0, "nothing until Darwin asks");
+	ask_for(500);
+	WAIT_FOR(v2_lit() && spmi_get(&flash_model, V2_ITARGET) == 11, 3000);
+	CHECK(v2_lit() && spmi_get(&flash_model, V2_ITARGET) == 11, "half is 150 mA: code %u", spmi_get(&flash_model, V2_ITARGET));
+	ask_for(5000);
+	WAIT_FOR(spmi_get(&flash_model, V2_ITARGET) == 23, 3000);
+	CHECK(spmi_get(&flash_model, V2_ITARGET) == 23, "at most 300 mA: code %u", spmi_get(&flash_model, V2_ITARGET));
+	/* the module's supply droops (its bit 4): off, and off for the rest of the run */
+	spmi_set(&flash_model, V2_STATUS2, 0x10);
+	WAIT_FOR(!v2_lit(), 3000);
+	CHECK(!v2_lit() && logged("OFF: "), "off at a droop: %s", log_text);
+	spmi_set(&flash_model, V2_STATUS2, 0x00);
+	refused(0);
+	refused(1000);
+	usleep(300 * 1000);
+	CHECK(!v2_lit(), "and off for the rest of the run");
+	v2_never();
+	v2_dark_at_the_end();
+}
+
+/* the channels' flags are this module's own 0x08: a flag there is trouble before the light */
+static void
+pm6150l_channel_open(void)
+{
+	phone_v2();
+	spmi_set(&flash_model, V2_STATUS1, 0x01);
+	boot_args = "torch=2";
+	hakios_torch_init();
+	WAIT_FOR(logged("torch: done"), 5000);
+	CHECK(logged("not lit: ") && !v2_lit() && v2_times_lit == 0, "never lit: %s", log_text);
+	v2_never();
 }
 
 static void
@@ -823,6 +977,8 @@ main(int argc, char **argv)
 		{ "time_limit", time_limit }, { "write_does_not_stick", write_does_not_stick },
 		{ "lit_and_then_given_up", lit_and_then_given_up }, { "short_writes_and_reads", short_writes_and_reads },
 		{ "not_ours_to_write", not_ours_to_write }, { "another_part", another_part }, { "another_arbiter", another_arbiter },
+		{ "pm6150l_look_only", pm6150l_look_only }, { "pm6150l_light_once", pm6150l_light_once },
+		{ "pm6150l_for_darwin", pm6150l_for_darwin }, { "pm6150l_channel_open", pm6150l_channel_open },
 		{ "board_without_the_part", board_without_the_part }, { "only_the_six", only_the_six },
 		{ "dropped_and_asked_again", dropped_and_asked_again }, { "second_bus", second_bus },
 		{ "light_once_read_back_fails", light_once_read_back_fails }, { "flags_read_fails_while_lit", flags_read_fails_while_lit },

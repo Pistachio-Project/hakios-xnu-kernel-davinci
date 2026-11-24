@@ -185,7 +185,7 @@ KEY_WITH_UNDERSCORE = re.compile(r'(?<![\w.])(' + '|'.join(sorted(
      if '_' in key} | {key for key in CAMERA_SENSOR if '_' in key}, key=len, reverse=True)) + r')(?![\w(=])')
 # what a feature needs of the SoC file: a board cannot list a feature its SoC has no addresses for
 FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virtio': ('virtio',), 'cpufreq-scmi': ('scmi_perf',), 'cpufreq-epss': ('cpufreq',), 'display-scan': ('display',), 'buttons-pmic': ('spmi',),
-                 'torch-pm8350c': ('spmi',), 'ddr-rpmh': ('rpmh',),
+                 'torch-pm8350c': ('spmi',), 'torch-pm6150l': ('spmi',), 'ddr-rpmh': ('rpmh',),
                  'camera-sm7325': ('spmi', 'pins', 'clocks', 'rpmh', 'smmu', 'camera'),
                  'gpu-a660': ('adreno', 'clocks', 'rpmh'),
                  # the part drivers that drive the SoC's pins, switch a bus's clocks on in the GCC, ask RPMh
@@ -198,7 +198,7 @@ FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virt
                  'adsp': ('rpmh', 'ipc'), 'wifi-wcn6750': ('rpmh', 'pins', 'spmi', 'ipc', 'smmu'), 'mic-wcd938x': ('pins', 'lpass')}
 # ... and the stream of the SMMU that a part's DMA comes in on: [stream ID, mask], from the device tree's iommus
 STREAM_OF = {'speaker-aw88261': 'audio_stream', 'wifi-wcn6750': 'wifi_stream', 'camera-sm7325': 'camera_stream'}
-WRITES_TO_PMIC = ('bluetooth-wcn-uart', 'torch-pm8350c', 'camera-sm7325')    # ... these through the arbiter's channels as well
+WRITES_TO_PMIC = ('bluetooth-wcn-uart', 'torch-pm8350c', 'torch-pm6150l', 'camera-sm7325')    # ... these through the arbiter's channels as well
 # The boot arguments that start a feature's driver, as a porter is to try them: the level that only looks
 # first where there is one. (Documentation/boot-args.md has every argument; a test holds these names to it.)
 FEATURE_BOOTARGS = {
@@ -221,6 +221,7 @@ FEATURE_BOOTARGS = {
     'imu-lsm6dso': 'sensors=1 looks; sensors=2 follows the orientation',
     'imu-bmi160': 'sensors=1 looks; sensors=2 follows the orientation',
     'torch-pm8350c': 'torch=1 looks; torch=3 is the light for Darwin',
+    'torch-pm6150l': 'torch=1 looks; torch=3 is the light for Darwin',
     'camera-sm7325': 'cam=N',
     'wifi-wcn6750': 'wifi=1',
     'mic-wcd938x': 'mic=N with adsp=1',
@@ -229,7 +230,7 @@ FEATURE_BOOTARGS = {
 # features that are a driver of one part as one phone has it wired, by the first word of their names
 PART_DRIVERS = ('bluetooth', 'touch', 'speaker', 'haptic', 'imu', 'torch', 'camera', 'wifi', 'mic', 'modem')
 # ... and of the board's own file
-FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'gpu-a660': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
+FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'gpu-a660': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch', 'torch-pm6150l': 'torch',
                           'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
                           'touch-ft3658u': 'touch', 'touch-ft5x06': 'touch_i2c', 'touch-gt9889': 'touch_i2c', 'camera-sm7325': 'camera', 'imu-lsm6dso': 'imu',
                           'imu-bmi160': 'imu'}
