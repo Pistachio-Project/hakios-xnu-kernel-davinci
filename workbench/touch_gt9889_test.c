@@ -144,7 +144,7 @@ static unsigned data_writes;                    /* bytes written into the chip b
 static unsigned writes_elsewhere;               /* ... into registers but the event byte's */
 
 /* the report it puts out, set by the scenario; `pending' while the host has not taken it (and `steady': it is said again) */
-static uint8_t rep[96];
+static uint8_t rep[96], frame_taken[96];
 static volatile bool pending, steady;
 static pthread_mutex_t stage_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned ptr, last_start;                /* the register the next byte is of; the start that set it */
@@ -213,7 +213,10 @@ chip_written(uint8_t high, uint8_t value)
 		pthread_mutex_lock(&stage_lock);
 		if (!steady) {
 			pending = false;
-			model.input[int_pin] = true;
+			tlmm_model_line(int_pin, true);
+		} else {
+			tlmm_model_line(int_pin, true);         /* a finger that stays: the chip lets the line go and pulls it low for its next report */
+			tlmm_model_line(int_pin, false);
 		}
 		pthread_mutex_unlock(&stage_lock);
 	} else {
@@ -236,9 +239,15 @@ chip_read(uint8_t high __unused)
 	if (ptr == REPORT_AT + 12) {
 		second_reads++;
 	}
+	if (ptr == 0x3100) {
+		return 0xbb;                    /* the doze handshake: the chip is held awake */
+	}
 	pthread_mutex_lock(&stage_lock);
-	if (pending && ptr >= REPORT_AT && ptr < REPORT_AT + sizeof(rep)) {
-		byte = rep[ptr - REPORT_AT];
+	if (ptr == REPORT_AT) {
+		memcpy(frame_taken, pending ? rep : (const uint8_t[sizeof(rep)]){ 0 }, sizeof(frame_taken));   /* (a frame is whole when the host starts to read it) */
+	}
+	if (ptr >= REPORT_AT && ptr < REPORT_AT + sizeof(frame_taken)) {
+		byte = frame_taken[ptr - REPORT_AT];
 	}
 	pthread_mutex_unlock(&stage_lock);
 	ptr++;
@@ -274,7 +283,8 @@ chip_says(const struct finger *f, unsigned n, bool again)
 	rep[3 + 8 * n] = (uint8_t)-sum;
 	steady = again;
 	pending = true;
-	model.input[int_pin] = false;           /* its interrupt line: low while a report waits */
+	tlmm_model_line(int_pin, true);
+	tlmm_model_line(int_pin, false);        /* its interrupt line: pulled low (an edge) while a report waits */
 	pthread_mutex_unlock(&stage_lock);
 }
 
@@ -284,7 +294,7 @@ no_finger(void)
 	pthread_mutex_lock(&stage_lock);
 	pending = false;
 	steady = false;
-	model.input[int_pin] = true;
+	tlmm_model_line(int_pin, true);
 	pthread_mutex_unlock(&stage_lock);
 }
 
@@ -299,6 +309,7 @@ one_finger(unsigned id, unsigned x, unsigned y)
 /* ---- the registers: the pins' model, with the chip on them ----------------------------------------------------------- */
 
 static unsigned pin_writes[PINS];
+#define INTR_AS_FOUND           0x60u   /* (a target the firmware left, nothing enabled) */
 
 uint32_t
 hakios_test_rd(vm_offset_t address)
@@ -376,6 +387,7 @@ phone(const char *name, bool left_running)
 	}
 	model.cfg[sda_pin] = model.cfg[scl_pin] = BUS_AS_FOUND;
 	model.cfg[int_pin] = INT_AS_FOUND;
+	model.intr_cfg[int_pin] = INTR_AS_FOUND;
 	model.cfg[reset_pin] = RESET_AS_FOUND;
 	model.io[reset_pin] = left_running ? 2 : 0;
 	model.wanted[reset_pin] = left_running;
@@ -409,6 +421,11 @@ pins_as_found(const char *when, bool in_reset)
 	CHECK(device.driven_high == 0, "%s: a line of the bus was driven high %u times", when, device.driven_high);
 	CHECK(model.elsewhere == 0, "%s: %u accesses outside the pins' registers", when, model.elsewhere);
 	CHECK(model.drove_wrong == 0, "%s: a pin was made an output before its level was said, %u times", when, model.drove_wrong);
+	CHECK(model.routed == 0, "%s: a pin's interrupt was enabled or routed %u times", when, model.routed);
+	for (unsigned i = 0; i < PINS; i++) {
+		CHECK(model.intr_cfg[i] == (i == int_pin ? INTR_AS_FOUND : 0) && model.intr_status[i] == 0,
+		    "%s: gpio%u interrupt registers %#x/%#x, found %#x/0", when, i, model.intr_cfg[i], model.intr_status[i], i == int_pin ? INTR_AS_FOUND : 0);
+	}
 	for (unsigned i = 0; i < PINS; i++) {
 		uint32_t io = i == reset_pin && in_reset ? 0 : io_found[i];
 
@@ -461,15 +478,15 @@ ready(void)
 	ready_on("phone-gt9889", "touchscreen=1");
 }
 
-/* until the driver has read the chip's report block as it is now, twice */
+/* until the driver has read the chip's report block after the edge the chip made */
 static void
 taken(void)
 {
 	unsigned before = reports_read;
 
-	WAIT_FOR(reports_read >= before + 2, 3000);
-	CHECK(reports_read >= before + 2, "the driver goes on reading reports: %u since: %s", reports_read - before, log_text);
-	usleep(2000);                           /* (and has made of the last what it makes of it) */
+	WAIT_FOR(reports_read >= before + 1, 3000);
+	CHECK(reports_read >= before + 1, "the driver goes on reading reports: %u since: %s", reports_read - before, log_text);
+	usleep(30000);                          /* (and has made of the last what it makes of it; a finger that stays has its next edge in that time) */
 }
 
 static unsigned
@@ -864,7 +881,8 @@ firmware_request(void)
 	rep[0] = 0x40;
 	steady = false;
 	pending = true;
-	model.input[int_pin] = false;
+	tlmm_model_line(int_pin, true);
+	tlmm_model_line(int_pin, false);
 	pthread_mutex_unlock(&stage_lock);
 	WAIT_FOR(clears >= 1, 3000);
 	taken();
@@ -872,7 +890,7 @@ firmware_request(void)
 	CHECK(boots == 1 && !logged("looks in a row"), "nothing reset");
 }
 
-/* a chip that dozes while nobody touches it does not answer a look nobody asked for: not trouble, and it still works when touched */
+/* a chip that dozes while nobody touches it is not asked, and when it is asked (the fallback) and does not answer it is not trouble */
 static void
 dozing_is_not_trouble(void)
 {
@@ -880,11 +898,52 @@ dozing_is_not_trouble(void)
 	dozing = true;
 	usleep(400000);
 	CHECK(boots == 1 && !logged("looks in a row") && !logged("a report not read"), "no trouble: %s", log_text);
-	CHECK(seen.idle_misses >= 3, "the looks were made and went unanswered: %u", seen.idle_misses);
+	CHECK(seen.looks <= 2, "no edge, no look but the first: %u", seen.looks);
 	one_finger(0, 100, 200);
 	WAIT_FOR(posts >= 1, 3000);
 	post_is(0, HAKIOS_TOUCH_DOWN, 0, scaled(100, 1079), scaled(200, 2339));
 	dozing = false;
+}
+
+/* the pin controller latches INT's falling edge (detection bits as the vendor's pinctrl, not enabled, not routed); a report is read at once after it and the latch cleared */
+static void
+edge_latched_read_promptly(void)
+{
+	uint32_t cfg;
+	unsigned before;
+	uint64_t at;
+
+	ready();
+	cfg = model.intr_cfg[int_pin];
+	CHECK((cfg & 0x1f) == (1u << 4 | 2u << 2 | 1u << 1) && !(cfg & (1u | 1u << 8)) && (cfg & 0xe0) == (INTR_AS_FOUND & 0xe0),
+	    "falling-edge detection with raw status only, nothing enabled or routed, the target left: %#x", cfg);
+	usleep(100000);
+	before = reports_read;
+	CHECK(before <= 2, "idle, the chip is not read beyond the identity and the first look: %u", before);
+	at = real_ns();
+	one_finger(1, 50, 60);
+	WAIT_FOR(posts >= 1, 3000);
+	CHECK(posts == 1 && (real_ns() - at) / 1000000 < 60, "posted within a few polls of the edge: %llu ms", (unsigned long long)(real_ns() - at) / 1000000);
+	taken();
+	no_finger();
+	usleep(50000);
+	CHECK((model.intr_status[int_pin] & 1) == 0, "the latch cleared after the read");
+	CHECK(model.routed == 0, "never enabled or routed: %u", model.routed);
+	quiesce();
+	powered_off("the run's end with the latch");
+}
+
+/* gt9889_doze=1: the event byte's write inside the handshake (0xaa into 0x30f0, 0xbb read from 0x3100, 0xcc into 0x30f0) */
+static void
+doze_handshake(void)
+{
+	phone("phone-gt9889", false);
+	start("touchscreen=1 gt9889_doze=1");
+	WAIT_FOR(logged("touch screen ready"), 10000);
+	one_finger(3, 5, 6);
+	WAIT_FOR(posts >= 1, 3000);
+	CHECK(posts >= 1 && writes_elsewhere >= 2, "the handshake's writes seen next to the event byte's: %u", writes_elsewhere);
+	quiesce();
 }
 
 /* a finger whose chip falls silent is lifted after a quarter of a second: not sooner, not much later, once */
@@ -916,11 +975,36 @@ silent_finger_lifted(void)
 	silent = false;
 }
 
+/* a chip with a finger on it pulls INT every 10 ms (a hung one as well: it is the line that is alive, not the bus) */
+static void *
+frames(void *unused __unused)
+{
+	for (;;) {
+		usleep(10000);
+		pthread_mutex_lock(&stage_lock);
+		if (hung || (pending && steady)) {
+			tlmm_model_line(int_pin, true);
+			tlmm_model_line(int_pin, false);
+		}
+		pthread_mutex_unlock(&stage_lock);
+	}
+	return NULL;
+}
+
+static void
+frames_start(void)
+{
+	pthread_t thread;
+
+	(void)pthread_create(&thread, NULL, frames, NULL);
+}
+
 /* a chip that hangs with a finger down and that its reset brings back: reset, looked at again, read again */
 static void
 reset_brings_it_back(void)
 {
 	ready();
+	frames_start();
 	one_finger(2, 10, 20);
 	taken();
 	hung = true;
@@ -941,6 +1025,7 @@ static void
 four_troubles_end_it(void)
 {
 	ready();
+	frames_start();
 	one_finger(2, 10, 20);
 	hang_after = 3;
 	hung = true;
@@ -1001,7 +1086,8 @@ main(int argc, char **argv)
 		{ "nobody_answers", nobody_answers }, { "supply_refused", supply_refused },
 		{ "one_finger_down_moves_up", one_finger_down_moves_up }, { "several_fingers", several_fingers },
 		{ "mirrored", mirrored }, { "reports_not_believed", reports_not_believed }, { "firmware_request", firmware_request },
-		{ "dozing_is_not_trouble", dozing_is_not_trouble }, { "silent_finger_lifted", silent_finger_lifted },
+		{ "dozing_is_not_trouble", dozing_is_not_trouble }, { "edge_latched_read_promptly", edge_latched_read_promptly },
+		{ "doze_handshake", doze_handshake }, { "silent_finger_lifted", silent_finger_lifted },
 		{ "reset_brings_it_back", reset_brings_it_back }, { "four_troubles_end_it", four_troubles_end_it },
 		{ "run_ends_while_polling", run_ends_while_polling }, { "run_ends_in_bring_up", run_ends_in_bring_up },
 	};

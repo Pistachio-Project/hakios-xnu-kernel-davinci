@@ -30,6 +30,8 @@
 #define TLMM_PINS               hakios_tlmm_pins(hakios_board())
 #define GPIO_CFG(n)             ((HAKIOS_TLMM) + hakios_tlmm_offset(hakios_board(), (n)))        /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              ((HAKIOS_TLMM) + hakios_tlmm_offset(hakios_board(), (n)) + 4)    /* bit 0 in, bit 1 out */
+#define GPIO_INTR_CFG(n)        ((HAKIOS_TLMM) + hakios_tlmm_offset(hakios_board(), (n)) + 8)    /* the pin's interrupt detection */
+#define GPIO_INTR_STATUS(n)     ((HAKIOS_TLMM) + hakios_tlmm_offset(hakios_board(), (n)) + 0xc)  /* bit 0: an edge was seen */
 #define PULL_NONE               0
 #define PULL_DOWN               1
 #define PULL_KEEPER             2
@@ -65,6 +67,46 @@ gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
 {
 	gpio_set(pin, high);            /* the level first, so that the pin never drives the wrong one */
 	gpio_configure(pin, 0, pull, ma, true);
+}
+
+/*
+ * A pin's edge latch, for a pin whose interrupt this kernel cannot take: the controller sees falling edges and
+ * remembers one in the pin's status register, and is not told to send it anywhere (the enable and target bits stay
+ * as they were), so nothing fires and the driver reads the latch. Bits: drivers/pinctrl/qcom/pinctrl-msm.c
+ * msm_gpio_irq_set_type() (raw status enable on, falling edge = detection 2 and polarity 1) with the SM7150's positions
+ * (pinctrl-sm6150.c: enable 0, polarity 1, detection 2 (two bits), raw status 4, target 5); the status bit is cleared by
+ * writing 0 (msm_gpio_irq_ack()).
+ */
+#define INTR_ENABLE             (1u << 0)
+#define INTR_POLARITY           (1u << 1)
+#define INTR_DETECTION_MASK     (3u << 2)
+#define INTR_DETECTION_EDGE_FALLING     (2u << 2)
+#define INTR_RAW_STATUS_EN      (1u << 4)
+#define INTR_DIR_CONN_EN        (1u << 8)
+
+/* the latch armed for falling edges, and cleared (the caller has the registers as found, to give back) */
+static inline void __attribute__((unused))
+gpio_edge_latch_arm(unsigned pin)
+{
+	uint32_t cfg = rd(GPIO_INTR_CFG(pin));
+
+	cfg &= ~(INTR_ENABLE | INTR_DETECTION_MASK | INTR_DIR_CONN_EN);   /* (not enabled, not routed anywhere) */
+	cfg |= INTR_RAW_STATUS_EN | INTR_DETECTION_EDGE_FALLING | INTR_POLARITY;
+	wr(GPIO_INTR_CFG(pin), cfg);
+	wr(GPIO_INTR_STATUS(pin), 0);
+}
+
+/* an edge was seen since the last clear */
+static inline bool __attribute__((unused))
+gpio_edge_latched(unsigned pin)
+{
+	return rd(GPIO_INTR_STATUS(pin)) & 1;
+}
+
+static inline void __attribute__((unused))
+gpio_edge_clear(unsigned pin)
+{
+	wr(GPIO_INTR_STATUS(pin), 0);
 }
 
 #endif /* HAKIOS_TLMM_H */

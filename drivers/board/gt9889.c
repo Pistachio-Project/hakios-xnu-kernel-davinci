@@ -58,6 +58,13 @@
  *   5  its reports read, from here on
  * At touchscreen=-1 steps 1 and 4 are made, and 4 with nothing switched on for it.
  *
+ * Interrupt: INT falls for each report (the vendor reads it only then: goodix,irq-flags = 2) and this kernel cannot take
+ * the interrupt, so the pin controller is asked to latch the falling edge (tlmm.h) and the latch is polled every POLL_MS;
+ * it is never routed to the interrupt controller. After an edge the report is read at once, the event byte written 0 and
+ * the latch cleared. Without one the chip is not read but once a second (LATCHLESS_TICKS; a failed read then is nothing),
+ * and where the latch could not be armed the line's level and the old idle looks are what is used. The pin's interrupt
+ * registers are given back as found. gt9889_doze=1 brackets the event byte's write with the vendor's doze handshake.
+ *
  * What a report costs: the bus is driven by hand at 100 kHz at most with a core spun for it (i2c_gpio.h). The 12
  * bytes of a look are some 130 bits, about 1.4 ms; idle the chip is looked at every fourth tick (31 times a second:
  * 4 % of a core), with a finger down 125 times a second (a sixth of a core and more with more fingers). A serial
@@ -122,6 +129,8 @@ gt9889_wait_us(uint32_t us)
 }
 
 #define POLL_MS                 8       /* the interrupt line is looked at 125 times a second */
+#define LATCHLESS_TICKS         125     /* with the latch armed and no edge: the chip is asked once a second */
+#define DOZE_TRIES              20
 #define IDLE_LOOKS              4       /* ... and the chip asked on every fourth look whatever the line says (this file's head: interrupt) */
 #define LIFT_US                 250000  /* nothing believable for so long: the fingers are lifted */
 #define TROUBLE_LOOKS           125     /* so many looks in a row without a report: the chip is reset */
@@ -505,7 +514,7 @@ regs_read(uint16_t reg, uint8_t *values, unsigned count)
 	return answered;
 }
 
-/* one byte into a register: the event byte's 0, which says the report was taken (the only write this file makes) */
+/* one byte into a register: the event byte's 0 (and the doze handshake's), which says the report was taken (the only write this file makes) */
 static bool
 reg_write(uint16_t reg, uint8_t value)
 {
@@ -542,6 +551,34 @@ fingers_down(void)
 	return down;
 }
 
+/* The vendor's doze handshake (goodix_ts_i2c.c:522-587): 0xAA into 0x30F0, the chip says 0xBB in 0x3100, later 0xCC. */
+#define GT9889_REG_DOZE         0x30f0
+#define GT9889_REG_DOZE_STATE   0x3100
+static uint32_t doze;                   /* gt9889_doze=1 */
+
+/* the event byte written 0 (the chip waits for that before the next report), inside the handshake if asked for */
+static void
+doze_ack(void)
+{
+	bool held = false;
+	uint8_t state = 0;
+
+	if (doze & 1) {
+		if (reg_write(GT9889_REG_DOZE, 0xaa)) {
+			for (unsigned i = 0; i < DOZE_TRIES && !held; i++) {
+				held = regs_read(GT9889_REG_DOZE_STATE, &state, 1) && state == 0xbb;
+				if (!held) {
+					gt9889_wait_us(1000);
+				}
+			}
+		}
+	}
+	(void)reg_write(GT9889_REG_REPORT, 0);
+	if (held) {
+		(void)reg_write(GT9889_REG_DOZE, 0xcc);
+	}
+}
+
 /*
  * A report: its first bytes, and, if they say more than one finger, the rest from the next register on (as the vendor
  * reads it); `bytes' is how many came. A failed read is false. The event byte is written 0 afterwards if the report
@@ -565,7 +602,7 @@ report_read(uint8_t *report, unsigned *bytes)
 		*bytes += more;
 	}
 	if (report[0] != 0) {
-		(void)reg_write(GT9889_REG_REPORT, 0);
+		doze_ack();
 	}
 	return true;
 }
@@ -574,7 +611,7 @@ report_read(uint8_t *report, unsigned *bytes)
 
 static uint32_t flip, trace;
 static uint32_t panel_x, panel_y;       /* the largest coordinates: the board's */
-static struct { uint32_t looks, reports, bad, reads_failed, positions, idle_misses, requests; } seen;
+static struct { uint32_t looks, reports, bad, reads_failed, positions, idle_misses, requests, raw_dumped; } seen;
 
 static void
 report(const struct gt9889_frame *frame)
@@ -628,6 +665,8 @@ release(void)
 static unsigned pin_number[KEPT_PINS];
 static uint32_t pin_found_cfg[KEPT_PINS], pin_found_io[KEPT_PINS];
 static unsigned pins_kept;
+static uint32_t int_found_intr_cfg;     /* INT's interrupt detection as found, and whether it was changed */
+static bool latch_armed;
 static bool powered;                    /* bring-up has begun to change things: there is something to put back */
 
 static void
@@ -643,6 +682,7 @@ pins_record(void)
 		pin_found_cfg[i] = rd(GPIO_CFG(pin_number[i]));
 		pin_found_io[i] = rd(GPIO_IO(pin_number[i]));
 	}
+	int_found_intr_cfg = rd(GPIO_INTR_CFG(PIN_INT));
 	__atomic_store_n(&powered, true, __ATOMIC_SEQ_CST);
 }
 
@@ -663,6 +703,11 @@ power_off(void)
 	}
 	if (WIRED->io_supply != NULL) {
 		supply_off(WIRED->io_supply, &io_supply_at);
+	}
+	if (latch_armed) {
+		wr(GPIO_INTR_CFG(PIN_INT), int_found_intr_cfg);         /* (then the latch, which putting the detection back may set) */
+		gpio_edge_clear(PIN_INT);
+		latch_armed = false;
 	}
 	for (unsigned i = 0; i < pins_kept; i++) {
 		if (pin_number[i] != PIN_RESET) {
@@ -695,6 +740,10 @@ reset_pulse(void)
 	}
 	gpio_configure(PIN_INT, 0, PULL_UP, 2, false);
 	wait_ms(RESET_WAIT_MS);
+	if (!__atomic_load_n(&leaving, __ATOMIC_SEQ_CST)) {
+		gpio_edge_latch_arm(PIN_INT);   /* (after the pin is an input: the reset's own edges are not reports) */
+		latch_armed = true;
+	}
 }
 
 /*
@@ -856,21 +905,51 @@ poll_once(unsigned tick)
 	struct gt9889_frame frame;
 	unsigned bytes = 0;
 	enum gt9889_look look = GT9889_BAD;
-	/* (the line may only pulse for a report, and a board may have it wrong: asked now and then whatever it says) */
-	bool pending = !gpio_get(PIN_INT), down = fingers_down() != 0, got;
+	bool armed = __atomic_load_n(&latch_armed, __ATOMIC_SEQ_CST), edge = false, down = fingers_down() != 0, asked, got;
 	uint64_t now;
 
-	if (!pending && !down && tick % IDLE_LOOKS != 0) {
-		return true;
+	if (armed) {
+		/* the latch is cleared before the read, so that an edge during it is the next report's */
+		edge = gpio_edge_latched(PIN_INT);
+		if (edge) {
+			gpio_edge_clear(PIN_INT);
+		}
+		asked = edge;
+		if (!edge) {
+			if (tick != 1 && tick % LATCHLESS_TICKS != 0) {
+				lift_if_silent(now_us());
+				return true;
+			}
+		}
+	} else {
+		/* (no latch: the line may only pulse for a report, and a board may have it wrong: asked now and then whatever it says) */
+		asked = !gpio_get(PIN_INT) || down;
+		if (!asked && tick % IDLE_LOOKS != 0) {
+			return true;
+		}
 	}
 	seen.looks++;
 	got = report_read(report_bytes, &bytes);
 	now = now_us();
+	if (got && trace && seen.raw_dumped < 60) {
+		/* gt9889_trace=1: each read as it came, before it is judged (the first 60), to tell the bus from the chip's format */
+		char hex[3 * GT9889_REPORT_MAX + 1];
+		unsigned at = 0;
+
+		seen.raw_dumped++;
+		for (unsigned i = 0; i < bytes && at + 3 < sizeof(hex); i++) {
+			at += (unsigned)snprintf(hex + at, sizeof(hex) - at, "%02x ", report_bytes[i]);
+		}
+		say("gt9889: read %u bytes (%s, line %s, latch %s): %s\n", bytes, asked ? "asked" : "unasked", gpio_get(PIN_INT) ? "high" : "low",
+		    armed ? (edge ? "set" : "clear") : "off", hex);
+	}
 	if (got) {
 		look = gt9889_decode(report_bytes, bytes, contacts, panel_x, panel_y, &frame);
-	} else if (!pending && !down) {
+	}
+	if (!asked && (!got || look == GT9889_BAD)) {
 		/* a look that was not asked for by the line or a finger, and the chip did not answer: it may be dozing (this file's head) */
 		seen.idle_misses++;
+		lift_if_silent(now);
 		return true;
 	}
 	if (look == GT9889_FRAME) {
@@ -967,8 +1046,8 @@ gt9889_thread(__unused void *parameter, __unused wait_result_t result)
 		return;
 	}
 	done();
-	say("gt9889: step 5: touch screen ready, %u x %u, %u fingers; the interrupt line (gpio%u) is looked at every %u ms\n", panel_x,
-	    panel_y, contacts, PIN_INT, POLL_MS);
+	say("gt9889: step 5: touch screen ready, %u x %u, %u fingers; the interrupt line (gpio%u) is looked at every %u ms (%s)\n", panel_x,
+	    panel_y, contacts, PIN_INT, POLL_MS, latch_armed ? "its falling edges latched" : "by its level");
 	trouble.last_good_us = now_us();
 	for (unsigned tick = 1; begin(); tick++) {
 		if (!poll_once(tick)) {
@@ -1029,11 +1108,13 @@ hakios_gt9889_init(void)
 	/*
 	 * touch_flip=N: bit 0 mirrors the touches left to right, bit 1 top to bottom.
 	 * gt9889_trace=1: the first 40 touches' positions as the controller gives them, in the log.
+	 * gt9889_doze=1: the event byte's write inside the vendor's doze handshake (this file's head).
 	 * gt9889_steps=N: the bring-up stops after its first N steps (this file's head), and powers off what it powered.
 	 */
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	PE_parse_boot_argn("gt9889_trace", &trace, sizeof(trace));
 	PE_parse_boot_argn("gt9889_steps", &steps, sizeof(steps));
+	PE_parse_boot_argn("gt9889_doze", &doze, sizeof(doze));
 	if (steps == 0) {
 		say("gt9889: gt9889_steps=0: nothing is done\n");
 		return;

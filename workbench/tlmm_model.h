@@ -15,6 +15,9 @@ static struct {
 	unsigned pins;                  /* how many there are (a tiled controller has fewer than 256) */
 	uint32_t at[PINS];              /* where a pin's registers are from base: 0x1000 n, or its tile's offset more */
 	uint32_t cfg[PINS], io[PINS];
+	uint32_t intr_cfg[PINS];        /* the interrupt detection; intr_status[] bit 0 is the latch */
+	uint32_t intr_status[PINS];
+	unsigned intr_writes, routed;   /* writes to those; times a pin's interrupt was enabled or routed (should be none) */
 	bool input[PINS];               /* what is outside on the pin */
 	unsigned reads, writes, elsewhere;
 	unsigned drove_wrong;           /* a pin became an output while its level was not the one asked for last */
@@ -35,7 +38,7 @@ tlmm_model_decode(vm_offset_t address, uint32_t *pin, uint32_t *reg)
 		if (offset >= model.at[n] && offset - model.at[n] < 0x1000) {
 			*pin = n;
 			*reg = offset - model.at[n];
-			return *reg == 0 || *reg == 4;
+			return *reg == 0 || *reg == 4 || *reg == 8 || *reg == 0xc;
 		}
 	}
 	return false;
@@ -51,6 +54,12 @@ tlmm_model_rd(vm_offset_t address)
 		return 0;
 	}
 	model.reads++;
+	if (reg == 8) {
+		return model.intr_cfg[pin];
+	}
+	if (reg == 0xc) {
+		return model.intr_status[pin];
+	}
 	return reg == 0 ? model.cfg[pin] : (model.io[pin] & 2) | (model.input[pin] ? 1 : 0);
 }
 
@@ -64,6 +73,16 @@ tlmm_model_wr(vm_offset_t address, uint32_t value)
 		return;
 	}
 	model.writes++;
+	if (reg == 8 || reg == 0xc) {
+		model.intr_writes++;
+		if (reg == 8) {
+			model.routed += (value & (1u << 0 | 1u << 8)) != 0;
+			model.intr_cfg[pin] = value;
+		} else {
+			model.intr_status[pin] &= value;        /* written 0: cleared */
+		}
+		return;
+	}
 	if (reg == 4) {
 		model.io[pin] = value;
 		model.wanted[pin] = (value & 2) ? 1 : 0;
@@ -76,6 +95,16 @@ tlmm_model_wr(vm_offset_t address, uint32_t value)
 	if (model.after_write != NULL) {
 		model.after_write();
 	}
+}
+
+/* the line of a pin is now at that level; a falling edge is latched if the pin's detection is set for it (the controller's) */
+static inline void
+tlmm_model_line(unsigned pin, bool high)
+{
+	if (model.input[pin] && !high && (model.intr_cfg[pin] & (1u << 4)) && (model.intr_cfg[pin] & (3u << 2)) == (2u << 2)) {
+		model.intr_status[pin] |= 1;
+	}
+	model.input[pin] = high;
 }
 
 /* the pins at that address, nothing asked of any yet */
