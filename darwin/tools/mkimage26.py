@@ -3,12 +3,15 @@
 phone's ARMv8.2 cores: every arm64e Mach-O goes through pacstrip, the dyld shared cache is the one
 pacstrip rewrote (darwin26/dyld-strip).
 
-usage: [IOS=DIR] [WALLPAPER=COLOUR] [METAL=1] mkimage26.py [--min | --prune] [--metal] OUT.apfs      (IOS: the unpacked IPSW, default ios27 beside the
+usage: [IOS=DIR] [WALLPAPER=COLOUR] [METAL=1] mkimage26.py [--min | --prune | --lean] [--metal] OUT.apfs      (IOS: the unpacked IPSW, default ios27 beside the
                                                               repository; darwin/tools/unpack.sh)
 
   --min   only what proves the user space runs: launchd, dyld, the cache and a few programs of /bin
           and /usr/bin; the rest of the system is left out
   (default) the files select-system.py chooses (the rules of 16.5's image), applied to iOS 26/27
+  --lean  --prune and, from scenario D, the resources of WeatherUI and AvatarKit (Maps, Setup, Music and CameraEffectsKit are
+          pruned already). Not the cache zero-fill (scenario C): the static closure misses dlopen(), the cache's page hashes would need
+          signing again, and nothing here can boot-test it. /jb (Sileo) stays unless JB=0
   --prune the same, smaller for 6 GB of RAM (Documentation/ram-budget.md, scenario B): .loctable string
           tables cut to English and Base, the heavy apps nothing at boot needs and the poster apps
           left out, and Fonts/AppFonts
@@ -86,6 +89,11 @@ PRUNED_METALLIB_DIRS = ('System/Library/CoreImage/PortraitFilters.cifilter/',)
 PRUNED_FRAMEWORK_RESOURCES = ('System/Library/PrivateFrameworks/iWorkImport.framework/',
                               'System/Library/PrivateFrameworks/IntelligenceFlowPlannerSupport.framework/',
                               'System/Library/PrivateFrameworks/CameraEffectsKit.framework/')
+# --lean (Documentation/ram-budget.md scenario D, on top of --prune, which already drops Maps, Setup, Music and
+# CameraEffectsKit): the resources of the frameworks the doc names. Their code stays in the shared cache
+LEAN_FRAMEWORK_RESOURCES = ('System/Library/PrivateFrameworks/WeatherUI.framework/',
+                            'System/Library/PrivateFrameworks/AvatarKit.framework/')
+LEAN = False
 EMOJI = 'System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc'
 # What select-system.py (16.5's rules: framework resources up to SMALL) leaves out and Darwin 27 cannot
 # do without: linkd dies at its start without the App Intents schema database ("AppIntentSchemas/
@@ -113,6 +121,12 @@ METAL_LEFT_OUT = ('System/Library/PrivateFrameworks/GESS.framework/', 'System/Li
 METAL = False
 
 
+def _is_macho_name(rel):
+    # the framework's own binary (WeatherUI/WeatherUI) is a stub beside the cache; keep it and drop the resources
+    parts = rel.split('/')
+    return len(parts) == 5 and parts[-1] == parts[-2][:-len('.framework')]
+
+
 def pruned(rel):
     if rel.startswith('Applications/'):
         app = rel.split('/')[1]
@@ -122,6 +136,8 @@ def pruned(rel):
     if rel.startswith(PRUNED_METALLIB_DIRS) and rel.endswith('.metallib'):
         return True
     if rel.startswith(PRUNED_FRAMEWORK_RESOURCES) and not rel.endswith('/Info.plist'):
+        return True
+    if LEAN and rel.startswith(LEAN_FRAMEWORK_RESOURCES) and not rel.endswith('/Info.plist') and not _is_macho_name(rel):
         return True
     return rel.startswith('System/Library/Fonts/AppFonts/')
 
@@ -442,9 +458,10 @@ def write_job_cache(jobs):
 
 
 def main():
-    global PRUNE, METAL
+    global PRUNE, METAL, LEAN
     minimal = '--min' in sys.argv
-    PRUNE = '--prune' in sys.argv
+    LEAN = '--lean' in sys.argv
+    PRUNE = '--prune' in sys.argv or LEAN
     METAL = '--metal' in sys.argv
     out = [a for a in sys.argv[1:] if not a.startswith('--')]
     if len(out) != 1:
