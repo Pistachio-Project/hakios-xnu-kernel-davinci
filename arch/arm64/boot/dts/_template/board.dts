@@ -130,10 +130,12 @@
 		// and otherwise says so and drives the pins by hand as without these keys. The same keys as touch { }'s; needs
 		// clocks { gcc } in soc.dtsi; the engine's node is the bus's (qupv3_seN_i2c).
 		// serial-engine = <0x00a84000>; // the bus's node: reg (qupv3_se7_i2c: i2c@a84000)
-		// clocks = <0x1800c 0x18010 0x18864>; // the wrapper's two bus clocks and the engine's own: each one's halt_reg
+		// clocks = <0x1800c 0x18010 0x18144>; // the wrapper's two bus clocks and the engine's own: each one's halt_reg
 		// vote-register = <0x5200c>;   // the enable_reg of those clocks
-		// votes = <18 19 20 21 29>;    // ... and enable_mask of the wrapper's core_2x, core, the two bus clocks and the
-		//                              // engine's, as bit numbers (tools/qupclocks.py gcc-SOC.c WRAPPER ENGINE prints the three lines)
+		// votes = <18 19 20 21 23>;    // ... and enable_mask of the wrapper's core_2x, core, the two bus clocks and the
+		//                              // engine's, as bit numbers (tools/qupclocks.py gcc-SOC.c WRAPPER ENGINE prints the three lines;
+		//                              // WRAPPER and ENGINE from the node's se-clk, GCC_QUPV3_WRAPw_Se_CLK: a node's "seN" label is
+		//                              // the chip-wide number, not the engine's within its wrapper)
 	// };
 	// The same section is the feature "touch-gt9889"'s: a Goodix GT9889 ("goodix,gt9889" node, the vendor's
 	// goodix_driver_gt9886), a board lists one of the two. Its keys are the node's: address = reg (0x5d);
