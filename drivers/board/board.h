@@ -52,6 +52,7 @@ enum {
 	HAKIOS_HAS_SPEAKER_AW88261 = 1u << 7,   /* two Awinic AW88261 amplifiers on I2C (board/speaker.c, board/sound.c) */
 	HAKIOS_HAS_HAPTIC_AW86927  = 1u << 8,   /* an Awinic AW86927 vibration motor driver (board/haptic.c) */
 	HAKIOS_HAS_TORCH_PM8350C   = 1u << 9,   /* the flash LED module of a PM8350C (board/torch.c) */
+	HAKIOS_HAS_TORCH_PM6150L   = 1u << 24,  /* ... or a PM6150L's ("qcom,qpnp-flash-led-v2"): the same torch { }, the same driver */
 	HAKIOS_HAS_CAMERA_SM7325   = 1u << 10,  /* cameras on an SM7325's camera blocks, powered by a PM8008, wired as
 	                                         * the board's camera { } says (board/camera.c) */
 	HAKIOS_HAS_WIFI_WCN6750    = 1u << 11,  /* a WCN6750 radio on the SoC's own Wi-Fi DSP (board/wifi.c) */

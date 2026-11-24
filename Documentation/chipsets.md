@@ -23,7 +23,7 @@ alone, the first kernel of a new chip ([porting.md](porting.md)).
 | The cores' speed by the firmware (`board/scmi_perf.c`) | `scmi-perf { }`: the shared memory, the mailbox, the doorbell | SCMI's performance protocol, on the chips whose firmware sets the cores' speed itself | — |
 | The memory's vote (`board/ddr.c`) | `rpmh { }`: the command database and the application processor's RSC | RPMh's bus votes, by the names the command database gives (`MC0`, `SH0`), through the sequencer's first slot set: every chip with RPMh, whose tree lists its active slots first (`qcom,tcs-config`) | A name the database has not: said, no vote. A tree whose first slots are not active ones: said by `tools/boards.py new --dts` |
 | The panel's light (`board/backlight.c`) | `display { dsi0 }`, `clocks { }`, and the board's `backlight { }` | DCS through MDSS DSI 2.2 and later (any panel that takes 0x51), or in software | A DSI controller off: the light in software |
-| The flashlight (`board/torch.c`) | `spmi { }` and the board's `torch { }` | The flash LED module of a PM8350C | Said, left alone |
+| The flashlight (`board/torch.c`) | `spmi { }` and the board's `torch { }` | The flash LED module of a PM8350C or a PM6150L | Said, left alone |
 
 ## Telling the kinds apart
 
@@ -107,5 +107,5 @@ reg of `qcom,ufshc`); both are read.
   from memory without a phone to see them on. The keys and the flashlight say the version and do nothing. The second
   bus of a version 8 arbiter is not known either (`bus = <1>` with `channel-map` is refused).
 - eMMC storage, and UFS 4 hosts' vendor registers beyond what JEDEC lays out.
-- The flash LED of PMICs other than the PM8350C.
+- The flash LED of PMICs other than the PM8350C and the PM6150L.
 - The table's core-count field and per-core DCVS of the cores' frequency block ([drivers.md](drivers.md)).
