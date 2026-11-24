@@ -17,6 +17,7 @@ struct platform {
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
+	uint32_t timer_intid;            /* the EL1 virtual timer's PPI as a GIC INTID (16-31); 0: the usual 27 */
 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
 	/*
 	 * The one partition of the phone's storage a write may reach, named "darwin": the port's own. Its

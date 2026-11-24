@@ -198,6 +198,10 @@
 		cores = <8>;                    // the cpu@ nodes
 		core-shift = <8>;               // where the core's number is in its reg: 8 for 0x000, 0x100 ..., 0 for 0, 1 ...
 		small-cores = <0x0f>;           // optional: a bit for each core of the lowest capacity-dmips-mhz
+		// timer-intid = <27>;          // optional: the EL1 virtual timer's interrupt as a GIC INTID: 16 + the third PPI
+		//                              // of the tree's arm,armv8-timer node. 27 (PPI 11) where left out; SM7150's is 19
+		//                              // (PPI 3): with the wrong one the kernel runs without a clock tick and hangs
+		//                              // in its first timed wait
 		psci = "smc";                   // the psci node's method: "smc" or "hvc"
 		timeout-scale = <20>;           // optional: how many times longer the kernel waits for a lock; for emulators
 	};

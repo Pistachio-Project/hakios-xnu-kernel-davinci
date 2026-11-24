@@ -75,7 +75,7 @@
 
 #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
 #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
+#define GIC_INTID_VTIMER_USUAL  27          /* EL1 virtual timer PPI, where the SoC file does not say another */
 #define GIC_INTID_SPI_MIN       32
 #define GIC_INTID_SPURIOUS_MIN  1020
 #define GIC_INTID_SPURIOUS_MOST 1023        /* 1020 to 1023 are no interrupt; above them there are others */
@@ -84,6 +84,8 @@
 #define GIC_PRIORITY_DEFAULT    0xa0
 
 static vm_offset_t gicd_base, gicr_base;
+/* the EL1 virtual timer's PPI: 27 on most chips; the SoC file's platform { timer-intid } where it is another (SM7150: 19) */
+static uint32_t gic_intid_vtimer = GIC_INTID_VTIMER_USUAL;
 #define GICD_TYPER              0x0004  /* [4:0] ITLinesNumber: SPIs up to 32 * (N + 1) - 1 */
 #define GICD_TYPER_ESPI         (1u << 8)   /* extended SPIs, up to 32 * (ESPI_range [31:27] + 1) + 4095 */
 static uint32_t gic_intid_most = 1019;  /* the last INTID the distributor has, from GICD_TYPER */
@@ -343,7 +345,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 		}
 		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
 
-		if (intid == GIC_INTID_VTIMER) {
+		if (intid == gic_intid_vtimer) {
 			/* same sequence as the FIQ path in sleh_fiq() */
 			getCpuDatap()->cpu_decrementer = -1; /* Large */
 			rtclock_intr(TRUE);
@@ -461,7 +463,7 @@ gic_v3_irq_cpu_init(void)
 {
 	int cpu = cpu_number();
 	vm_offset_t gicr;
-	uint32_t mine = 1u << GIC_INTID_VTIMER;
+	uint32_t mine;
 
 	/*
 	 * (the device tree's node is read once, by the boot processor; the rest is done every time a
@@ -510,6 +512,16 @@ gic_v3_irq_cpu_init(void)
 		if (gicd_base == 0 || gicr_base == 0) {
 			panic("gic: cannot map the distributor/redistributor");
 		}
+		if (SecureDTGetProperty(entry, "timer-intid", &prop, &prop_size) == kSuccess && prop_size >= sizeof(uint32_t)) {
+			uint32_t intid = *(uint32_t const *)prop;
+
+			if (intid >= 16 && intid < GIC_INTID_SPI_MIN) {
+				gic_intid_vtimer = intid;
+			} else {
+				kprintf("gic: timer-intid %u is not a PPI (16-31): the usual %u is used\n", intid,
+				    GIC_INTID_VTIMER_USUAL);
+			}
+		}
 		{
 			uint32_t typer = gic_read32(gicd_base + GICD_TYPER), lines = typer & 0x1f, most = 32 * (lines + 1) - 1;
 
@@ -519,6 +531,9 @@ gic_v3_irq_cpu_init(void)
 			}
 		}
 	}
+
+	/* (after the device tree was read: timer-intid may have moved the timer's PPI) */
+	mine = 1u << gic_intid_vtimer;
 
 	/* System-register CPU interface */
 	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | 1);
@@ -556,7 +571,7 @@ gic_v3_irq_cpu_init(void)
 	/* Virtual timer PPI (and those): Group 1 (IRQ), default priority, enabled */
 	gic_write32(gicr + GICR_IGROUPR0, gic_read32(gicr + GICR_IGROUPR0) | mine);
 	gic_write32(gicr + GICR_IGRPMODR0, gic_read32(gicr + GICR_IGRPMODR0) & ~mine);
-	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
+	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(gic_intid_vtimer)) = GIC_PRIORITY_DEFAULT;
 	gic_write32(gicr + GICR_ISENABLER0, mine);
 
 	/* Distributor: affinity routing, Group 1 enabled (normally already so) */
@@ -582,7 +597,7 @@ gic_v3_irq_cpu_init(void)
 
 	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
 	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d\n",
-	    (void *)gicd_base, cpu, (void *)gicr, GIC_INTID_VTIMER);
+	    (void *)gicd_base, cpu, (void *)gicr, gic_intid_vtimer);
 }
 
 #endif /* GENERIC_GIC_V3_IRQ */

@@ -87,7 +87,8 @@ SOC_SCHEMA = {
                  'gic_redist_size': (U64, False), 'gic_redist_stride': (U64, False), 'uart': (U64, False),
                  'ufs': (U64, False),
                  'cores': (int, True), 'core_shift': (int, True), 'small_cores': (int, False),
-                 'psci': (('smc', 'hvc'), True), 'timeout_scale': (int, False)},
+                 'psci': (('smc', 'hvc'), True), 'timeout_scale': (int, False),
+                 'timer_intid': (int, False)},
     'clocks': {'gcc': (int, True), 'gcc_disp_ahb_cbcr': (int, False), 'dispcc': (int, False),
                'dispcc_mdss_gdscr': (int, False), 'dispcc_mdss_ahb_cbcr': (int, False),
                'dispcc_mdss_pclk0_cbcr': (int, False), 'dispcc_mdss_mdp_cbcr': (int, False)},
@@ -1243,6 +1244,8 @@ def platforms_text(socs, boards):
                    f'.timeout_scale = {platform.get("timeout_scale", 0)}',
                    f'.small_cores = {platform.get("small_cores", 0):#x}',
                    f'.fb_base = {loader.get("fb_base", 0):#010x}']
+        if 'timer_intid' in platform:
+            fields.append(f'.timer_intid = {platform["timer_intid"]}')
         own = board.get('storage')
         if own:
             fields.append(f'.own = {{ .type = {c_guid(own["type_guid"])}, .unique = {c_guid(own["unique_guid"])},\n'

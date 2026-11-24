@@ -633,6 +633,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (plat->gic_redist_stride != 0) {
 		dt_prop_u64(&w, "redistributor-stride", plat->gic_redist_stride);
 	}
+	if (plat->timer_intid != 0) {
+		dt_prop_u32(&w, "timer-intid", plat->timer_intid);  /* the virtual timer's PPI, where it is not 27 */
+	}
 	dt_end(&w);
 	if (plat->uart != 0) {
 		dt_begin(&w, "uart0");
