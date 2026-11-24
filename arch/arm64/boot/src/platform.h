@@ -13,6 +13,7 @@ struct platform {
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
 	int uefi_charger;                /* the firmware has Qualcomm's charger protocols: the battery is read through them */
+	int uefi_charger_no_this;        /* ... and its drivers take no This argument (the board says so; the revision seen is logged) */
 	int cores;                       /* at most this many processor cores, numbered from 0 ... */
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */

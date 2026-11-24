@@ -317,7 +317,7 @@ static struct loader_battery charger_shared __attribute__((aligned(0x2000))) = {
 static efi_charger_ex *CHARGER_EX;
 static efi_qcom_charger *QCOM_CHARGER;
 static int charger_enabled;
-static int charger_no_this;	/* the firmware's charger protocols take no This (QCOM_CHARGER_NO_THIS_REVISION) */
+static int charger_no_this;	/* the firmware's charger protocols take no This (uefi-charger-no-this in the board file) */
 
 /* The screen recording the last kernel left in memory, if it made one ("oem recording" stages it). */
 static const char *recording_data;

@@ -9,11 +9,11 @@ charger_start(void)
 	if (charger_enabled || !PLAT->uefi_charger) {
 		return;
 	}
+	charger_no_this = PLAT->uefi_charger_no_this;
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
 	qcom_status = BS->locate_protocol(&qcom_charger_guid, NULL, (void **)&QCOM_CHARGER);
 	if (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL) {
 		/* Re-open the driver's status path after QcomChargerApp handed off to the OS. */
-		charger_no_this = QCOM_CHARGER->revision == QCOM_CHARGER_NO_THIS_REVISION;
 		init_status = charger_no_this ? ((efi_qcom_charger_init_nothis)(void *)QCOM_CHARGER->initialize)(1) :
 		    QCOM_CHARGER->initialize(QCOM_CHARGER, 1);
 	}
