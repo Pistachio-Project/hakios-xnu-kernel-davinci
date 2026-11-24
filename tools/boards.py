@@ -144,7 +144,7 @@ BOARD_SCHEMA = {
               'bus_pins': ([int], True),
               'interrupt': (int, True), 'reset': (int, True), 'io_supply': (str, True), 'analog_supply': (str, False),
               'analog_enable': (int, False), 'vendor_pins': ([int], False), 'coordinates': ([int], False)},
-    # a touch controller on two of the SoC's pins as I2C (board/ft5x06.c): nothing of a serial engine's
+    # a touch controller on two of the SoC's pins as I2C (board/ft5x06.c, board/gt9889.c): nothing of a serial engine's
     'touch_i2c': {'sda': (int, True), 'scl': (int, True), 'interrupt': (int, True), 'reset': (int, True),
                   'address': (int, True), 'contacts': (int, True), 'coordinates': ([int], True),
                   'io_supply': (str, False), 'analog_supply': (str, False), 'analog_millivolts': (int, False),
@@ -192,6 +192,7 @@ FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virt
                  # for a part's supply, and give a device its addresses in the SMMU
                  'touch-goodix': ('pins', 'clocks', 'rpmh'), 'touch-ft3658u': ('pins', 'clocks', 'rpmh'),
                  'touch-ft5x06': ('pins',),      # (and rpmh, if its touch_i2c names a supply: feature_needs())
+                 'touch-gt9889': ('pins',),      # (likewise)
                  'speaker-aw88261': ('pins', 'clocks', 'rpmh', 'smmu'), 'haptic-aw86927': ('pins',),
                  'imu-lsm6dso': ('pins',), 'imu-bmi160': ('pins',),
                  'adsp': ('rpmh', 'ipc'), 'wifi-wcn6750': ('rpmh', 'pins', 'spmi', 'ipc', 'smmu'), 'mic-wcd938x': ('pins', 'lpass')}
@@ -214,6 +215,7 @@ FEATURE_BOOTARGS = {
     'touch-goodix': 'touchscreen=1',
     'touch-ft3658u': 'touchscreen=1',
     'touch-ft5x06': 'touchscreen=-1 looks; touchscreen=1',
+    'touch-gt9889': 'touchscreen=-1 looks; touchscreen=1',
     'speaker-aw88261': 'speaker_probe=N looks; sound=N with adsp=1',
     'haptic-aw86927': 'haptic=N',
     'imu-lsm6dso': 'sensors=1 looks; sensors=2 follows the orientation',
@@ -229,15 +231,17 @@ PART_DRIVERS = ('bluetooth', 'touch', 'speaker', 'haptic', 'imu', 'torch', 'came
 # ... and of the board's own file
 FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'gpu-a660': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
                           'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
-                          'touch-ft3658u': 'touch', 'touch-ft5x06': 'touch_i2c', 'camera-sm7325': 'camera', 'imu-lsm6dso': 'imu',
+                          'touch-ft3658u': 'touch', 'touch-ft5x06': 'touch_i2c', 'touch-gt9889': 'touch_i2c', 'camera-sm7325': 'camera', 'imu-lsm6dso': 'imu',
                           'imu-bmi160': 'imu'}
 # ... and what a controller's driver uses of [touch] beyond what every one needs
 TOUCH_NEEDS = {'touch-goodix': ('analog_enable', 'vendor_pins', 'coordinates'), 'touch-ft3658u': ('analog_supply',)}
 # the touch controllers' drivers, each a feature: a board has one controller (board/drivers.c starts one)
-TOUCH_CHIPS = ('touch-goodix', 'touch-ft3658u', 'touch-ft5x06')
+TOUCH_CHIPS = ('touch-goodix', 'touch-ft3658u', 'touch-ft5x06', 'touch-gt9889')
 # what a chip of the FT5x06 family can say (board/ft5x06_report.h): so many fingers, coordinates of 12 bits; and the
 # analog supply its data sheets allow, 2.6 to 3.6 V
 FT5X06_CONTACTS, FT5X06_COORDINATE_MAX, FT5X06_ANALOG_MV = 10, 0xfff, (2600, 3600)
+# ... and a GT9889 (board/gt9889_report.h): ten fingers, coordinates of 16 bits; its analog supply is asked 3.0 V by the vendor
+GT9889_COORDINATE_MAX = 0xffff
 GPU_SPEEDS = 5          # (struct hakios_board: gpu.speeds_khz)
 # the accelerometer's ranges an LSM6DSO has (board/lsm6dso_core.h), in g; a BMI160 has the same four (board/bmi160_core.h)
 IMU_FULL_SCALES = (2, 4, 8, 16)
@@ -325,7 +329,7 @@ def feature_needs(feature, board, soc):
     if isinstance(touch, dict) and any(key not in touch for key in TOUCH_NEEDS.get(feature, ())):
         needs.append(' and '.join(key for key in TOUCH_NEEDS[feature] if key not in touch) + ' in [touch] of the board file')
     wired = board.get('touch_i2c')
-    if feature == 'touch-ft5x06' and isinstance(wired, dict) and ('io_supply' in wired or 'analog_supply' in wired) and \
+    if feature in ('touch-ft5x06', 'touch-gt9889') and isinstance(wired, dict) and ('io_supply' in wired or 'analog_supply' in wired) and \
             'rpmh' not in soc:
         needs.append(f'[rpmh] in {soc_file} (its [touch_i2c] names a supply, which is asked of RPMh)')
     spmi, display = soc.get('spmi'), soc.get('display')
@@ -396,7 +400,7 @@ def features_text():
             'The brightness (`[backlight]`), the thermal floors (`[thermal]`), the PMIC\'s clock (`[rtc]`, which',
             'needs `[spmi]` in the SoC file) and the partition that may be written (`[storage]`) are not',
             'features: a board has them by giving the section. `display-scan` is for a command-mode panel only.',
-            '`touch-ft5x06` needs `[rpmh]` in the SoC file as well when its `[touch_i2c]` names a regulator',
+            '`touch-ft5x06` and `touch-gt9889` need `[rpmh]` in the SoC file as well when its `[touch_i2c]` names a regulator',
             '(`io_supply`, `analog_supply` with `analog_millivolts`): a supply that is always on is not named.',
             '',
             '"nothing" is what the checker asks for, not what the driver needs of the phone. `modem-sm7325` has',
@@ -763,12 +767,13 @@ def load(problems=None):
             if any(not 0 <= pin <= 255 for pin in wires) or len(set(wires)) != len(wires):
                 problems.add(f'{rel} [touch_i2c]', 'sda, scl, interrupt, reset and analog_enable are different pins of the SoC, 0 to 255')
             if not 0x08 <= wired['address'] <= 0x77:
-                problems.add(f'{rel} [touch_i2c]', 'address is the chip\'s 7-bit I2C address, 0x08 to 0x77 (the FT5x06 family\'s: 0x38)')
+                problems.add(f'{rel} [touch_i2c]', 'address is the chip\'s 7-bit I2C address, 0x08 to 0x77 (the FT5x06 family\'s: 0x38; a GT9889\'s: 0x5d)')
             if not 1 <= wired['contacts'] <= FT5X06_CONTACTS:
                 problems.add(f'{rel} [touch_i2c]', f'contacts is how many fingers the chip reports at most: 1 to {FT5X06_CONTACTS}')
-            if len(wired['coordinates']) != 2 or any(not 0 < most <= FT5X06_COORDINATE_MAX for most in wired['coordinates']):
+            widest, bits = (GT9889_COORDINATE_MAX, 16) if 'touch-gt9889' in data.get('features', []) else (FT5X06_COORDINATE_MAX, 12)
+            if len(wired['coordinates']) != 2 or any(not 0 < most <= widest for most in wired['coordinates']):
                 problems.add(f'{rel} [touch_i2c]', 'coordinates are the largest x and y the controller reports: two numbers, '
-                             f'1 to {FT5X06_COORDINATE_MAX} (a report has 12 bits for each)')
+                             f'1 to {widest} (a report has {bits} bits for each)')
             if ('analog_supply' in wired) != ('analog_millivolts' in wired) or \
                     not FT5X06_ANALOG_MV[0] <= wired.get('analog_millivolts', FT5X06_ANALOG_MV[0]) <= FT5X06_ANALOG_MV[1]:
                 problems.add(f'{rel} [touch_i2c]', 'analog_supply and analog_millivolts go together: the regulator\'s name in RPMh and '

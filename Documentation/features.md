@@ -33,11 +33,12 @@ the two the same. What each key means is in `arch/arm64/boot/dts/_template/soc.d
 | `imu-lsm6dso` | `pins { }` | `imu { }`: `sda`, `scl`, `interrupt`, `address`, `full-scale`, `mount` | `sensors=1 looks; sensors=2 follows the orientation` |
 | `imu-bmi160` | `pins { }` | `imu { }`: `sda`, `scl`, `interrupt`, `address`, `full-scale`, `mount` | `sensors=1 looks; sensors=2 follows the orientation` |
 | `touch-ft5x06` | `pins { }` | `touch-i2c { }`: `sda`, `scl`, `interrupt`, `reset`, `address`, `contacts`, `coordinates` | `touchscreen=-1 looks; touchscreen=1` |
+| `touch-gt9889` | `pins { }` | `touch-i2c { }`: `sda`, `scl`, `interrupt`, `reset`, `address`, `contacts`, `coordinates` | `touchscreen=-1 looks; touchscreen=1` |
 
 The brightness (`backlight { }`), the thermal floors (`thermal { }`), the PMIC's clock (`rtc { }`, which
 needs `spmi { }` in the SoC file) and the partition that may be written (`storage { }`) are not
 features: a board has them by giving the section. `display-scan` is for a command-mode panel only.
-`touch-ft5x06` needs `rpmh { }` in the SoC file as well when its `touch-i2c { }` names a regulator
+`touch-ft5x06` and `touch-gt9889` need `rpmh { }` in the SoC file as well when its `touch-i2c { }` names a regulator
 (`io-supply`, `analog-supply` with `analog-millivolts`): a supply that is always on is not named.
 
 "nothing" is what the checker asks for, not what the driver needs of the phone. `modem-sm7325` has

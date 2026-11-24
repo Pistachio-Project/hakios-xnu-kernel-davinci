@@ -201,6 +201,15 @@ config TOUCH_FT5X06
 	  A FocalTech controller of the FT5x06 register family (FT5x06, FT5x46, FT6x36 ...) on two of the SoC's pins as
 	  I2C, driven by hand (board/ft5x06.c, the board's "touch-ft5x06" and touch-i2c { }). No firmware is uploaded.
 
+config TOUCH_GT9889
+	bool "Goodix GT9889 touch screens on I2C"
+	default y
+	select QCOM_TLMM
+	select QCOM_RPMH
+	help
+	  A Goodix GT9889 (GTX8 "Normandy") on two of the SoC's pins as I2C, driven by hand (board/gt9889.c, the board's
+	  "touch-gt9889" and touch-i2c { }). No firmware is uploaded and no configuration sent.
+
 config ADRENO_A6XX
 	bool "Adreno 6xx GPU (A660 family): started, and Metal's device for Darwin"
 	default y

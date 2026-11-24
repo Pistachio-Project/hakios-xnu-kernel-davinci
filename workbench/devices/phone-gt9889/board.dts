@@ -1,0 +1,29 @@
+/dts-v1/;
+
+// A test phone whose touch controller is a Goodix GT9889 on I2C, wired as Xiaomi's davinci has it (its address,
+// its analog supply behind a pin and a regulator of RPMh's, none for the I/O), on a made-up chip (soc.dtsi beside
+// this file). For the test of that driver (workbench/touch_gt9889_test.c).
+/ {
+	name = "phone-gt9889";
+	description = "Test phone, its Goodix GT9889 on I2C";
+	soc = "soc-gt9889";
+
+	features = "touch-gt9889";
+
+	backlight {
+		type = "soft";
+	};
+
+	touch-i2c {
+		sda = <6>;
+		scl = <7>;
+		interrupt = <9>;
+		reset = <8>;
+		address = <0x5d>;
+		contacts = <10>;
+		coordinates = <1079 2339>;
+		analog-supply = "ldoc6";
+		analog-millivolts = <3000>;
+		analog-enable = <5>;
+	};
+};

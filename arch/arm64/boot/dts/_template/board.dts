@@ -24,7 +24,7 @@
 	// gpu-a660        an Adreno of the A660 family (642, 642L, 643, 660 ...) behind a GMU (gpu=1); needs gpu { }
 	// and these, each a driver of one part wired the way one phone has it -- list one only if your phone
 	// has that part on the same pins and bus (drivers/board/board.h, Documentation/drivers.md):
-	// touch-goodix, touch-ft3658u, touch-ft5x06, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,
+	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-gt9889, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,
 	// camera-sm7325, wifi-wcn6750, mic-wcd938x, modem-sm7325, bluetooth-wcn-uart
 	// Documentation/features.md has what each needs written down first; tools/boards.py status NAME says it for
 	// this board.
@@ -126,6 +126,13 @@
 		// analog-millivolts = <3008>;  // ... the regulator's voltage in the device tree, 2600 to 3600
 		// analog-enable = <78>;        // optional: a GPIO that switches its analog supply on, high
 	// };
+	// The same section is the feature "touch-gt9889"'s: a Goodix GT9889 ("goodix,gt9889" node, the vendor's
+	// goodix_driver_gt9886), a board lists one of the two. Its keys are the node's: address = reg (0x5d);
+	// interrupt = goodix,irq-gpio and reset = goodix,reset-gpio; analog-enable = goodix,avdd-gpio; contacts =
+	// goodix,panel-max-id; coordinates = goodix,panel-max-x and -y (the largest values, not the sizes: 1079 2339 for
+	// a 1080 x 2340 panel), up to 65535; analog-supply = the node's vtouch-supply regulator by its RPMh name with
+	// analog-millivolts what the vendor driver asks of it (3000); no io-supply. The driver has no firmware or
+	// configuration to send and does not know the chip's identity registers (they are in the vendor's firmware package).
 
 	// The microphones' codec, for the feature "mic-wcd938x": a WCD938x on the SoC's SoundWire.
 	// mic {

@@ -17,7 +17,7 @@ static char started[1024];
 STARTS(hakios_bt_uart_init)
 STARTS(hakios_scmi_perf_init)
 STARTS(hakios_input_init) STARTS(hakios_cpufreq_init) STARTS(hakios_virtio_input_init) STARTS(hakios_fts_init)
-STARTS(hakios_ft5x06_init)
+STARTS(hakios_ft5x06_init) STARTS(hakios_gt9889_init)
 STARTS(hakios_goodix_init) STARTS(hakios_prof_start) STARTS(hakios_buttons_init) STARTS(hakios_rtc_init) STARTS(hakios_battery_init)
 STARTS(hakios_ufs_init) STARTS(hakios_net_init) STARTS(hakios_adreno_init) STARTS(hakios_backlight_init)
 STARTS(hakios_thermal_init) STARTS(hakios_wifi_init) STARTS(hakios_adsp_init) STARTS(hakios_mpss_init) STARTS(hakios_audio_init)
@@ -76,6 +76,7 @@ all_once(const char *touch)
 	CHECK(times("hakios_fts_init ") == (strcmp(touch, "hakios_fts_init ") == 0), "the FT3658U's driver: %s", started);
 	CHECK(times("hakios_goodix_init ") == (strcmp(touch, "hakios_goodix_init ") == 0), "the Goodix driver: %s", started);
 	CHECK(times("hakios_ft5x06_init ") == (strcmp(touch, "hakios_ft5x06_init ") == 0), "the FT5x06 family's driver: %s", started);
+	CHECK(times("hakios_gt9889_init ") == (strcmp(touch, "hakios_gt9889_init ") == 0), "the GT9889's driver: %s", started);
 	/* what the order is for */
 	before("hakios_input_init ", "hakios_virtio_input_init ");    /* the queue before whoever feeds it */
 	before("hakios_input_init ", "hakios_buttons_init ");
@@ -114,6 +115,16 @@ board_with_ft5x06(void)
 	boot_args = "touchscreen=-1";
 	hakios_drivers_init();
 	all_once("hakios_ft5x06_init ");
+	CHECK(!logged("touch:"), "nothing is said of a board that has its driver: %s", log_text);
+}
+
+static void
+board_with_gt9889(void)
+{
+	board = "phone-gt9889";
+	boot_args = "touchscreen=-1";
+	hakios_drivers_init();
+	all_once("hakios_gt9889_init ");
 	CHECK(!logged("touch:"), "nothing is said of a board that has its driver: %s", log_text);
 }
 
@@ -183,7 +194,7 @@ main(int argc, char **argv)
 {
 	static const struct { const char *name; void (*run)(void); } scenarios[] = {
 		{ "board_with_ft3658u", board_with_ft3658u }, { "board_with_goodix", board_with_goodix },
-		{ "board_with_ft5x06", board_with_ft5x06 },
+		{ "board_with_ft5x06", board_with_ft5x06 }, { "board_with_gt9889", board_with_gt9889 },
 		{ "board_without_touch", board_without_touch }, { "board_without_touch_looked_at", board_without_touch_looked_at }, { "board_without_touch_not_asked", board_without_touch_not_asked },
 		{ "board_without_touch_turned_off", board_without_touch_turned_off },
 		{ "unknown_board", unknown_board },

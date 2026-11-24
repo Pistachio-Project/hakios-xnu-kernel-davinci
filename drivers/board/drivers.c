@@ -51,6 +51,12 @@ touch_controller_init(void)
 		} else {
 			hakios_say("touch: this board's FocalTech FT5x06-family touch screen has no driver in this kernel (CONFIG_TOUCH_FT5X06)\n");
 		}
+	} else if (hakios_board_has(HAKIOS_HAS_TOUCH_GT9889)) {
+		if (CONFIG_TOUCH_GT9889) {
+			hakios_gt9889_init();
+		} else {
+			hakios_say("touch: this board's Goodix GT9889 touch screen has no driver in this kernel (CONFIG_TOUCH_GT9889)\n");
+		}
 	} else if (hakios_board_has(HAKIOS_HAS_TOUCH_GOODIX)) {
 		if (CONFIG_TOUCH_GOODIX) {
 			hakios_goodix_init();

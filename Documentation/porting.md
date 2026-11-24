@@ -202,6 +202,12 @@ feature named after the part and the wiring it expects (`touch-goodix`, `haptic-
   it and reads its touches, and `ft5x06_steps=N` stops the bring-up after its Nth step. The driver uploads no
   firmware: a chip with its own flash runs after a reset, one without (the display-and-touch chips, FT8719 and
   the like) does not. It has been run against a model only, not on a phone.
+- If it is **a Goodix GT9889** (a `goodix,gt9889` node under an `i2c@` bus, Xiaomi's `goodix_driver_gt9886`; the Mi 9T
+  has it): list `touch-gt9889` and fill in the same `touch-i2c { }` (the template says which property of the node
+  each key is). `touchscreen=-1` reads the chip's report block and changes nothing; `touchscreen=1` powers, resets
+  and reads it (`gt9889_steps=N` stops after the Nth step). No firmware or configuration is sent, and its identity
+  registers are not known (the vendor driver reads them from a package this tree does not have). Model only, not
+  on a phone.
 - If it has **the same part on other pins or another bus** and the driver has them in its code, the driver needs those made data. Move
   the constants into the board file and `board/board.h`, as the buttons' driver has its peripherals
   in `buttons { }`, the flashlight's in `torch { }`, the vibration motor's pins in `haptic { }` and the

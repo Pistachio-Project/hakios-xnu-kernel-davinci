@@ -38,6 +38,13 @@ tags yet, so the current work is one section.
   from the family's register layout as remembered and run against a model of the chip
   (`workbench/touch_ft5x06_test.c`). A report costs a core 0.4 ms idle and about 1.6 ms with one finger, the bus
   being driven by hand. ([drivers.md](Documentation/drivers.md), [porting.md](Documentation/porting.md))
+- **A touch screen driver for the Goodix GT9889 on I2C** (the Xiaomi Mi 9T's). A board lists `touch-gt9889` and
+  fills in the same `touch-i2c { }` as for the FT5x06; `touchscreen=-1` reads the chip's report block and changes
+  nothing, `touchscreen=1` powers (the pin, then the RPMh regulator), resets (INT high, which picks the address) and
+  reads its touches (`gt9889_steps=N`). Taken from Xiaomi's `goodix_driver_gt9886`; **no firmware or configuration
+  is sent**, and the chip's identity registers are not known (the vendor reads them from a firmware package).
+  **Not run on a phone**: model only (`workbench/touch_gt9889_test.c`). davinci's `touch-i2c { }` is written but the
+  feature is not listed yet. ([drivers.md](Documentation/drivers.md))
 - **The PMIC drivers through a version 7 arbiter** (two SPMI buses behind one arbiter: SM8450, SM8550, SM8650 and
   their relatives), beside versions 5, 6 and 8. `board/spmi.h` tells it by the arbiter's version register; the SoC file
   has the same `spmi { }` blocks plus `bus` (the node's `qcom,bus-id`, 0 if left out; `tools/boards.py new --dts`
