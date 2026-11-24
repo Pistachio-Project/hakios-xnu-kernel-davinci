@@ -42,8 +42,19 @@ CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protec
 LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
 $CC -I"$RN/../lib/libmini" -c "$RN/../lib/libmini/mini.c" -o "$OBJ/mini.o"
 $CC -c "$RN/../lib/libmini/start.S" -o "$OBJ/start.o"
+# Without cctools' ld64 (DARWIN_LD, env.sh) xnu-clang links with LLVM's ld64.lld, which does not implement -static: its
+# output still asks for dyld (LC_LOAD_DYLINKER), and stage0 as process 1 then died in dyld before it could mount anything
+# (dyld found no shared cache: the cryptex is not there yet). place-kernel.py --program makes such a link a program the
+# kernel starts without dyld, as tools/qemu-root.sh does for its init.
+if [ ! -x "$DARWIN_LD" ]; then
+	LD="$LD -Wl,-no_fixup_chains"
+fi
 for prog in init stage0 child var_store; do
 	$CC -I"$RN/../lib/libmini" $LD -o "$OBJ/$prog" "$RN/../init/$prog.c" "$OBJ/mini.o" "$OBJ/start.o"
+	if [ ! -x "$DARWIN_LD" ]; then
+		python3 "$RN/../kernel/host/llvm/place-kernel.py" --program "$OBJ/$prog" "$OBJ/$prog.static" > /dev/null
+		mv "$OBJ/$prog.static" "$OBJ/$prog" && chmod 755 "$OBJ/$prog"
+	fi
 done
 # what the default job list asks the network (net_test waitaddr), as the libraries are: arm64e, pacstrip
 $DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -framework Network -o "$OBJ/net_test" "$US/src/net_test.m"
