@@ -84,6 +84,7 @@
  *               (a6xx_gmu.c, a6xx_hfi.c, a6xx_gpu.c hw_init); the structure, the SMMU and
  *               TrustZone code and the ring are HackiOS's (redwood_adreno.c steps 11-21)
  */
+#include <kern/startup.h>
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <kern/clock.h>
@@ -2487,7 +2488,12 @@ step_core_space(void)
  * kept. A kernel before this one may have left a shader loaded: TrustZone is first asked to give
  * it up, as the vendor's driver does when it is unloaded.
  */
-#define ZAP_MEMORY              0x98f95000ull
+/*
+ * (boot-arg adreno_zap_memory=PA for a phone whose device tree reserves it elsewhere: the Mi 9T's gpu_region is at
+ * 0x97f15000, the same size. The default is the Pixel 4a's.)
+ */
+static TUNABLE(uint64_t, adreno_zap_memory, "adreno_zap_memory", 0x98f95000ull);
+#define ZAP_MEMORY              adreno_zap_memory
 #define ZAP_MEMORY_SIZE         0x2000u
 #define ELF_PT_LOAD             1
 static uint32_t zap_wanted = 1;         /* boot-arg adreno_zap=0: none (ios-surya's command processor ran without one) */
