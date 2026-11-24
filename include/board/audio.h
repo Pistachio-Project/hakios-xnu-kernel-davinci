@@ -55,6 +55,7 @@ void hakios_audio_init(void);
 void hakios_virtio_sound_init(void);   /* boot-arg virtio_sound=1: QEMU's virtio sound device */
 void hakios_speaker_init(void);        /* boot-arg speaker_probe=N: a look at the phone's speaker amplifiers */
 void hakios_haptic_init(void);         /* boot-arg haptic=N: the phone's vibration motor (bsd/dev/board/haptic.c) */
+void hakios_haptic_ldo_init(void);     /* boot-arg haptic_ldo=N: a vibration motor on a PMIC's LDO (bsd/dev/board/haptic_ldo.c) */
 void hakios_haptic_quiesce(void);      /* its chip back into reset: at the run's end and on a panic's way out */
 void hakios_haptic_pretend(uint32_t peak); /* a test's stand-in for Darwin's waveform: as if a write of this loudness came */
 void hakios_torch_init(void);          /* boot-arg torch=N: the phone's flashlight (bsd/dev/board/torch.c) */
