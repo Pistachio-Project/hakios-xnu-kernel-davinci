@@ -368,11 +368,38 @@ static TUNABLE(uint32_t, bl_log, "bl_log", 0);
 static uint32_t bl_logged;
 static uint32_t found_dma_control;
 
+static bool dcs_send_words(const uint32_t *words, unsigned n, uint32_t length, uint32_t raw);
+
 static bool
 dcs_send(uint32_t raw)
 {
-	uint32_t words[4], length = 0, control, dma_control;
+	uint32_t words[4], length = 0;
 	unsigned n = bl_dcs_brightness_words(raw, profile.bytes, profile.little_endian, 0, words, &length);
+
+	return dcs_send_words(words, n, length, raw);
+}
+
+/*
+ * A DCS short write with one parameter (data type 0x15) through the same command path as the brightness: for
+ * panel_autorefresh=2 (cmdpanel.c), set_tear_on (0x35 0x00), which this phone's UEFI does not send and without which the panel gives no
+ * tear-effect pulses. False if the backend is not DCS or the controller is not reachable.
+ */
+static bool
+hakios_backlight_dcs_short(uint8_t command, uint8_t parameter)
+{
+	uint32_t words[2] = { (uint32_t)command | (uint32_t)parameter << 8 | (uint32_t)DSI_DT_DCS_SHORT_WRITE_1 << 16 |
+		                  (uint32_t)DSI_CMD_LAST << 24, 0 };
+
+	if (profile.backend != BL_DCS || dsi == 0 || broken) {
+		return false;
+	}
+	return dcs_send_words(words, 2, 4, 0x10000u | command);
+}
+
+static bool
+dcs_send_words(const uint32_t *words, unsigned n, uint32_t length, uint32_t raw)
+{
+	uint32_t control, dma_control;
 	bool sent, error;
 	uint64_t began = now_us();
 
@@ -751,6 +778,19 @@ hakios_backlight_init(void)
 		say("backlight: dcs: the panel's brightness is ours: %u to %u, %u byte%s%s, %s mode\n", profile.raw_min,
 		    profile.raw_max, profile.bytes, profile.bytes == 1 ? "" : "s", profile.bytes == 2 ?
 		    (profile.little_endian ? " LSB first" : " MSB first") : "", profile.video_mode ? "video" : "command");
+		{
+			/*
+			 * panel_autorefresh=2 (cmdpanel.c, which runs too early for this path): the panel's tear-effect
+			 * pulses on, set_tear_on (DCS 0x35, mode 0), which this phone's UEFI never sends.
+			 */
+			int autorefresh = 0;
+
+			if (PE_parse_boot_argn("panel_autorefresh", &autorefresh, sizeof(autorefresh)) && autorefresh == 2 &&
+			    !profile.video_mode) {
+				say("backlight: dcs: set_tear_on (0x35 0x00) to the panel, for panel_autorefresh=2: %s\n",
+				    hakios_backlight_dcs_short(0x35, 0x00) ? "sent" : "NOT SENT");
+			}
+		}
 	}
 	if (profile.backend == BL_NONE) {
 		return;
