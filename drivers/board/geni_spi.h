@@ -12,30 +12,7 @@
 #ifndef HAKIOS_GENI_SPI_H
 #define HAKIOS_GENI_SPI_H
 
-/*
- * The rate a root clock generator (RCG) of the engine's clock gives, from its configuration -- its source
- * ([10:8]: the crystal, GPLL0, GPLL0 halved), its half-integer divider ([4:0]) and its M/N mode ([13:12])
- * -- and its M and NOT(N - M) registers
- */
-static uint32_t
-rcg_rate(uint32_t cfg, uint32_t m, uint32_t not_n_minus_m)
-{
-	static const uint32_t parent[8] = { XO_HZ, 600000000, 0, 0, 0, 0, 300000000, 0 };
-	uint64_t hz = parent[cfg >> 8 & 7];
-	uint32_t divider = cfg & 0x1f, mode = cfg >> 12 & 3;
-
-	if (divider) {
-		hz = hz * 2 / (divider + 1);
-	}
-	if (mode) {
-		uint32_t n = (~not_n_minus_m & 0xffff) + (m & 0xffff);
-
-		if (n) {
-			hz = hz * (m & 0xffff) / n;
-		}
-	}
-	return (uint32_t)hz;
-}
+#include "geni_clk.h"          /* rcg_rate() */
 
 #define GENI_FORCE_DEFAULT      (se + 0x020)
 #define GENI_OUTPUT_CTRL        (se + 0x024)

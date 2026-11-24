@@ -9,6 +9,7 @@
 #include "fakekernel.h"
 
 extern char log_text[];
+extern void loader_log_putc(char c);    /* (the fake kernel's: the driver's lines go to its log) */
 
 /* ---- the engine ------------------------------------------------------------------------------------- */
 
