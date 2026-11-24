@@ -12,7 +12,8 @@ RN=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=env.sh
 source "$RN/userland/env.sh"
 M=$IOS_REPO/components/metal/plugin
-export IOS_ARCH=arm64e
+# arm64e with ld64 (DARWIN_LD); with ld64.lld (DARWIN_LLD=1) arm64, its header named arm64e by pac_strip (env.sh)
+if [ "${DARWIN_LLD:-0}" = 1 ]; then export IOS_ARCH=arm64; else export IOS_ARCH=arm64e; fi
 # (every time: it copies the front end in again and ninja rebuilds what changed, so an edit of components/metal/plugin/tools/mesa/air
 # is in this plug-in)
 mkdir -p "$OBJ"
