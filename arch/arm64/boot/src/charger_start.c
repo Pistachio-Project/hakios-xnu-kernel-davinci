@@ -9,16 +9,19 @@ charger_start(void)
 	if (charger_enabled || !PLAT->uefi_charger) {
 		return;
 	}
+	charger_no_this = PLAT->uefi_charger_no_this;
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
 	qcom_status = BS->locate_protocol(&qcom_charger_guid, NULL, (void **)&QCOM_CHARGER);
 	if (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL) {
 		/* Re-open the driver's status path after QcomChargerApp handed off to the OS. */
-		init_status = QCOM_CHARGER->initialize(QCOM_CHARGER, 1);
+		init_status = charger_no_this ? ((efi_qcom_charger_init_nothis)(void *)QCOM_CHARGER->initialize)(1) :
+		    QCOM_CHARGER->initialize(QCOM_CHARGER, 1);
 	}
 	charger_enabled = (!EFI_ERROR(ex_status) && CHARGER_EX != NULL) ||
 	    (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL);
-	print("battery: ChargerEx=%x QcomCharger=%x init=%x shared=%x\n", ex_status, qcom_status, init_status,
-	    (uint64_t)(uintptr_t)&charger_shared);
+	print("battery: ChargerEx=%x QcomCharger=%x init=%x shared=%x rev=%x nothis=%d\n", ex_status, qcom_status,
+	    init_status, (uint64_t)(uintptr_t)&charger_shared, QCOM_CHARGER != NULL ? QCOM_CHARGER->revision : 0,
+	    (uint64_t)charger_no_this);
 	charger_poll();
 	print("battery: flags=%x SOC=%d%% V=%d mV I=%d mA T=%d C action=%d\n", (uint64_t)charger_shared.flags,
 	    (uint64_t)(int64_t)charger_shared.soc_percent, (uint64_t)(int64_t)charger_shared.voltage_mv,

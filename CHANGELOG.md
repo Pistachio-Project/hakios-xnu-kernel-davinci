@@ -8,6 +8,10 @@ tags yet, so the current work is one section.
 
 ### For whoever brings up a phone
 
+- **The loader reads the battery on firmware whose charger protocols take no This.** The Mi 9T's UEFI (BOOT.XF.3.1,
+  QcomCharger revision 0x10008) answers every call with success and zeros when it is called with a This. `uefi-charger-no-this`
+  in `loader { }` (with `uefi-charger`) makes the loader call the protocols the way those drivers declare them; without it
+  they are called as before, and the log shows the revision found.
 - **The way from nothing to a package, walked with a made-up phone, and what it tripped on put right.** One page has
   the whole layout of a phone's repository: every file and directory, who writes it and whether it is committed
   ([porting.md](Documentation/porting.md), "Or keep it in a repository of your own"). Bringing a package in from the

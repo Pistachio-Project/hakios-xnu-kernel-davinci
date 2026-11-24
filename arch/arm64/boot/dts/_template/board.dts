@@ -312,6 +312,8 @@
 		// log-other-cpu;               // keep notes in the log partition while a kernel starts on another core
 		// uefi-charger;                // the firmware has Qualcomm's charger protocols: the loader reads the battery
 		//                              // through them and hands it to the kernel (feature "battery-uefi")
+		// uefi-charger-no-this;        // with uefi-charger: that firmware's charger protocols take no This argument (the
+		//                              // out pointer is the first one; the loader's log shows the revision it found)
 	// };
 
 	// Its UEFI, as arch/arm64/boot/mkboot.py packs it for `fastboot boot`; the build itself is in firmware/NAME/uefi/.

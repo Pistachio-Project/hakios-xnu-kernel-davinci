@@ -611,6 +611,12 @@ class Check(Sandbox):
         # (the loader reads the battery for the kernel only when the board says its firmware has the charger's protocols:
         # arch/arm64/boot/src/charger_start.c. Said, not refused: another loader may give it)
         self.assertRegex(said, r'battery-uefi +needs uefi-charger in loader \{ \} of the board file')
+        # (uefi-charger-no-this is the way to call that firmware's drivers: it makes no sense without uefi-charger)
+        self.board('fb-base = <0xe1000000>;', 'fb-base = <0xe1000000>;\n\t\tuefi-charger-no-this;')
+        self.assertRegex(self.problems(), r'uefi-charger-no-this is for a firmware with charger protocols')
+        self.board('uefi-charger-no-this;', 'uefi-charger;\n\t\tuefi-charger-no-this;')
+        self.assertEqual(self.problems(), '')
+        self.board('fb-base = <0xe1000000>;\n\t\tuefi-charger;\n\t\tuefi-charger-no-this;', 'fb-base = <0xe1000000>;')
         self.board('fb-base = <0xe1000000>;', 'fb-base = <0xe1000000>;\n\t\tuefi-charger;')
         self.assertRegex(status(), r'battery-uefi +can be listed: what it needs is there \(then battery=1\)')
         self.board('"cpufreq-epss"', '"cpufreq-epss", "battery-uefi"')

@@ -179,7 +179,8 @@ BOARD_SCHEMA = {
              'dsp_memory_size': (int, False), 'pins': ([int], False), 'supplies': ([str], False)},
     'storage': {'type_guid': (str, True), 'unique_guid': (str, True), 'first_lba': (U64, True), 'last_lba': (U64, True),
                 'write_first': (U64, True)},
-    'loader': {'fb_base': (U64, False), 'log_other_cpu': (bool, False), 'uefi_charger': (bool, False)},
+    'loader': {'fb_base': (U64, False), 'log_other_cpu': (bool, False), 'uefi_charger': (bool, False),
+               'uefi_charger_no_this': (bool, False)},
     'uefi': {'fd_base': (U64, True), 'fd_size': (int, True), 'header_version': (int, False)},
     'boot': {'fastboot_product': (str, True), 'cpus': (int, True), 'bootargs': ([str], True)},
 }
@@ -912,6 +913,8 @@ def load(problems=None):
         for argument in sorted({name for name in named if named.count(name) > 1}):
             problems.add(f'{rel} [boot]', f'bootargs: "{argument}" is there twice')
         if 'loader' in data:
+            if data['loader'].get('uefi_charger_no_this') and not data['loader'].get('uefi_charger'):
+                problems.add(rel, '[loader] uefi_charger_no_this is for a firmware with charger protocols: it needs uefi_charger')
             if 'platform' not in soc:
                 problems.add(rel, '[loader] needs [platform] in soc.dtsi')
             elif 'io_base' not in soc['platform'] or 'io_size' not in soc['platform']:
@@ -1325,6 +1328,8 @@ def platforms_text(socs, boards):
                    f'.timeout_scale = {platform.get("timeout_scale", 0)}',
                    f'.small_cores = {platform.get("small_cores", 0):#x}',
                    f'.fb_base = {loader.get("fb_base", 0):#010x}']
+        if loader.get('uefi_charger_no_this'):
+            fields.append('.uefi_charger_no_this = 1')
         if 'timer_intid' in platform:
             fields.append(f'.timer_intid = {platform["timer_intid"]}')
         own = board.get('storage')
