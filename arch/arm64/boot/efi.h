@@ -167,6 +167,17 @@ typedef struct efi_qcom_charger {
 	efi_status (EFIAPI *take_action)(struct efi_qcom_charger *self, uint32_t action, const void *battery_status);
 } efi_qcom_charger;
 
+/*
+ * Older Qualcomm firmware (BOOT.XF.3.1, SM6150: QcomCharger revision 0x10008, ChargerEx 0x10003) installs both
+ * charger protocols without a This argument, as Qualcomm's open EFIChargerEx.h declares them: the out pointer is the
+ * first argument.  Called with a This the driver writes through it, into the protocol itself, and reports success
+ * with the answer left at zero.  The loader picks the shape by the QcomCharger revision (charger_start.c).
+ */
+#define QCOM_CHARGER_NO_THIS_REVISION 0x10008ull
+typedef efi_status (EFIAPI *efi_charger_ex_query_nothis)(void *out);
+typedef efi_status (EFIAPI *efi_qcom_charger_init_nothis)(uint8_t enable);
+typedef efi_status (EFIAPI *efi_qcom_charger_action_nothis)(uint32_t *action, void *battery_status, uint8_t display);
+
 /* Block I/O + Partition Info (used to persist the log on the phone) */
 typedef struct {
 	uint32_t media_id; uint8_t removable, present, logical, read_only, write_caching; uint8_t pad[3];

@@ -35,13 +35,19 @@ charger_poll(void)
 	charger_shared.sequence++;
 	__asm__ volatile ("dmb ish" ::: "memory");
 	if (CHARGER_EX != NULL) {
-		presence_status = CHARGER_EX->get_battery_presence(CHARGER_EX, &present);
+		presence_status = charger_no_this ?
+		    ((efi_charger_ex_query_nothis)(void *)CHARGER_EX->get_battery_presence)(&present) :
+		    CHARGER_EX->get_battery_presence(CHARGER_EX, &present);
 		s = presence_status;
 		if (!EFI_ERROR(s) && present) flags |= LOADER_BATTERY_PRESENT;
-		charger_status = CHARGER_EX->get_charger_presence(CHARGER_EX, &plugged);
+		charger_status = charger_no_this ?
+		    ((efi_charger_ex_query_nothis)(void *)CHARGER_EX->get_charger_presence)(&plugged) :
+		    CHARGER_EX->get_charger_presence(CHARGER_EX, &plugged);
 		s = charger_status;
 		if (!EFI_ERROR(s) && plugged) flags |= LOADER_BATTERY_CHARGER_PRESENT;
-		voltage_status = CHARGER_EX->get_battery_voltage(CHARGER_EX, &voltage);
+		voltage_status = charger_no_this ?
+		    ((efi_charger_ex_query_nothis)(void *)CHARGER_EX->get_battery_voltage)(&voltage) :
+		    CHARGER_EX->get_battery_voltage(CHARGER_EX, &voltage);
 		s = voltage_status;
 		if (!EFI_ERROR(s) && voltage >= 2500 && voltage <= 5000) {
 			have_voltage = 1;
@@ -50,7 +56,9 @@ charger_poll(void)
 		}
 	}
 	if (QCOM_CHARGER != NULL) {
-		gauge_status = QCOM_CHARGER->get_charging_action(QCOM_CHARGER, &action, &status, 0);
+		gauge_status = charger_no_this ?
+		    ((efi_qcom_charger_action_nothis)(void *)QCOM_CHARGER->get_charging_action)(&action, &status, 0) :
+		    QCOM_CHARGER->get_charging_action(QCOM_CHARGER, &action, &status, 0);
 		s = gauge_status;
 		if (!EFI_ERROR(s)) {
 			charger_shared.charger_action = action;
