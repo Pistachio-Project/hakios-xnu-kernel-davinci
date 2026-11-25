@@ -1345,11 +1345,11 @@ constexpr uint32_t kCacheMagic = 0x53434d48;   // "HMCS"
 // the window server paid its hundreds of compiles again. BUMP kCompilerVersion whenever the code a stage compiles to can
 // change: the AIR front end or ir3 options in this file, the stage/kernel layouts the cache file holds (their sizes are in
 // the key already), the encoding of a resource, the key's own inputs. Without the Mesa hash define: a build is its own.
-constexpr const char* kCompilerVersion = "v2";
+#define HM_COMPILER_VERSION "v2"
 #ifdef HAKIOS_METAL_CACHE_BUILD
-const char* const kCacheBuild = kCompilerVersion " " HAKIOS_METAL_CACHE_BUILD;
+const char* const kCacheBuild = HM_COMPILER_VERSION " " HAKIOS_METAL_CACHE_BUILD;
 #else
-const char* const kCacheBuild = kCompilerVersion " " __DATE__ " " __TIME__;
+const char* const kCacheBuild = HM_COMPILER_VERSION " " __DATE__ " " __TIME__;
 #endif
 
 // What a cache miss looked like, for the plug-in's log (cacheNotes): said by the caller on its own thread, since the
