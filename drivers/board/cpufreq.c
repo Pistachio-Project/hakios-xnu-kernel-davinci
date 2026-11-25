@@ -39,6 +39,8 @@ extern void hakios_tl(const char *format, ...) __printflike(1, 2);   /* the kern
 /* (the loader's log as well: this runs early, and the kernel's own log of a run keeps only its end) */
 #define tell hakios_say
 
+extern void hakios_pm_idle_init(void);
+
 /*
  * Where the block is, which layout it has and which cores each of its groups ("domains") has is the board's
  * data (board/board.h; soc.dtsi, cpufreq { }): on the two phones this was written for, three EPSS groups of
@@ -737,6 +739,7 @@ hakios_cpufreq_init(void)
 	uint32_t enabled = 0, cores[CPUFREQ_GROUPS] = { 0 }, before, here;
 
 	hakios_cpuload_start();
+	hakios_pm_idle_init();          /* (boot-arg pm_idle=: the cores' idle states; arch/arm64/kernel/cpu_idle.c) */
 	PE_parse_boot_argn("cpufreq", &enabled, sizeof(enabled));
 	if (CONFIG_QCOM_DDR_VOTE) {
 		hakios_ddr_init(enabled != 0);  /* (the memory first, as before: bsd/dev/board/ddr.c) */

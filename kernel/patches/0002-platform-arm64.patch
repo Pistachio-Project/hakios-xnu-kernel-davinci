@@ -250,6 +250,21 @@ diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
  	pmap_clear_user_ttb();
  	flush_mmu_tlb();
  #endif
+@@ -876,7 +974,14 @@ arm_init_idle_cpu(
+ 		arm_debug_set(NULL);
+ 	}
+ 
+ 	fiq_context_init(FALSE);
++#if defined(GENERIC_PSCI_SMP)
++	{
++		extern void hakios_idle_resume(void);
++
++		hakios_idle_resume();   /* hakios: after a power-down of the core (pm_idle): the interrupt controller, the timer's deadline */
++	}
++#endif
+ 
+ 	cpu_idle_exit(TRUE);
+ }
 diff --git a/osfmk/arm/commpage/commpage.c b/osfmk/arm/commpage/commpage.c
 --- a/osfmk/arm/commpage/commpage.c
 +++ b/osfmk/arm/commpage/commpage.c
@@ -469,6 +484,22 @@ diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
  		platform_cache_idle_enter();
  #endif
  
+@@ -611,7 +616,15 @@ cpu_idle(void)
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
+ #else
++#if defined(GENERIC_PSCI_SMP)
++		{
++			extern void hakios_idle_enter(cpu_data_t *);
++
++			hakios_idle_enter(cpu_data_ptr);        /* hakios: WFI, or a deeper state of the firmware's (pm_idle=) */
++		}
++#else
+ 		__builtin_arm_wfi();
++#endif
+ #endif
+ 
+ #if defined(APPLETYPHOON)
 diff --git a/osfmk/arm64/kpc.c b/osfmk/arm64/kpc.c
 --- a/osfmk/arm64/kpc.c
 +++ b/osfmk/arm64/kpc.c
