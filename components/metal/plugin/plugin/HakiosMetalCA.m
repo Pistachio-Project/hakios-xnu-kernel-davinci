@@ -3881,6 +3881,8 @@ hm_pipeline_note(double ms)
 				hm_print("ir3: %s: vertex %u words, %d full and %d half registers, %u bytes of private memory; fragment %u words, %d full and %d half "
 					 "registers, %u bytes of private memory (spills), branch stack %u\n", hakios_metal_program_name(program),
 					 hakios_metal_program_stage_words(program, 0), vf, vh, vp, fw, ff, fh, fp, fb);
+				hm_print("ir3 mix: %s: vertex %s | fragment %s\n", hakios_metal_program_name(program),
+					 hakios_metal_program_stage_mix(program, 0), hakios_metal_program_stage_mix(program, 1));
 			}
 		}
 		hm_print("linked %s (%p) for pixel format %u: the vertex stage binds %u resources, the fragment stage %u; fragment constants not 0:%s\n",

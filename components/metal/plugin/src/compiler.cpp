@@ -33,6 +33,13 @@
 #include "hakios-metal/a6xx.hpp"
 #endif
 
+#if defined(__GLIBC__)
+#include <errno.h>
+static inline const char* hmProgname() { return program_invocation_short_name; }   // (the host build: glibc has no getprogname)
+#else
+static inline const char* hmProgname() { return getprogname(); }
+#endif
+
 namespace hakios::metal {
 
 namespace {
@@ -272,6 +279,7 @@ struct Translation {
     air_shader_info info{};
     ir3_shader* shader = nullptr;         // the hand-built shader; its variant hangs off it
     ir3_shader_variant* v = nullptr;
+    std::string mix;                      // the final ir3 instruction mix of the stage (irMix), kept in the stage's listing when no disassembly is made
     std::string irNote;                   // what ir3's code is made of (half and full writes), told with the cache notes
     uint32_t* bin = nullptr;              // the assembled binary (ralloc'd under the variant)
     uint8_t fbTargets[kMaxTextureSlots] = {};   // lowerFbRead's slots: n + 1 where colour attachment n is read
@@ -858,6 +866,54 @@ bool usesSubgroup(nir_shader* nir) {
     return false;
 }
 
+// What the final ir3 code is made of, on one line: instructions (a repeat group counts once, its repeats apart), memory
+// loads by kind (ldg global, ldib image/buffer, ldc UBO, ldl local), sampler instructions, the width conversions (mov with
+// different source and destination types), nops (instructions and the nop slots of the others), sync flags, ALU reads from
+// the constant file, SFU. For the hot programs' account of where the cycles go, and to see a constant-data lowering fail.
+std::string irMix(struct ir3* ir) {
+    unsigned n = 0, rpt = 0, ldg = 0, ldib = 0, ldc = 0, ldl = 0, ldlv = 0, st = 0, tex = 0, isam = 0, cov = 0, nops = 0, nopSlots = 0, sy = 0, ss = 0, cst = 0, sfu = 0, alu = 0, imm = 0;
+    foreach_block (block, &ir->block_list) {
+        foreach_instr (instr, &block->instr_list) {
+            if (is_meta(instr)) continue;
+            n++;
+            rpt += instr->repeat;
+            nopSlots += instr->nop;
+            if (instr->flags & IR3_INSTR_SY) sy++;
+            if (instr->flags & IR3_INSTR_SS) ss++;
+            if (instr->opc == OPC_NOP) { nops++; continue; }
+            if (is_tex(instr)) {
+                tex++;
+                if (instr->opc == OPC_ISAM) isam++;
+            } else if (is_mem(instr)) {
+                switch (instr->opc) {
+                case OPC_LDG: case OPC_LDG_K: ldg++; break;
+                case OPC_LDIB: case OPC_LDIB_B: ldib++; break;
+                case OPC_LDC: ldc++; break;
+                case OPC_LDL: ldl++; break;
+                case OPC_LDLV: ldlv++; break;
+                case OPC_STG: case OPC_STIB: case OPC_STL: case OPC_STP: st++; break;
+                default: break;
+                }
+            } else if (is_sfu(instr)) {
+                sfu++;
+            } else if (is_alu(instr)) {
+                alu++;
+                if (instr->opc == OPC_MOV && instr->cat1.src_type != instr->cat1.dst_type && instr->srcs_count > 0 &&
+                    !(instr->srcs[0]->flags & (IR3_REG_IMMED | IR3_REG_CONST)))
+                    cov++;
+            }
+            for (unsigned i = 0; i < instr->srcs_count; i++) {
+                if (instr->srcs[i]->flags & IR3_REG_CONST) cst++;
+                if (instr->srcs[i]->flags & IR3_REG_IMMED) imm++;
+            }
+        }
+    }
+    char buf[400];
+    snprintf(buf, sizeof(buf), "mix: %u instrs (+%u repeats, %u nop instrs, %u nop slots), alu %u, sfu %u, cov %u, tex %u (isam %u), ldg %u ldib %u ldc %u ldl %u ldlv %u, stores %u, (sy) %u (ss) %u, const srcs %u imm srcs %u",
+             n, rpt, nops, nopSlots, alu, sfu, cov, tex, isam, ldg, ldib, ldc, ldl, ldlv, st, sy, ss, cst, imm);
+    return buf;
+}
+
 bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     ir3_compiler* compiler = theCompiler();
     nir_shader* nir = t.nir;
@@ -946,6 +1002,7 @@ bool compileVariant(Translation& t, PassOrder order, std::string* why) {
         }
         t.irNote = std::string("ir3 ") + t.name() + ": " + std::to_string(full) + " instructions writing full registers, " + std::to_string(half) + " writing half (merged register file: the footprint is one count)";
     }
+    if (v->ir != nullptr) t.mix = irMix(v->ir);
     {
         std::string name = t.name();
         if (!fixPrefetchSamplers(nir, v, &name, why)) return false;
@@ -1044,6 +1101,8 @@ bool fillKernel(Translation& t, const KernelHome& out, uint32_t highestSampler, 
             out.listing.assign(text, length);
             free(text);
         }
+    } else {
+        out.listing = t.mix;   // (no disassembly: the instruction mix, one line, for the plug-in's hot-program account)
     }
     k.words = out.words.data();
     k.numWords = uint32_t(out.words.size());
@@ -1366,7 +1425,7 @@ constexpr uint32_t kCacheMagic = 0x53434d48;   // "HMCS"
 // the window server paid its hundreds of compiles again. BUMP kCompilerVersion whenever the code a stage compiles to can
 // change: the AIR front end or ir3 options in this file, the stage/kernel layouts the cache file holds (their sizes are in
 // the key already), the encoding of a resource, the key's own inputs. Without the Mesa hash define: a build is its own.
-#define HM_COMPILER_VERSION "v2"
+#define HM_COMPILER_VERSION "v3"
 #ifdef HAKIOS_METAL_CACHE_BUILD
 const char* const kCacheBuild = HM_COMPILER_VERSION " " HAKIOS_METAL_CACHE_BUILD;
 #else
@@ -1600,7 +1659,7 @@ void prefetchStart() {
     }
     if (dir == nullptr || dir[0] == 0) return;
 #if defined(__APPLE__)
-    const char* prog = getprogname();
+    const char* prog = hmProgname();
 #else
     const char* prog = "host";
 #endif
@@ -1906,6 +1965,7 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
     phase("walks before lowering");
     if (!compileVariant(t, PassOrder::kGraphics, why)) return nullptr;
     if (!t.irNote.empty()) cacheNote(t.irNote);
+    if (!t.mix.empty()) cacheNote("ir3 " + name + " " + t.mix);
     phase("compileVariant (NIR, ir3)");
     KernelHome home{out->stage.k, out->words, out->immediates, out->resources, out->name, out->listing};
     if (!fillKernel(t, home, highestSampler, why)) return nullptr;

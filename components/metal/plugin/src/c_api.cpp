@@ -1366,6 +1366,14 @@ int hakios_metal_program_stage_regs(hakios_metal_program* p, unsigned stage, int
     return 0;
 }
 
+// the stage's final instruction mix (one line, compiler.cpp irMix) when it kept one rather than a disassembly; "" otherwise
+const char* hakios_metal_program_stage_mix(hakios_metal_program* p, unsigned stage) {
+    if (p == nullptr || stage > 1) return "";
+    const std::shared_ptr<CompiledStage>& s = stage == 0 ? p->program->vs : p->program->fs;
+    if (s == nullptr || s->listing.compare(0, 4, "mix:") != 0) return "";
+    return s->listing.c_str();
+}
+
 unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stage) {
     if (p == nullptr || stage > 1) return 0;
     return (stage == 0 ? p->program->program.vs : p->program->program.fs).k.numWords;

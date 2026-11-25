@@ -307,6 +307,7 @@ int main(int argc, char** argv) {
                     auto st = compileStage(bc, len, &why, gConstants, 0, gHaveKnown ? &gKnown : nullptr);
                     const auto t1 = std::chrono::steady_clock::now();
                     ok = st != nullptr;
+                    if (ok && getenv("SWEEP_LISTING") != nullptr) std::printf("%s\n", st->listing.c_str());   // (the ir3 disassembly, or with HAKIOS_METAL_LISTING=0 the instruction mix)
                     if (ok) {
                         std::printf("sweep: %s: %u instruction words in %.0f ms%s\n", f.name.c_str(), st->stage.k.numWords,
                                     std::chrono::duration<double, std::milli>(t1 - t0).count(), gHaveKnown ? ", its buffer known" : "");

@@ -10,6 +10,13 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(__GLIBC__)
+#include <errno.h>
+static inline const char* hmProgname() { return program_invocation_short_name; }   // (the host build: glibc has no getprogname)
+#else
+static inline const char* hmProgname() { return getprogname(); }
+#endif
+
 namespace hakios::metal {
 
 namespace {
@@ -136,7 +143,7 @@ std::atomic<uint64_t> gRecycleMissesTotal{0};
 
 bool windowServerProcess() {
     static const bool ws = [] {
-        const char* n = getprogname();
+        const char* n = hmProgname();
         return n != nullptr && strcmp(n, "backboardd") == 0;
     }();
     return ws;

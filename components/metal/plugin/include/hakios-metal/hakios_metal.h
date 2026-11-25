@@ -334,6 +334,8 @@ int hakios_metal_function_control_bytes(const void *fs_bitcode, size_t fs_size, 
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
 /* a stage's register footprint as ir3 left it (full and half registers: SP_xS_CTRL_REG0), its private memory a fiber (spills) and branch stack */
 int hakios_metal_program_stage_regs(hakios_metal_program *program, unsigned stage, int *full_regs, int *half_regs, unsigned *pvtmem_bytes, unsigned *branchstack);
+/* a stage's instruction mix as one line ("mix: ..."): "" when the stage kept a disassembly instead */
+const char *hakios_metal_program_stage_mix(hakios_metal_program *program, unsigned stage);
 void hakios_metal_program_free(hakios_metal_program *program);
 /* the buffers made from the kernel and those taken again from a queue's pool since the last call, and the bytes made */
 void hakios_metal_buffer_counts(unsigned *made, unsigned *reused, unsigned long long *bytes);
