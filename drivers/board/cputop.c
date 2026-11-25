@@ -14,6 +14,9 @@
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
+#include <kern/kalloc.h>
+#include <mach_debug/zone_info.h>
+#include <vm/vm_kern_xnu.h>
 
 #define CPUTOP_PROCS            640
 #define CPUTOP_SHOWN            12
@@ -128,14 +131,15 @@ cputop_thread(void *arg __unused, wait_result_t w __unused)
 
 struct memtop_entry {
 	int             pid;
-	uint64_t        footprint, compressed;
+	uint64_t        footprint, compressed, wired;
 	char            name[24];
 };
-static struct memtop_entry memtop_best[MEMTOP_SHOWN];
+static struct memtop_entry memtop_best[MEMTOP_SHOWN], memtop_wired[3];
 static uint32_t memtop_seconds;
 
 extern uint64_t get_task_phys_footprint(task_t);
 extern uint64_t get_task_compressed(task_t);
+extern uint64_t get_task_wired_mem(task_t);
 extern void hakios_memtop_line(char *buf, size_t len);
 
 static int
@@ -151,6 +155,23 @@ memtop_one(proc_t p, void *arg __unused)
 	e.pid = proc_pid(p);
 	e.footprint = get_task_phys_footprint(task);
 	e.compressed = get_task_compressed(task);
+	e.wired = get_task_wired_mem(task);
+	{
+		uint32_t w = 3;
+
+		while (w > 0 && e.wired > memtop_wired[w - 1].wired) {
+			w--;
+		}
+		if (w < 3) {
+			struct memtop_entry c = e;
+
+			strlcpy(c.name, proc_best_name(p), sizeof(c.name));
+			for (uint32_t i = 2; i > w; i--) {
+				memtop_wired[i] = memtop_wired[i - 1];
+			}
+			memtop_wired[w] = c;
+		}
+	}
 	strlcpy(e.name, proc_best_name(p), sizeof(e.name));
 	while (at > 0 && e.footprint > memtop_best[at - 1].footprint) {
 		at--;
@@ -164,6 +185,57 @@ memtop_one(proc_t p, void *arg __unused)
 	return PROC_RETURNED;
 }
 
+/*
+ * The kernel's own accounting of what each allocation tag holds (vm_page_diagnose: IOKit, files, kalloc, the
+ * kexts' tags ...), the biggest few, in MB. "wired" there says how much of the machine's wired pages the tags
+ * together account for; the rest is wired without a tag -- pages a program has wired (see the processes above)
+ * or a page table.
+ */
+static void
+memtop_tags(void)
+{
+	uint32_t n = vm_page_diagnose_estimate() + 64;
+	mach_memory_info_t *info = kalloc_data(n * sizeof(*info), Z_WAITOK | Z_ZERO);
+	static char line[400];
+	int at = 0;
+	uint64_t total = 0;
+	struct { uint64_t size; char name[32]; uint32_t tag; } top[6] = { { 0 } };
+
+	if (info == NULL) {
+		return;
+	}
+	if (vm_page_diagnose(info, n, 0, false) == KERN_SUCCESS) {
+		for (uint32_t i = 0; i < n; i++) {
+			uint32_t type = info[i].flags & VM_KERN_SITE_TYPE;
+
+			if (info[i].size == 0 || (info[i].flags & (VM_KERN_SITE_ZONE | VM_KERN_SITE_ZONE_VIEW)) ||
+			    type == VM_KERN_SITE_COUNTER) {
+				continue;
+			}
+			total += info[i].size;
+			uint32_t at_i = 6;
+
+			while (at_i > 0 && info[i].size > top[at_i - 1].size) {
+				at_i--;
+			}
+			if (at_i < 6) {
+				for (uint32_t j = 5; j > at_i; j--) {
+					top[j] = top[j - 1];
+				}
+				top[at_i].size = info[i].size;
+				top[at_i].tag = info[i].tag;
+				strlcpy(top[at_i].name, (info[i].flags & VM_KERN_SITE_NAMED) ? info[i].name : "", sizeof(top[at_i].name));
+			}
+		}
+		at = snprintf(line, sizeof(line), "memtags: all tagged allocations %llu MB; biggest:", total >> 20);
+		for (uint32_t i = 0; i < 6 && top[i].size != 0 && at < (int)sizeof(line) - 1; i++) {
+			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s(tag %u) %llu", top[i].name, top[i].tag, top[i].size >> 20);
+		}
+		hakios_tl("%s\n", line);
+	}
+	kfree_data(info, n * sizeof(*info));
+}
+
 static void
 memtop_thread(void *arg __unused, wait_result_t w __unused)
 {
@@ -174,6 +246,7 @@ memtop_thread(void *arg __unused, wait_result_t w __unused)
 
 		delay_for_interval(memtop_seconds * 1000, NSEC_PER_MSEC);
 		bzero(memtop_best, sizeof(memtop_best));
+		bzero(memtop_wired, sizeof(memtop_wired));
 		proc_iterate(PROC_ALLPROCLIST, memtop_one, NULL, NULL, NULL);
 		hakios_memtop_line(line, sizeof(line));
 		at = (int)strlen(line);
@@ -182,7 +255,13 @@ memtop_thread(void *arg __unused, wait_result_t w __unused)
 			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s[%d] %llu (%llu)", memtop_best[i].name,
 			    memtop_best[i].pid, memtop_best[i].footprint >> 20, memtop_best[i].compressed >> 20);
 		}
+		at += snprintf(line + at, sizeof(line) - (size_t)at, "; wired in processes (user wiring: mlock, IOMemoryDescriptor::prepare of a program's pages):");
+		for (uint32_t i = 0; i < 3 && memtop_wired[i].wired != 0 && at < (int)sizeof(line) - 1; i++) {
+			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s[%d] %llu", memtop_wired[i].name, memtop_wired[i].pid,
+			    memtop_wired[i].wired >> 20);
+		}
 		hakios_tl("%s\n", line);
+		memtop_tags();
 	}
 }
 
