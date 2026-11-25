@@ -1684,8 +1684,13 @@ extern uintptr_t EDRRegisterCallbackBlock(uintptr_t, uintptr_t, uintptr_t, uintp
     uintptr_t) __attribute__((weak_import));
 extern uintptr_t EDRRegisterCallbackBlockOnQueue(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
     uintptr_t, uintptr_t) __attribute__((weak_import));
+extern void EDRServerStartService(void) __attribute__((weak_import));
+extern void EDRServerAddDisplay(int) __attribute__((weak_import));
+extern float EDRGetDisplayHeadroom(unsigned) __attribute__((weak_import));
 static volatile int edr_stub_on;
+static volatile int edr_server_on;
 static unsigned edr_stub_calls;
+static unsigned edr_server_calls;
 
 #define EDR_STUB(name)                                                                                                \
 	static uintptr_t edr_##name(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f,         \
@@ -1697,6 +1702,14 @@ static unsigned edr_stub_calls;
 			}                                                                                                   \
 			return (uintptr_t)-1;                                                                               \
 		}                                                                                                       \
+		if (edr_server_on) {                                                                                    \
+			int result = (int)name(a, b, c, d, e, f, g, h);                                                       \
+			if (__atomic_fetch_add(&edr_server_calls, 1, __ATOMIC_RELAXED) < 8) {                                  \
+				say(result >= 0 ? "hakios: edr: client %d registered (" #name ")\n"                           \
+				                : "hakios: edr: " #name " refused: %d\n", result);                              \
+			}                                                                                                   \
+			return (uintptr_t)(long)result;                                                                        \
+		}                                                                                                       \
 		return name(a, b, c, d, e, f, g, h);                                                                    \
 	}                                                                                                               \
 	DC_INTERPOSE(edr_##name, name)
@@ -1706,9 +1719,55 @@ EDR_STUB(EDRCreateClientWithTimeoutAndCallback);
 EDR_STUB(EDRRegisterCallbackBlock);
 EDR_STUB(EDRRegisterCallbackBlockOnQueue);
 
+static float
+edr_headroom(unsigned display)
+{
+	float headroom = EDRGetDisplayHeadroom(display);
+
+	if (edr_server_on && __atomic_fetch_add(&edr_server_calls, 1, __ATOMIC_RELAXED) < 12) {
+		say("hakios: edr: answered headroom %g (display %u)\n", (double)headroom, display);
+	}
+	return headroom;
+}
+DC_INTERPOSE(edr_headroom, EDRGetDisplayHeadroom);
+
+/*
+ * Boot-arg edrserver=1 (instead of edrstub=1): libEDR's own server in the window server, so that its clients get
+ * an answer at once. Protocol (libEDR, Darwin 27; not MIG): EDRServerStartService checks in
+ * com.apple.libEDR.Notification (bootstrap_check_in, a receive source on a queue of its own); each client request is
+ * one message (ids 0..0x12: create client, register port, enable, limits ...); its sends to clients are
+ * mach_msg(SEND_TIMEOUT, 1 ms), so a client that does not read never blocks it. CoreBrightness adds the displays
+ * (EDRServerAddDisplay(id)) on a phone, and has no display here; they are added here. Nothing enables EDR for them:
+ * the scaling factor stays at its default 1.0, so EDRGetDisplayHeadroom (the client's own: 1/max(factor, limits))
+ * is 1.0 and clients see SDR only. root26-darwin.sh keeps the Mach service in backboardd's job for it
+ * (backboardd is the one that checks in); without the server the name must not exist (edrstub=1).
+ */
+static void
+edr_server_start(const char *arguments)
+{
+	if (strstr(arguments, "edrserver=1") == NULL) {
+		return;
+	}
+	if (EDRServerStartService == NULL || EDRServerAddDisplay == NULL) {
+		say("hakios: edr: libEDR has no server here, edrserver=1 ignored\n");
+		return;
+	}
+	edr_stub_on = 0;
+	edr_server_on = 1;
+	EDRServerStartService();
+	for (int display = 0; display < 3; display++) {
+		EDRServerAddDisplay(display);
+	}
+	say("hakios: edr: server up (displays 0-2, SDR only)\n");
+}
+
 static void
 edr_stub_start(const char *arguments)
 {
+	if (strstr(arguments, "edrserver=1") != NULL) {
+		edr_server_start(arguments);
+		return;
+	}
 	if (strstr(arguments, "edrstub=1") != NULL) {
 		edr_stub_on = 1;
 		say("hakios: edrstub=1: libEDR's client calls answer -1 (no EDR) at once\n");

@@ -244,8 +244,14 @@ done
 # every request: CoreAnimation in backboardd asks EDR at each display state change while holding the lock
 # its display thread needs, and waited out libEDR's timeout, about 40 s: one frame in 40 s on Darwin 27.
 # Without the name a lookup fails at once and libEDR answers that there is no EDR.
-python3 - "$J/com.apple.backboardd.plist" <<'PY'
+# EDRSERVER=1 (build time; default off) keeps the name and the boot-arg edrserver=1 starts libEDR's own server
+# in backboardd (inject.c: answers at once, SDR only). The two go together: the name without the server stalls
+# every client for 40 s, so EDRSERVER=1 images must boot with edrserver=1 (and not edrstub=1).
+python3 - "$J/com.apple.backboardd.plist" "${EDRSERVER:-0}" <<'PY'
 import plistlib, sys
+if sys.argv[2] == '1':
+    print('  backboardd: com.apple.libEDR.Notification kept (boot with edrserver=1)')
+    sys.exit(0)
 with open(sys.argv[1], 'rb') as f:
     job = plistlib.load(f)
 if job.get('MachServices', {}).pop('com.apple.libEDR.Notification', None) is not None:
