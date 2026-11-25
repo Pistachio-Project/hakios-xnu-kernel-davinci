@@ -543,6 +543,7 @@ void CommandBuffer::finish(Status s, bool recycle) {
         // the GPU has finished with this buffer, or never had it: its slabs and the memory it kept go back, before the
         // handlers, which touch nothing of them (the stamps they may read are held apart) and may let go of the queue
         kept_.clear();
+        forgetRecent();
         slab_.reset();
         queue_.giveSlabs(&slabs_);
         keptAny_.clear();

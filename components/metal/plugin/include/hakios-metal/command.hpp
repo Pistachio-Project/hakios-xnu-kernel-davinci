@@ -115,9 +115,15 @@ public:
     // a blit the caller could not record (a buffer not in the GPU's memory, say): the buffer ends in the error state
     void refuse(const std::string& why) { fail(why); }
     // a buffer it uses, kept alive until it completes (the owner may let go of it before that)
-    void keep(std::shared_ptr<const Buffer> b) { kept_.push_back(std::move(b)); }
+    // (not again for one of the last eight it kept: a draw keeps its target, its program and its buffers, which the draw
+    // before it kept too, and each is an atomic count up here and down when the buffer completes)
+    template <class T> void keep(const std::shared_ptr<T>& b) {
+        if (!recentlyKept(keptRecent_, keptNext_, b.get())) kept_.push_back(b);
+    }
     // anything else it uses (a compiled kernel's words), the same way
-    void keepAlive(std::shared_ptr<const void> p) { keptAny_.push_back(std::move(p)); }
+    template <class T> void keepAlive(const std::shared_ptr<T>& p) {
+        if (!recentlyKept(keptAnyRecent_, keptAnyNext_, p.get())) keptAny_.push_back(p);
+    }
     // OTHER's recorded work after this one's, as if it had been recorded here: its packets, what it names and what it
     // keeps alive -- a parallel render encoder's sub-encoders each record into a command buffer of their own, from any
     // thread in any order, and are appended in the order they were made. OTHER is left empty and is not committed; an
@@ -244,7 +250,29 @@ private:
                      const uint32_t* immediates, const compute::Options& options);
     // the end of it, however it ends: the status, the handlers (which see that status), and only then the waiters
     void finish(Status s, bool recycle = true);
-    void use(const Buffer& b, bool write) { uses_.push_back(BoUse{&b.bo(), write}); }
+    // (a buffer used twice in a row, as a draw's target and tables are, once: Gpu::submit merges a buffer's uses)
+    void use(const Buffer& b, bool write) {
+        const Bo* bo = &b.bo();
+        for (const BoUse& u : usesRecent_) {
+            if (u.bo == bo && u.write == write) return;
+        }
+        usesRecent_[usesNext_++ & 7] = BoUse{bo, write};
+        uses_.push_back(BoUse{bo, write});
+    }
+    static bool recentlyKept(const void* (&ring)[8], uint8_t& next, const void* p) {
+        for (const void* r : ring) {
+            if (r == p) return true;
+        }
+        ring[next++ & 7] = p;
+        return false;
+    }
+    // what uses_, kept_ and keptAny_ have just been given, forgotten when they are emptied (a buffer's address may come
+    // back, for another)
+    void forgetRecent() {
+        for (const void*& r : keptRecent_) r = nullptr;
+        for (const void*& r : keptAnyRecent_) r = nullptr;
+        for (BoUse& u : usesRecent_) u = BoUse{nullptr, false};
+    }
 public:
     // What each register written in a pass holds, for appendDeduped: a draw writes some 500 of them and almost all
     // hold their value already, so each is looked up once. A register is a page of 256 and a slot in it: two loads
@@ -380,7 +408,12 @@ private:
     // every draw, each grew from nothing a word at a time -- nine allocations for a draw's 350 words, and the phone's
     // allocator hands large frees back to the system (madvise), which the samples of a draw call showed beside them
     pm4::Stream drawBody_, drawBodySys_;
+    std::vector<uint8_t> drawKey_;   // render.cpp: draw's static key, built here so that its memory is kept
     std::vector<BoUse> uses_;
+    BoUse usesRecent_[8] = {};
+    const void* keptRecent_[8] = {};
+    const void* keptAnyRecent_[8] = {};
+    uint8_t usesNext_ = 0, keptNext_ = 0, keptAnyNext_ = 0;
     std::vector<std::shared_ptr<const Buffer>> kept_;   // the buffers it uses stay alive until it completes
     std::vector<std::shared_ptr<const void>> keptAny_;
     std::vector<std::function<void(CommandBuffer&)>> handlers_;

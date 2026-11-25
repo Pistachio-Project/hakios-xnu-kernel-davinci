@@ -66,6 +66,25 @@ int main() {
     attr.vertexDescriptor.layouts[0] = VertexLayout{12, VertexStep::kPerVertex, 1};
     Program txBlend = tx;
     txBlend.blend = ColorBlend{true, 0, 0, 1, 7, 1, 7, 0xf};   // One, OneMinusSrcAlpha
+    // BENCH_SYN=1: what an uber shader's draw adds to these small kernels' -- immediates uploaded each draw, a constant
+    // range from each stage's buffer (at 8 mod 16, as CoreAnimation binds its uniforms: copied by the command processor)
+    static uint32_t imm[128];
+    for (uint32_t i = 0; i < 128; i++) imm[i] = 0x3f800000u + i;
+    const bool syn = getenv("BENCH_SYN") != nullptr;
+    if (syn) {
+        for (Program* p : {&flat, &tx, &attr, &txBlend}) {
+            for (Stage* s : {&p->vs, &p->fs}) {
+                Kernel& k = s->k;
+                k.immediates = imm;
+                k.numImmediates = 128;
+                k.immediatesOffsetVec4 = 0;
+                k.constlen = std::max<uint32_t>(k.constlen, 64);
+                k.uboRanges[0] = KernelUboRange{0, 36, 0, 64};
+                k.numUboRanges = 1;
+            }
+        }
+    }
+    const uint64_t skew = syn ? 8 : 0;
     Program* progs[4] = {&flat, &tx, &attr, &txBlend};
 
     RenderPass pass;
@@ -93,9 +112,9 @@ int main() {
             d.viewport = Viewport{0, 0, 828, 1792, 0, 1};
             d.scissor = Scissor{uint32_t(i * 7 % 300), uint32_t(i * 13 % 900), 200 + uint32_t(i % 50), 100 + uint32_t(i % 70)};
             Bindings vsb, fsb;
-            if (&p == &attr) vsb.buffers = {Binding{vb.get(), uint64_t(i % 16) * 256}};
-            else vsb.buffers = {Binding{ub.get(), uint64_t(i % 16) * 256}, Binding{ub.get(), 4096}};
-            fsb.buffers = {Binding{ub.get(), uint64_t(i % 8) * 256}};
+            if (&p == &attr) vsb.buffers = {Binding{vb.get(), uint64_t(i % 16) * 256 + skew}};
+            else vsb.buffers = {Binding{ub.get(), uint64_t(i % 16) * 256 + skew}, Binding{ub.get(), 4096 + skew}};
+            fsb.buffers = {Binding{ub.get(), uint64_t(i % 8) * 256 + skew}};
             if (&p == &tx || &p == &txBlend) {
                 fsb.textures = {src[i % 8].get()};
                 fsb.samplers = {&smp};

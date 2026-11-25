@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <initializer_list>
+#include <optional>
 #include <tuple>
 
 #include "hakios-metal/a6xx.hpp"
@@ -596,8 +597,10 @@ bool placeCopies(std::vector<PushedRange>* ranges, uint32_t* at, const Stage& st
 
 struct StageTextures {
     uint32_t numTex = 0, numSamp = 0;
-    uint32_t texWords[kMaxTextureSlots][16] = {};
-    uint32_t sampWords[kMaxTextureSlots][4] = {};
+    // (the first numTex rows of texWords and numSamp of sampWords are set, by stageTextures, and the rest never read:
+    // a draw with no texture, most of them, does not pay for 1.3 KB of zeros a stage)
+    uint32_t texWords[kMaxTextureSlots][16];
+    uint32_t sampWords[kMaxTextureSlots][4];
     std::vector<const Texture*> used;
 };
 
@@ -658,6 +661,7 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
         }
         return true;
     }
+    memset(out->texWords, 0, size_t(out->numTex) * sizeof out->texWords[0]);
     for (uint32_t t = 0; t < out->numTex; t++) {
         const KernelTexture& kt = k.textures[t];
         if (kt.kind != kTexSampled) continue;
@@ -725,6 +729,7 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
     for (uint32_t m = 0; m < kMaxTextureSlots; m++) {
         if ((k.samplerMask >> m) & 1) out->numSamp = m + 1;
     }
+    memset(out->sampWords, 0, size_t(out->numSamp) * sizeof out->sampWords[0]);
     for (uint32_t m = 0; m < out->numSamp; m++) {
         if (((k.samplerMask >> m) & 1) == 0) continue;
         if (m >= b.samplers.size() || b.samplers[m] == nullptr) {
@@ -1276,13 +1281,17 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
     // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
     // as if it did not write it -- no register for the slot, RB_MRT_CONTROL 0 -- which is the slot nothing writes.
-    Stage fsDrawn = program.fs;
+    // (a copy of the stage, 1.4 KB, only for the draw that changes it: most pass has an attachment for every output)
+    std::optional<Stage> fsDrawn;
     // (a dual-source stage's second colour is the blend's second source, not attachment 1's: it is kept)
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         if (i == 1 && program.fs.dualSrcBlend) continue;
-        if (fsDrawn.colorRegid[i] != kRegidNone && attachmentOf(pass, i).texture == nullptr) fsDrawn.colorRegid[i] = kRegidNone;
+        if (program.fs.colorRegid[i] != kRegidNone && attachmentOf(pass, i).texture == nullptr) {
+            if (!fsDrawn) fsDrawn = program.fs;
+            fsDrawn->colorRegid[i] = kRegidNone;
+        }
     }
-    const Stage& fs = fsDrawn;
+    const Stage& fs = fsDrawn ? *fsDrawn : program.fs;
     // --- the two stages ---
     if (vs.kind != kStageVertex) {
         return refuse(why, std::string(stageName(vs)) + " is not a vertex stage");
@@ -1567,12 +1576,12 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     }
     memset(tableCpu + kTableFbReadFlushAt, 0, 4);   // (the draw's own table: zero before the flush below writes it)
     memcpy(tableCpu + kGfxIboAt, ibos.words, size_t(ibos.count) * 64);
-    memset(tableCpu + kFsTexConstAt, 0, kMaxTextureSlots * 64);
-    memset(tableCpu + kFsTexSampAt, 0, kMaxTextureSlots * 16);
-    memcpy(tableCpu + kFsTexConstAt, fsTex.texWords, sizeof fsTex.texWords);
-    memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, sizeof fsTex.sampWords);
-    memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, sizeof vsTex.texWords);
-    memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, sizeof vsTex.sampWords);
+    // (the descriptors the stages load, numTex and numSamp of them, and not the 16 slots' worth of zeros around them:
+    // the loads and the prefetches read no more, and each draw's table is 5 KB of write-combined memory a draw)
+    memcpy(tableCpu + kFsTexConstAt, fsTex.texWords, size_t(fsTex.numTex) * sizeof fsTex.texWords[0]);
+    memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, size_t(fsTex.numSamp) * sizeof fsTex.sampWords[0]);
+    memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, size_t(vsTex.numTex) * sizeof vsTex.texWords[0]);
+    memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, size_t(vsTex.numSamp) * sizeof vsTex.sampWords[0]);
     MrtWords mrts[kMaxColorOutputs] = {};
     uint32_t srgbMask = 0;
     for (uint32_t i = 0; i < numRt; i++) {
@@ -3070,9 +3079,11 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     // sample count and options are the last draw's in this pass: deduplication dropped every word of it anyway, and
     // making the words was most of a draw's encoding (some 190 of its 350). Not after a packet that made the
     // deduplication forget what the registers hold (staticKey emptied then).
-    std::vector<uint8_t> staticKey;
+    // (a member's vector, its memory kept from draw to draw: a key made with a heap allocation a draw is one more
+    // malloc and free in each; the pass's own takes the words by swapping, and hands the old ones back)
+    std::vector<uint8_t>& staticKey = drawKey_;
+    staticKey.clear();
     if (options.dedupRegs) {
-        staticKey.reserve(2 * sizeof(void*) + 3 * sizeof(uint32_t) + sizeof program.blend + sizeof program.moreBlend + sizeof encodeOptions);
         const void* ptrs[2] = {program.vs.k.words, program.fs.k.words};
         const uint32_t sizes[3] = {program.vs.k.numWords, program.fs.k.numWords, program.samples};
         auto add = [&](const void* p, size_t n) { staticKey.insert(staticKey.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
@@ -3204,7 +3215,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     if (options.dedupRegs && open_->options.dedupRegs) {
         bool forgot = appendDeduped(into, body, open_->gmem ? open_->bodyRegs : open_->regs);
         if (open_->dual) forgot = appendDeduped(open_->sysStream, bodySys, open_->regs) || forgot;
-        open_->staticKey = forgot ? std::vector<uint8_t>() : std::move(staticKey);
+        if (forgot) open_->staticKey.clear();
+        else open_->staticKey.swap(staticKey);
     } else {
         appendStream(into, body);
         if (open_->dual) appendStream(open_->sysStream, bodySys);
@@ -3380,6 +3392,7 @@ bool CommandBuffer::append(CommandBuffer& other) {
     other.uses_.clear();
     other.kept_.clear();
     other.keptAny_.clear();
+    other.forgetRecent();
     counts_.passes += other.counts_.passes;
     counts_.draws += other.counts_.draws;
     counts_.dispatches += other.counts_.dispatches;
