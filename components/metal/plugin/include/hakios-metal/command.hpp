@@ -247,45 +247,52 @@ private:
     void use(const Buffer& b, bool write) { uses_.push_back(BoUse{&b.bo(), write}); }
 public:
     // What each register written in a pass holds, for appendDeduped: a draw writes some 500 of them and almost all
-    // hold their value already, so each is looked up once, in an open-addressed table of its own (std::unordered_map's
-    // find and insert, two lookups and a node a register, were most of a draw's 20 us of deduplication on the phone)
+    // hold their value already, so each is looked up once. A register is a page of 256 and a slot in it: two loads
+    // and a bit, no hash (registers a draw writes lie close together, a few dozen pages in all, so a pass touches a few
+    // cache lines of them where a hash scattered each one; the open-addressed table before this was a quarter of a
+    // draw's time on the phone, and std::unordered_map's find and insert before it most of 20 us)
     class RegShadow {
     public:
         // whether REG held VALUE; it holds VALUE from now on
         bool hold(uint32_t reg, uint32_t value) {
-            if (keys_.empty() || 2 * (used_ + 1) > keys_.size()) grow();
-            const size_t mask = keys_.size() - 1;
-            for (size_t i = (reg * 2654435761u) & mask;; i = (i + 1) & mask) {
-                if (keys_[i] == reg) {
-                    const bool same = values_[i] == value;
-                    values_[i] = value;
-                    return same;
-                }
-                if (keys_[i] == kEmpty) {
-                    keys_[i] = reg;
-                    values_[i] = value;
-                    used_++;
-                    return false;
-                }
+            const uint32_t pageNo = reg >> kPageBits;
+            Page* p = pageNo < pages_.size() ? pages_[pageNo].get() : nullptr;
+            if (p == nullptr) p = newPage(pageNo);
+            if (!p->listed) {
+                p->listed = true;
+                touched_.push_back(p);
             }
+            const uint32_t slot = reg & (kPageSize - 1);
+            const uint64_t bit = uint64_t(1) << (slot & 63);
+            uint64_t& valid = p->valid[slot >> 6];
+            const bool same = (valid & bit) != 0 && p->values[slot] == value;
+            valid |= bit;
+            p->values[slot] = value;
+            return same;
         }
         void clear() {
-            std::fill(keys_.begin(), keys_.end(), kEmpty);
-            used_ = 0;
+            for (Page* p : touched_) {
+                for (uint64_t& v : p->valid) v = 0;
+                p->listed = false;
+            }
+            touched_.clear();
         }
     private:
-        static constexpr uint32_t kEmpty = ~0u;
-        void grow() {
-            std::vector<uint32_t> keys = std::move(keys_), values = std::move(values_);
-            keys_.assign(std::max<size_t>(1024, keys.size() * 2), kEmpty);
-            values_.assign(keys_.size(), 0);
-            used_ = 0;
-            for (size_t i = 0; i < keys.size(); i++) {
-                if (keys[i] != kEmpty) hold(keys[i], values[i]);
+        static constexpr uint32_t kPageBits = 8, kPageSize = 1u << kPageBits;
+        struct Page {
+            uint32_t values[kPageSize];
+            uint64_t valid[kPageSize / 64];
+            bool listed;
+        };
+        Page* newPage(uint32_t pageNo) {
+            if (pageNo >= pages_.size()) pages_.resize(pageNo + 1);
+            if (pages_[pageNo] == nullptr) {
+                pages_[pageNo].reset(new Page());
             }
+            return pages_[pageNo].get();
         }
-        std::vector<uint32_t> keys_, values_;
-        size_t used_ = 0;
+        std::vector<std::unique_ptr<Page>> pages_;
+        std::vector<Page*> touched_;
     };
 
 private:

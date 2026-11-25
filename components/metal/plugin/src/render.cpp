@@ -2811,7 +2811,7 @@ void appendStream(pm4::Stream& to, const pm4::Stream& from) {
     const std::vector<uint32_t>& w = from.words();
     to.packet(pm4::kNop, nullptr, 0);
     for (size_t i = 0; i < w.size();) {
-        pm4::Header h = pm4::decode(w[i]);
+        pm4::Header h = pm4::decodeOwn(w[i]);
         if (h.kind == pm4::Header::kRegisters) {
             to.registers(h.reg, &w[i + 1], h.count);
         } else {
@@ -2833,7 +2833,7 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
     const std::vector<uint32_t>& w = from.words();
     to.packet(pm4::kNop, nullptr, 0);
     for (size_t i = 0; i < w.size();) {
-        pm4::Header h = pm4::decode(w[i]);
+        pm4::Header h = pm4::decodeOwn(w[i]);
         if (h.kind == pm4::Header::kRegisters) {
             uint32_t runStart = 0, runLen = 0;
             for (uint32_t k = 0; k < h.count; k++) {

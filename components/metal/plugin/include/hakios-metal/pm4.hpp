@@ -11,6 +11,7 @@
 // The opcodes are Mesa's src/freedreno/registers/adreno/adreno_pm4.xml, checked one by one against it.
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -62,16 +63,72 @@ struct Header {
     uint32_t count = 0;       // the words after the header
 };
 
+// The same for a stream this process wrote itself (appendStream, appendDeduped copy one packet at a time, a hundred
+// and more a draw): the header's kind by its top nibble, no parity checked, as the encoder put the headers there
+inline Header decodeOwn(uint32_t word) {
+    Header h;
+    switch (word >> 28) {
+    case 4:
+        h.count = word & 0x7f;
+        h.reg = (word >> 8) & 0x3ffff;
+        h.kind = Header::kRegisters;
+        break;
+    case 7:
+        h.count = word & 0x3fff;
+        h.opcode = (word >> 16) & 0x7f;
+        h.kind = Header::kCommand;
+        break;
+    default:
+        break;
+    }
+    return h;
+}
+
 // WORDS, whole packets, cut into runs of at most MAX words each, at packet boundaries: (first word, words) of each, in
 // order -- what one CP_INDIRECT_BUFFER can take (kMaxIbWords), a run apiece
 std::vector<std::pair<uint32_t, uint32_t>> ibRuns(const std::vector<uint32_t>& words, uint32_t max = kMaxIbWords);
 
-Header decode(uint32_t word);
+// (inline: appendStream and appendDeduped decode every word of every draw they copy, and the encoder writes each
+// register packet through registers(): calls through the library's boundary, one per packet, were a draw's cost)
+inline Header decode(uint32_t word) {
+    Header h;
+    switch (word >> 28) {
+    case 4:
+        h.count = word & 0x7f;
+        h.reg = (word >> 8) & 0x3ffff;
+        if (((word >> 7) & 1) == oddParity(h.count) && ((word >> 27) & 1) == oddParity(h.reg)) {
+            h.kind = Header::kRegisters;
+        }
+        break;
+    case 7:
+        h.count = word & 0x3fff;
+        h.opcode = (word >> 16) & 0x7f;
+        if (((word >> 15) & 1) == oddParity(h.count) && ((word >> 23) & 1) == oddParity(h.opcode)) {
+            h.kind = Header::kCommand;
+        }
+        break;
+    default:
+        break;
+    }
+    return h;
+}
 
 // A stream of packets being written. Addresses are the GPU's (the IOVA of a buffer plus an offset).
 class Stream {
 public:
-    void registers(uint32_t reg, const uint32_t* values, uint32_t count);
+    void registers(uint32_t reg, const uint32_t* values, uint32_t count) {
+        // more than a header can count goes as several packets, each starting where the one before stopped
+        ready();
+        while (count > 0) {
+            const uint32_t n = count < kMaxType4Count ? count : kMaxType4Count;
+            uint32_t* at = grow(1 + n);
+            at[0] = type4(reg, n);
+            for (uint32_t i = 0; i < n; i++) at[1 + i] = values[i];
+            reg += n;
+            values += n;
+            count -= n;
+        }
+    }
     void nop(uint32_t words = 0);
     void waitForIdle();
     void waitMemWrites();
@@ -80,7 +137,13 @@ public:
     void memcpy(uint64_t destination, uint64_t source, uint32_t words);
     void indirect(uint64_t address, uint32_t words);
     // any type-7 packet: OPCODE with WORDS after its header (the compute dispatch's packets, compute.cpp)
-    void packet(uint32_t opcode, const uint32_t* words, uint32_t count);
+    void packet(uint32_t opcode, const uint32_t* words, uint32_t count) {
+        assert(count <= kMaxType7Count);
+        ready();
+        uint32_t* at = grow(1 + count);
+        at[0] = type7(opcode, count);
+        for (uint32_t i = 0; i < count; i++) at[1 + i] = words[i];
+    }
 
     const std::vector<uint32_t>& words() const { return words_; }
     size_t size() const { return words_.size(); }
@@ -101,7 +164,18 @@ public:
     }
 
 private:
-    void command(uint32_t opcode, uint32_t count);
+    void command(uint32_t opcode, uint32_t count) {
+        assert(count <= kMaxType7Count);
+        ready();
+        words_.push_back(type7(opcode, count));
+    }
+    // room for N more words, which the caller writes: where they start (the vector's size grows by N, zeros past the old end
+    // until written -- one resize rather than a push_back a word, each with its own look at the capacity)
+    uint32_t* grow(size_t n) {
+        const size_t at = words_.size();
+        words_.resize(at + n);
+        return words_.data() + at;
+    }
     // a stream's first words: room for a draw's at once (most streams are a draw's or a pass's head), not a word at a time
     void ready() {
         if (words_.capacity() == 0) words_.reserve(512);
