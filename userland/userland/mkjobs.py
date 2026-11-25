@@ -261,7 +261,7 @@ DENY += ('fileindexerd', 'spotlightknowledged.updater', 'icloudmailagent')
 # CPU in the run, searchpartyd (Find My accessories: no Bluetooth, UWB) 2.1 s, findmydeviced / findmylocated (no
 # network, no location) 0.7 / 0.9 s, nearbyd (UWB) 0.5 s, audioaccessoryd (no accessories) 0.8 s, carkitd (no
 # CarPlay) 0.2 s. All are on-demand jobs here, so nothing waits for them. ALLOW="sharingd" etc. puts one back.
-DENY_DAVINCI = ('sharingd', 'searchpartyd', 'findmydeviced', 'findmylocated', 'nearbyd', 'audioaccessoryd', 'carkitd')
+DENY_DAVINCI = ('com.apple.sharingd', 'searchpartyd', 'findmydeviced', 'findmylocated', 'nearbyd', 'audioaccessoryd', 'carkitd')
 if os.environ.get('BOARD') == 'davinci':
     DENY += DENY_DAVINCI
 
