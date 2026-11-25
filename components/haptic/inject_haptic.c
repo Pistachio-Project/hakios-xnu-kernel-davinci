@@ -83,7 +83,7 @@ struct hook {
 	SEL sel;
 	IMP original;
 };
-static struct hook hooks[64];
+static struct hook hooks[128];
 static unsigned hooked;
 
 static __thread Class resume;
@@ -104,35 +104,6 @@ original_of(Class from, SEL cmd, Class *at)
 	return NULL;
 }
 
-/*
- * One function for every selector: on arm64 an integer argument is in x2 and a floating one in d0, never in each
- * other's registers, so a method of either kind (or of none) is called on with what it was called with. A wrapped
- * method that calls up to a wrapped superclass's goes on from the class above (and the pulse is made once).
- */
-static void
-wrapper(id self, SEL cmd, uintptr_t integer, double real)
-{
-	Class outer = resume_sel == cmd ? resume : NULL, at = NULL, saved = resume;
-	SEL saved_sel = resume_sel;
-	IMP original = original_of(outer != NULL ? outer : object_getClass(self), cmd, &at);
-
-	if (outer == NULL) {
-		pulse(sel_getName(cmd));
-	}
-	if (original != NULL) {
-		resume = class_getSuperclass(at);
-		resume_sel = cmd;
-		((void (*)(id, SEL, uintptr_t, double))original)(self, cmd, integer, real);
-		resume = saved;
-		resume_sel = saved_sel;
-	}
-}
-
-static const char *const wanted[] = {
-	"impactOccurred", "impactOccurredWithIntensity:", "selectionChanged", "notificationOccurred:",
-	"pressedDown", "pressedUp",
-};
-
 static bool
 suffix(const char *s, const char *end)
 {
@@ -141,7 +112,78 @@ suffix(const char *s, const char *end)
 	return a >= b && strcmp(s + a - b, end) == 0;
 }
 
-/* The generators' classes, once UIKit has them; true when it has. */
+/*
+ * One function for every selector: on arm64 the first four integer arguments are in x2 to x5, floating ones in d0 and
+ * d1, and an integer result in x0, so a method of up to four such arguments is called on with what it was called with
+ * (a method with a structure or floating result, or more arguments, is not wrapped). A wrapped method that calls up to
+ * a wrapped superclass's goes on from the class above (and the pulse is made once).
+ */
+static uintptr_t
+wrapper(id self, SEL cmd, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, double d0, double d1)
+{
+	Class outer = resume_sel == cmd ? resume : NULL, at = NULL, saved = resume;
+	SEL saved_sel = resume_sel;
+	IMP original = original_of(outer != NULL ? outer : object_getClass(self), cmd, &at);
+	uintptr_t result = 0;
+
+	if (outer == NULL) {
+		static unsigned calls;
+
+		if (calls++ < 20) {
+			say("hakios: uihaptic: %s pid %d: call %u: -[%s %s]\n", getprogname(), getpid(), calls,
+			    class_getName(object_getClass(self)), sel_getName(cmd));
+		}
+		pulse(sel_getName(cmd));
+	}
+	if (original != NULL) {
+		resume = class_getSuperclass(at);
+		resume_sel = cmd;
+		result = ((uintptr_t (*)(id, SEL, uintptr_t, uintptr_t, uintptr_t, uintptr_t, double, double))original)(self, cmd, a2,
+		    a3, a4, a5, d0, d1);
+		resume = saved;
+		resume_sel = saved_sel;
+	}
+	return result;
+}
+
+/* the methods that play a feedback: of the generators, the public calls; of the engines and the rest of UIKit's feedback classes, those named for playing or actuating one */
+static bool
+wanted(const char *class_name, const char *sel)
+{
+	static const char *const generator[] = {
+		"impactOccurred", "impactOccurredWithIntensity:", "selectionChanged", "notificationOccurred:", "pressedDown", "pressedUp",
+	};
+
+	if (suffix(class_name, "FeedbackGenerator")) {
+		for (unsigned w = 0; w < sizeof(generator) / sizeof(generator[0]); w++) {
+			if (strcmp(sel, generator[w]) == 0) {
+				return true;
+			}
+		}
+	}
+	if (strstr(class_name, "FeedbackEngine") != NULL || strncmp(class_name, "_UIFeedback", 11) == 0 ||
+	    strncmp(class_name, "UIFeedback", 10) == 0) {
+		return strncmp(sel, "_playFeedback", 13) == 0 || strncmp(sel, "playFeedback", 12) == 0 ||
+		    strncmp(sel, "actuateFeedback", 15) == 0 || strncmp(sel, "_actuateFeedback", 16) == 0 ||
+		    strncmp(sel, "_performFeedback", 16) == 0 || strncmp(sel, "performFeedback", 15) == 0;
+	}
+	return false;
+}
+
+/* a method this wrapper can stand in for: no structure or floating result, at most four arguments after self and _cmd */
+static bool
+fits(Method m)
+{
+	char type[32];
+
+	method_getReturnType(m, type, sizeof(type));
+	if (type[0] == '{' || type[0] == '(' || type[0] == '[' || type[0] == 'd' || type[0] == 'f') {
+		return false;
+	}
+	return method_getNumberOfArguments(m) <= 6;
+}
+
+/* The classes of UIKit's feedback, once it has them; true when it has. */
 static bool
 install(void)
 {
@@ -156,29 +198,35 @@ install(void)
 		const char *name = class_getName(all[i]);
 		unsigned n = 0;
 		Method *methods;
+		bool engine = strstr(name, "FeedbackEngine") != NULL;
 
-		if (!suffix(name, "FeedbackGenerator")) {
+		if (!suffix(name, "FeedbackGenerator") && !engine && strncmp(name, "_UIFeedback", 11) != 0 &&
+		    strncmp(name, "UIFeedback", 10) != 0) {
 			continue;
 		}
 		found++;
 		methods = class_copyMethodList(all[i], &n);
-		for (unsigned m = 0; m < n && hooked < 64; m++) {
+		if (engine) {
+			/* (what the engines have, for the next look: the first 40 of each) */
+			for (unsigned m = 0; m < n && m < 40; m++) {
+				say("hakios: uihaptic: %s: engine %s has -%s\n", getprogname(), name, sel_getName(method_getName(methods[m])));
+			}
+		}
+		for (unsigned m = 0; m < n && hooked < 128; m++) {
 			const char *sel = sel_getName(method_getName(methods[m]));
 
-			for (unsigned w = 0; w < sizeof(wanted) / sizeof(wanted[0]); w++) {
-				if (strcmp(sel, wanted[w]) == 0) {
-					hooks[hooked].cls = all[i];
-					hooks[hooked].sel = method_getName(methods[m]);
-					hooks[hooked].original = method_setImplementation(methods[m], (IMP)wrapper);
-					say("hakios: uihaptic: wrapped -[%s %s]\n", name, sel);
-					hooked++;
-				}
+			if (wanted(name, sel) && fits(methods[m])) {
+				hooks[hooked].cls = all[i];
+				hooks[hooked].sel = method_getName(methods[m]);
+				hooks[hooked].original = method_setImplementation(methods[m], (IMP)wrapper);
+				say("hakios: uihaptic: wrapped -[%s %s]\n", name, sel);
+				hooked++;
 			}
 		}
 		free(methods);
 	}
 	free(all);
-	say("hakios: uihaptic: pid %d: %u generator classes, %u methods wrapped\n", getpid(), found, hooked);
+	say("hakios: uihaptic: %s pid %d: %u feedback classes, %u methods wrapped\n", getprogname(), getpid(), found, hooked);
 	return true;
 }
 
