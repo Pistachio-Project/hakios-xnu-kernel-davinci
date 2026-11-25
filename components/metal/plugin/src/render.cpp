@@ -3325,15 +3325,16 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     const bool grouped = options.dedupRegs && !fullState_ && (joins ? open_->options.dedupRegs : true);
     render::GroupCache *groupsBody = nullptr, *groupsSys = nullptr;
     if (grouped) {
-        std::vector<uint8_t>& key = drawKey_;
-        key.clear();
+        // (a stack buffer: the program, its blending of attachment 0 and of the ones past it the stage writes, and the options)
+        uint8_t key[2 * sizeof(void*) + 3 * sizeof(uint32_t) + kMaxColorOutputs * sizeof(ColorBlend) + sizeof(render::Options)];
+        size_t keyBytes = 0;
+        auto add = [&](const void* p, size_t n) { memcpy(key + keyBytes, p, n); keyBytes += n; };
         const void* ptrs[2] = {program.vs.k.words, program.fs.k.words};
         const uint32_t sizes[3] = {program.vs.k.numWords, program.fs.k.numWords, program.samples};
-        auto add = [&](const void* p, size_t n) { key.insert(key.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
         add(ptrs, sizeof ptrs);
         add(sizes, sizeof sizes);
         add(&program.blend, sizeof program.blend);
-        add(program.moreBlend, sizeof program.moreBlend);
+        add(program.moreBlend, sizeof(ColorBlend) * (std::min<uint32_t>(program.fs.numColorOutputs, kMaxColorOutputs) > 1 ? std::min<uint32_t>(program.fs.numColorOutputs, kMaxColorOutputs) - 1 : 0));
         add(&encodeOptions, sizeof encodeOptions);
         if (joins) {
             groupsBody = open_->gmem ? &open_->bodyGroups : &open_->groups;
@@ -3345,10 +3346,10 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             groupsSys = &newSys_;
         }
         groupsBody->begin();
-        groupsBody->setProgramKey(key.data(), key.size());
+        groupsBody->setProgramKey(key, keyBytes);
         if (dual || (joins && open_->dual)) {
             groupsSys->begin();
-            groupsSys->setProgramKey(key.data(), key.size());
+            groupsSys->setProgramKey(key, keyBytes);
         }
     }
     if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
