@@ -213,14 +213,12 @@ bindDrawer(unsigned index, const char * who)
 		IOLog("MiniIOMobileFramebuffer: %s anywhere: no slower core up for it\n", who);
 	}
 }
-#define SWAP_QUEUE              3                       /* frames that may wait for the panel at most (fb_queue; with fb_scanout one more, the shown one) */
-#define SWAP_QUEUE_BASE         2
-static bool gScanoutPending;                            /* fb_scanout: the swap now on the pipe has not been completed: its surface is the display's until the next latches */
+#define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
 static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
 static inline unsigned
 swapQueue(void)
 {
-	return (gQueue >= 1 && gQueue <= SWAP_QUEUE_BASE ? gQueue : 1) + (gScanoutPending ? 1 : 0);
+	return gQueue >= 1 && gQueue <= SWAP_QUEUE ? gQueue : 1;
 }
 /*
  * Boot-arg touch_lat=1: a line for every swap handed over ("tl: s ID at US") and for every frame
@@ -292,8 +290,6 @@ static TUNABLE(uint32_t, gScanout, "fb_scanout", 0);
 static bool gScanoutReady, gScanoutGaveUp;
 static MiniIOSurface * gScanoutHeld;            /* the surface the pipe fetches now */
 static uint32_t gScanoutFrames, gScanoutCopied, gScanoutWhy[8];
-static uint32_t gScanoutFlips, gScanoutDeferred;        /* stats: surfaces put on the pipe; swaps completed only when the next one latched */
-static uint64_t gScanoutLatch, gScanoutHoldLongest, gScanoutWaitLongest;   /* when the shown one latched; longest hold and flush wait (absolute time) */
 
 struct panel_scan {
 	bool            ok;
@@ -1781,14 +1777,7 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 		__asm__ volatile ("dc cvac, %0" : : "r" (line) : "memory");
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
-	uint64_t flushBegan = mach_absolute_time();
-	bool taken = hakios_display_scanout_show(s->scanoutAddr, s->info.bytesPerRow, s->info.width, s->info.height);
-	uint64_t latched = mach_absolute_time();
-
-	if (latched - flushBegan > gScanoutWaitLongest) {
-		gScanoutWaitLongest = latched - flushBegan;
-	}
-	if (!taken) {
+	if (!hakios_display_scanout_show(s->scanoutAddr, s->info.bytesPerRow, s->info.width, s->info.height)) {
 		gScanoutGaveUp = true;
 		scanoutRelease();
 		IOLog("MiniIOMobileFramebuffer: fb_scanout: the display did not take a frame: frames are copied from now on\n");
@@ -1805,12 +1794,7 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 	gScanoutHeld = MiniIOSurfaceCopy(s->sid);
 	if (previous != NULL) {
 		MiniIOSurfaceDrop(previous);
-		if (gScanoutLatch != 0 && latched - gScanoutLatch > gScanoutHoldLongest) {
-			gScanoutHoldLongest = latched - gScanoutLatch;
-		}
 	}
-	gScanoutLatch = latched;
-	gScanoutFlips++;
 	gScanoutFrames++;
 	return true;
 }
@@ -2088,25 +2072,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 * Only now is the frame in the panel's memory: the swap after it may be handed over. Given back any
 	 * earlier, the window server would draw a frame more ahead of the panel than fb_queue says.
 	 */
-	/*
-	 * fb_scanout: the display reads the surface of a frame until the next frame's flush has latched, so that frame's swap is
-	 * completed only then (here, for the frame before it): handed back earlier, the window server would draw into a surface that
-	 * is on the panel. A frame that is copied (or the first after a pause in scan-out) completes the one pending too.
-	 */
-	unsigned completed = 1;
-
-	if (direct) {
-		completed = gScanoutPending ? 1 : 0;
-		gScanoutDeferred += completed;
-	} else if (gScanoutPending) {
-		completed = 2;
-	}
 	IOLockLock(fSwapLock);
-	gScanoutPending = direct;
-	for (; completed != 0; completed--) {
-		fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
-		fSwapsWaiting--;
-	}
+	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
+	fSwapsWaiting--;
 	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 	IOLockUnlock(fSwapLock);
 	drawn = mach_absolute_time();
@@ -2156,11 +2124,6 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			IOLog("MiniIOMobileFramebuffer: fb_scanout=%u: %u frames fetched by the display itself, %u copied%s\n", gScanout,
 			    gScanoutFrames, gScanoutCopied, gScanoutGaveUp ? " (the display did not take a frame: off)" : "");
 			gScanoutFrames = gScanoutCopied = 0;
-			IOLog("MiniIOMobileFramebuffer: fb_scanout: %u flips, held %u surfaces (swaps completed after the next latched), "
-			    "longest hold %llu us, longest flush wait %llu us\n", gScanoutFlips, gScanoutDeferred,
-			    micros(gScanoutHoldLongest), micros(gScanoutWaitLongest));
-			gScanoutFlips = gScanoutDeferred = 0;
-			gScanoutHoldLongest = gScanoutWaitLongest = 0;
 		}
 		fStatSwapsLate = fStatStale = fStatStaleShown = 0;
 		/*
