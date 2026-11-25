@@ -396,8 +396,13 @@ surfaceMemory(vm_size_t bytes, bool contiguous)
  * asks for again (a big picture made once) once stayed there for good, and then no frame's memory
  * was kept any more -- each made afresh and freed (2 to 4 ms, and 1 to 2) instead of 0.3 and 0.05.
  */
+#define SUSPECTS 64
+static struct { IOBufferMemoryDescriptor * memory; uint64_t since; uint32_t sid; } gSuspects[SUSPECTS];
+static IOLock * gSuspectLock;
+static uint32_t gSuspectsTaken;
+
 static void
-surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
+surfaceMemoryBack(IOBufferMemoryDescriptor * memory, uint32_t sid)
 {
 	IOBufferMemoryDescriptor * evicted = NULL;
 
@@ -444,7 +449,61 @@ surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
 			return;
 		}
 	}
+	if (memory->getCapacity() >= SURFACE_KEEP_FROM && gSuspectLock != NULL) {
+		/* somebody else still holds the memory of a surface that is going: kept in sight (a reference of ours) until it is the
+		 * only one left, and said in the 5 s line meanwhile, so a holder that never lets go is named by how many it is */
+		IOLockLock(gSuspectLock);
+		for (unsigned i = 0; i < SUSPECTS; i++) {
+			if (gSuspects[i].memory == NULL) {
+				memory->retain();
+				gSuspects[i].memory = memory;
+				gSuspects[i].since = mach_absolute_time();
+				gSuspects[i].sid = sid;
+				gSuspectsTaken++;
+				break;
+			}
+		}
+		IOLockUnlock(gSuspectLock);
+	}
 	memory->release();
+}
+
+/* The 5 s line's part about them; those nobody else holds any more are let go (and freed). */
+extern "C" void
+MiniIOSurfaceSuspects(char * buf, size_t len)
+{
+	size_t at = 0;
+	unsigned live = 0, freed = 0;
+
+	if (gSuspectLock == NULL || len == 0) {
+		return;
+	}
+	buf[0] = 0;
+	IOLockLock(gSuspectLock);
+	for (unsigned i = 0; i < SUSPECTS; i++) {
+		IOBufferMemoryDescriptor * m = gSuspects[i].memory;
+
+		if (m == NULL) {
+			continue;
+		}
+		int others = m->getRetainCount() - 1;
+
+		if (others <= 0) {
+			gSuspects[i].memory = NULL;
+			freed++;
+			m->release();
+		} else {
+			uint64_t ns;
+
+			absolutetime_to_nanoseconds(mach_absolute_time() - gSuspects[i].since, &ns);
+			live++;
+			if (at + 40 < len && live <= 6) {
+				at += (size_t) snprintf(buf + at, len - at, " s%u:%d holders,%llus", gSuspects[i].sid, others, ns / NSEC_PER_SEC);
+			}
+		}
+	}
+	IOLockUnlock(gSuspectLock);
+	snprintf(buf + at, len - at, " [%u let go of now, %u held, %u taken in all]", freed, live, gSuspectsTaken);
 }
 
 void
@@ -479,7 +538,7 @@ MiniIOSurface::free(void)
 		OSDecrementAtomic(&gScanoutLive);
 	}
 	if (memory != NULL) {
-		surfaceMemoryBack(memory);
+		surfaceMemoryBack(memory, sid);
 		memory = NULL;
 	}
 	OSObject::free();
@@ -1289,6 +1348,7 @@ MiniIOSurfaceStart(IOService * provider)
 
 	gSurfaceLock = IOLockAlloc();
 	gSurfaceKeptLock = IOLockAlloc();
+	gSuspectLock = IOLockAlloc();
 	gEventLock = IOLockAlloc();
 	if (!PE_parse_boot_arg_str("surftrace_of", gSurfaceTraceOf, sizeof(gSurfaceTraceOf))) {
 		gSurfaceTraceOf[0] = 0;

@@ -83,6 +83,7 @@ hakios_alloc_note(const char * who, uint32_t selector, int64_t delta)
 	}
 }
 
+extern "C" void MiniIOSurfaceSuspects(char * buf, size_t len);
 extern "C" void MiniIOSurfaceExtra(uint64_t * snapshots, uint64_t * held, uint64_t * kept);
 /* The 5 s `memtop` lines: how many of the IOKit objects that hold memory there are alive, and what of it our own drivers know of
  * (the IOKit tag's total is in the memtags line; what is neither here nor in the GPU and surface figures is somebody else's) */
@@ -126,6 +127,12 @@ hakios_iokit_line(char * buf, size_t len)
 			    gAllocSites[best].net >> 10, gAllocSites[best].calls);
 		}
 		at += (size_t) snprintf(buf + at, len - at, "]");
+	}
+	{
+		char held[200] = "";
+
+		MiniIOSurfaceSuspects(held, sizeof(held));
+		at += (size_t) snprintf(buf + at, len - at, " [surface memory still held after its surface went:%s]", held);
 	}
 	if (gLeakResult[0] > -1000000) {
 		at += (size_t) snprintf(buf + at, len - at, " [leaktest, wired pages left over by 200 buffers: prepare %lld, +kernel map %lld, +flush %lld, prepare+complete %lld]",
