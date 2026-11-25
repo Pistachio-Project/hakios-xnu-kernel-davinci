@@ -522,7 +522,7 @@ void hakios_metal_cb_set_gmem_binning(hakios_metal_cb *cb, int on);
  * tracking of register groups (CommandBuffer::setFullState; boot-arg metal_full_state=1): the debug switch. Same state at every draw. */
 void hakios_metal_cb_set_full_state(hakios_metal_cb *cb, int on);
 /* Which register groups are tracked (CommandBuffer::setDirtyGroups, bit order in render.hpp's Group; boot-arg metal_dirty_groups=MASK): the
- * others are encoded whole every draw. All (0x1ff) by default. */
+ * others are encoded whole every draw; bit 9 also tracks binned GMEM bodies. 0x1ff by default. */
 void hakios_metal_cb_set_dirty_groups(hakios_metal_cb *cb, unsigned mask);
 /* every fragment texture of CB's draws the null texture (CommandBuffer::setNullFsTextures): for measuring only */
 void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb *cb, int on);

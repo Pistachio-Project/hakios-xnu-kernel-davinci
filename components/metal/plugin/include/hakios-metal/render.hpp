@@ -601,6 +601,9 @@ bool encode(pm4::Stream& stream, const Program& program, const RenderPass& pass,
 // A group with its bit clear is encoded whole in the draw's own stream every draw, as before the tracking.
 enum Group : uint32_t { kGroupPass, kGroupConfig, kGroupProgVs, kGroupProgFs, kGroupVfd, kGroupLink, kGroupRast, kGroupViewport, kGroupBlend, kGroupCount };
 constexpr uint32_t kAllGroups = (1u << kGroupCount) - 1;
+// bit 9 of the mask: the bodies of a binned GMEM pass (their draws skipped per tile by visibility) are tracked too; clear by default,
+// those bodies keep every draw's whole state
+constexpr uint32_t kTrackBinned = 1u << kGroupCount;
 class GroupCache {
 public:
     GroupCache() { begin(); }

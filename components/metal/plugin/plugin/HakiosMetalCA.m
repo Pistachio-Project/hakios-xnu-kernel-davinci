@@ -6350,7 +6350,8 @@ hm_full_state(void)
 /*
  * metal_dirty_groups=MASK (decimal or 0x hex): which register groups the per-pass dirty tracking covers, a bit each -- 0 pass (target,
  * MRT, MSAA), 1 config (SP/HLSQ_xS_CONFIG), 2 progVs, 3 progFs, 4 vfd, 5 link (VPC, FS in/out), 6 rast, 7 viewport, 8 blend/depth/stencil;
- * a group with its bit clear is encoded whole every draw. All (0x1ff) when absent; metal_full_state=1 is the same as 0.
+ * a group with its bit clear is encoded whole every draw; bit 9 (0x200) also tracks the bodies of a binned GMEM pass (otherwise they keep
+ * every draw's whole state). 0x1ff when absent; metal_full_state=1 is the same as 0.
  */
 static unsigned
 hm_dirty_groups(void)
@@ -6364,7 +6365,7 @@ hm_dirty_groups(void)
 
 		mask = 0x1ff;
 		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_dirty_groups=")) != NULL) {
-			mask = strtol(at + strlen("metal_dirty_groups="), NULL, 0) & 0x1ff;
+			mask = strtol(at + strlen("metal_dirty_groups="), NULL, 0) & 0x3ff;
 		}
 	}
 	return (unsigned)mask;

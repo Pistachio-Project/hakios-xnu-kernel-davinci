@@ -3360,8 +3360,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         // (a pass whose draws the tiles skip by visibility, binned, keeps the draws' own whole state: what a skipped draw leaves in the
         // registers is not what the next draw's delta assumes)
         const bool binned = gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3;
-        groupsBody->mask = binned ? 0u : dirtyGroups_;
-        groupsSys->mask = dirtyGroups_;
+        groupsBody->mask = binned && !(dirtyGroups_ & render::kTrackBinned) ? 0u : dirtyGroups_ & render::kAllGroups;
+        groupsSys->mask = dirtyGroups_ & render::kAllGroups;
         groupsBody->setProgramKey(key, keyBytes, &program.vs, &program.fs, sizeof(Stage));
         if (dual || (joins && open_->dual)) {
             groupsSys->begin();

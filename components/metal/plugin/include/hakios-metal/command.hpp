@@ -215,7 +215,7 @@ public:
     void setFullState(bool on) { fullState_ = on; }
     // which register groups are tracked (render::Group's bits, render.hpp): a group with its bit clear is encoded whole every draw, as
     // with setFullState; boot-arg metal_dirty_groups=MASK, for bisecting on the phone. All by default.
-    void setDirtyGroups(uint32_t mask) { dirtyGroups_ = mask & render::kAllGroups; }
+    void setDirtyGroups(uint32_t mask) { dirtyGroups_ = mask & (render::kAllGroups | render::kTrackBinned); }
     // why the last pass that could not be drawn in GMEM was not (gmemPlan's or gmemDrawOk's reason), empty when none was refused
     const std::string& gmemRefusal() const { return gmemWhy_; }
     // the words recorded so far (what the command processor will read)

@@ -123,7 +123,7 @@ bool envFullState() {
 uint32_t envDirtyGroups() {
     static const uint32_t mask = [] {
         const char* e = getenv("HAKIOS_METAL_DIRTY_GROUPS");
-        return e == nullptr || e[0] == 0 ? render::kAllGroups : uint32_t(strtoul(e, nullptr, 0)) & render::kAllGroups;
+        return e == nullptr || e[0] == 0 ? render::kAllGroups : uint32_t(strtoul(e, nullptr, 0)) & (render::kAllGroups | render::kTrackBinned);
     }();
     return mask;
 }
