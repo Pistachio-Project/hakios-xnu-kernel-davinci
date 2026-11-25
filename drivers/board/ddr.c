@@ -13,6 +13,7 @@
  * Layouts: Linux drivers/soc/qcom/cmd-db.c, rpmh-rsc.c, drivers/interconnect/qcom/bcm-voter.c.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
@@ -183,6 +184,15 @@ ddr_vote(uint32_t vote)
 	return ddr_rpmh_send(address, data, 3);
 }
 
+#define PM_DDR_LEVELS           3
+#define PM_DDR_DOWN_LOOKS       25
+static uint32_t pm_ddr, pm_ddr_vote[PM_DDR_LEVELS] = { 2048, 8192, 0x3fff };
+static uint32_t pm_ddr_level = PM_DDR_LEVELS - 1, pm_ddr_quiet, pm_ddr_changes, pm_ddr_failed;
+static uint64_t pm_ddr_at, pm_ddr_ticks[PM_DDR_LEVELS], pm_ddr_said;
+static bool pm_ddr_screen_off;
+static LCK_GRP_DECLARE(pm_ddr_lock_group, "hakios-ddr-pm");
+static LCK_MTX_DECLARE(pm_ddr_lock, &pm_ddr_lock_group);
+
 static void
 ddr_raise(void)
 {
@@ -206,8 +216,124 @@ ddr_raise(void)
 	 * like one that was answered (else the loader and the next kernel run with the memory at its top)
 	 */
 	ddr_voted = problem == NULL || strcmp(problem, RPMH_SAYS_NO_ANSWER) == 0;     /* (the words, not where they are) */
+	PE_parse_boot_argn("pm_ddr", &pm_ddr, sizeof(pm_ddr));
+	PE_parse_boot_argn("pm_ddr_lo", &pm_ddr_vote[0], sizeof(uint32_t));
+	PE_parse_boot_argn("pm_ddr_mid", &pm_ddr_vote[1], sizeof(uint32_t));
+	PE_parse_boot_argn("pm_ddr_hi", &pm_ddr_vote[2], sizeof(uint32_t));
+	for (unsigned i = 0; i < PM_DDR_LEVELS; i++) {
+		pm_ddr_vote[i] = MIN(MAX(pm_ddr_vote[i], 4u), 0x3fffu);
+	}
 	tell("ddr: memory bandwidth vote %u on MC0 (%#x) and SH0 (%#x)%s\n", vote, ddr_mc0, ddr_sh0,
 	    problem == NULL ? "" : ddr_voted ? ": FAILED, or perhaps not: given back at the run's end all the same" : ": FAILED");
+}
+
+/*
+ * POWER MANAGEMENT, phase 3 (boot-arg pm_ddr=1; default 0: the vote above stays where it was put): the memory's vote by the load, the
+ * way Android's cpubw and gpubw devfreq governors scale it, from what this kernel can see without a bandwidth counter of its own: the
+ * cores' load, the touch screen, and whether the GPU was given work lately. Three levels, from the table below (boot-args pm_ddr_lo=,
+ * pm_ddr_mid=, pm_ddr_hi=):
+ *
+ *   hi    a touch in the last 500 ms, a GPU submission in the last 100 ms, or a big core over 60% busy: the most, as before
+ *   mid   the cores' mean load over 15%
+ *   lo    otherwise (the display being scanned out and the radios fit in it)
+ *
+ * Up at once, down only after PM_DOWN_LOOKS quiet looks (the park thread's, 8 ms: 200 ms). The units of a vote are the BCM's, which
+ * this tree cannot convert to a bandwidth (the logs say a vote of 4 to 4096 measured the same as the loader's own, 12 GB/s writing,
+ * and the most 15.4): so `lo' is a vote in that range, below which nothing was measured, never the "no request" that left the
+ * memory at its floor (0.2 GB/s: the panel's scanout would not be sure of its frames). Every 5 s a line "pm: ddr" with the time
+ * at each level, how many times the vote changed and how many requests RPMh did not take. With the screen off (pm_screen=1,
+ * hakios_ddr_pm_screen()) the level is lo whatever the load; lit again, hi at once.
+ */
+bool hakios_ddr_pm_on(void);
+bool
+hakios_ddr_pm_on(void)
+{
+	return pm_ddr != 0 && ddr_voted;
+}
+
+static void
+pm_ddr_set(uint32_t level, uint64_t now)
+{
+	const char *problem;
+
+	pm_ddr_ticks[pm_ddr_level] += now - pm_ddr_at;
+	pm_ddr_at = now;
+	if (level == pm_ddr_level) {
+		return;
+	}
+	hakios_rpmh_lock();
+	problem = ddr_vote(pm_ddr_vote[level]);
+	hakios_rpmh_unlock();
+	if (problem != NULL && strcmp(problem, RPMH_SAYS_NO_ANSWER) != 0) {
+		pm_ddr_failed++;
+		return;                         /* (the level stays: asked again at the next look that wants it) */
+	}
+	pm_ddr_level = level;
+	pm_ddr_changes++;
+}
+
+/* A look of the park thread (cpufreq.c): MEAN and BIG are the cores' and the big cores' busiest load in percent. */
+void hakios_ddr_pm_look(uint32_t mean, uint32_t big, bool touch, bool gpu);
+void
+hakios_ddr_pm_look(uint32_t mean, uint32_t big, bool touch, bool gpu)
+{
+	uint64_t now = mach_absolute_time(), span;
+	uint32_t want;
+
+	if (!hakios_ddr_pm_on()) {
+		return;
+	}
+	lck_mtx_lock(&pm_ddr_lock);
+	if (pm_ddr_at == 0) {
+		pm_ddr_at = pm_ddr_said = now;
+	}
+	if (pm_ddr_screen_off) {
+		want = 0;
+	} else if (touch || gpu || big > 60) {
+		want = 2;
+	} else if (mean > 15) {
+		want = 1;
+	} else {
+		want = 0;
+	}
+	if (want >= pm_ddr_level) {
+		pm_ddr_quiet = 0;
+		pm_ddr_set(want, now);
+	} else if (pm_ddr_screen_off || ++pm_ddr_quiet >= PM_DDR_DOWN_LOOKS) {
+		pm_ddr_quiet = 0;
+		pm_ddr_set(want, now);
+	} else {
+		pm_ddr_set(pm_ddr_level, now);
+	}
+	nanoseconds_to_absolutetime(5 * NSEC_PER_SEC, &span);
+	if (now - pm_ddr_said >= span) {
+		uint64_t total = 0;
+
+		for (unsigned i = 0; i < PM_DDR_LEVELS; i++) {
+			total += pm_ddr_ticks[i];
+		}
+		tell("pm: ddr: vote %u %llu%%, %u %llu%%, %u %llu%% of the time; %u changes, %u refused by RPMh; now %u\n", pm_ddr_vote[0],
+		    total ? 100 * pm_ddr_ticks[0] / total : 0, pm_ddr_vote[1], total ? 100 * pm_ddr_ticks[1] / total : 0, pm_ddr_vote[2],
+		    total ? 100 * pm_ddr_ticks[2] / total : 0, pm_ddr_changes, pm_ddr_failed, pm_ddr_vote[pm_ddr_level]);
+		memset(pm_ddr_ticks, 0, sizeof(pm_ddr_ticks));
+		pm_ddr_changes = pm_ddr_failed = 0;
+		pm_ddr_said = now;
+	}
+	lck_mtx_unlock(&pm_ddr_lock);
+}
+
+/* the display's state (cpufreq.c hakios_pm_screen()): dark, the lowest level; lit, the highest at once */
+void hakios_ddr_pm_screen(bool off);
+void
+hakios_ddr_pm_screen(bool off)
+{
+	lck_mtx_lock(&pm_ddr_lock);
+	pm_ddr_screen_off = off;
+	if (hakios_ddr_pm_on()) {
+		pm_ddr_quiet = 0;
+		pm_ddr_set(off ? 0 : PM_DDR_LEVELS - 1, mach_absolute_time());
+	}
+	lck_mtx_unlock(&pm_ddr_lock);
 }
 
 /* On the way back to the loader (osfmk/arm64/loader_return.c: loader_return(), whatever the reason; the other processors are stopped) */

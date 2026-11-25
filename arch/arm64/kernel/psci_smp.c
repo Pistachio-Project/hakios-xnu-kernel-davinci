@@ -128,6 +128,29 @@ psci_call(uint64_t function, uint64_t arg1, uint64_t arg2, uint64_t arg3)
 	return (int64_t)x0;
 }
 
+/*
+ * CPU_SUSPEND (pm_idle, arch/arm64/kernel/cpu_idle.c): the calling core asks the firmware for a low-power state. A power-down state
+ * does not come back here: the core is started again at `entry' (the kernel's reset vector) with `context' in x0; a core that
+ * had an interrupt pending, or a state the firmware does not have, returns at once with the answer.
+ */
+#define PSCI_CPU_SUSPEND_64     0xC4000001u
+#define PSCI_FEATURES           0x8400000Au
+
+int64_t psci_smp_suspend(uint32_t power_state, uint64_t entry, uint64_t context);
+int64_t
+psci_smp_suspend(uint32_t power_state, uint64_t entry, uint64_t context)
+{
+	return psci_call(PSCI_CPU_SUSPEND_64, power_state, entry, context);
+}
+
+/* PSCI_FEATURES for a function (0 or more: it is there; negative: not implemented) */
+int64_t psci_smp_feature(uint32_t function);
+int64_t
+psci_smp_feature(uint32_t function)
+{
+	return psci_call(PSCI_FEATURES, function, 0, 0);
+}
+
 static const char *
 psci_error(int64_t status)
 {

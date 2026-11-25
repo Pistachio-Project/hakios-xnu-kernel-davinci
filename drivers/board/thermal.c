@@ -70,6 +70,7 @@
 #include "log.h"
 
 extern void hakios_backlight_set_cap(uint32_t level);
+extern bool hakios_cpufreq_pm_cap(uint32_t domain, uint32_t row);
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 extern uint32_t hakios_adreno_core_mhz(void);
 extern bool hakios_adreno_cap_range(uint32_t *lowest, uint32_t *top);
@@ -297,7 +298,10 @@ apply(uint32_t s)
 				row_now[d] = row;
 			}
 		} else if (epss[d] != 0 && row != row_now[d]) {
-			apply_row(d, row);
+			/* (pm_gov=1: the load governor of cpufreq.c writes the rows, this one's is the most it may ask) */
+			if (!hakios_cpufreq_pm_cap(d, row)) {
+				apply_row(d, row);
+			}
 			row_now[d] = row;
 		}
 	}
