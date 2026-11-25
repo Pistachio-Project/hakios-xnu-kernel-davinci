@@ -141,6 +141,7 @@ extern uint64_t get_task_phys_footprint(task_t);
 extern uint64_t get_task_compressed(task_t);
 extern uint64_t get_task_wired_mem(task_t);
 extern void hakios_memtop_line(char *buf, size_t len);
+extern void hakios_iokit_line(char *buf, size_t len);
 
 static int
 memtop_one(proc_t p, void *arg __unused)
@@ -196,10 +197,10 @@ memtop_tags(void)
 {
 	uint32_t n = vm_page_diagnose_estimate() + 64;
 	mach_memory_info_t *info = kalloc_data(n * sizeof(*info), Z_WAITOK | Z_ZERO);
-	static char line[400];
+	static char line[640];
 	int at = 0;
 	uint64_t total = 0;
-	struct { uint64_t size; char name[32]; uint32_t tag; } top[6] = { { 0 } };
+	struct { uint64_t size; char name[32]; uint32_t tag; } top[8] = { { 0 } };
 
 	if (info == NULL) {
 		return;
@@ -213,13 +214,13 @@ memtop_tags(void)
 				continue;
 			}
 			total += info[i].size;
-			uint32_t at_i = 6;
+			uint32_t at_i = 8;
 
 			while (at_i > 0 && info[i].size > top[at_i - 1].size) {
 				at_i--;
 			}
-			if (at_i < 6) {
-				for (uint32_t j = 5; j > at_i; j--) {
+			if (at_i < 8) {
+				for (uint32_t j = 7; j > at_i; j--) {
 					top[j] = top[j - 1];
 				}
 				top[at_i].size = info[i].size;
@@ -228,10 +229,10 @@ memtop_tags(void)
 			}
 		}
 		at = snprintf(line, sizeof(line), "memtags: all tagged allocations %llu MB; biggest:", total >> 20);
-		for (uint32_t i = 0; i < 6 && top[i].size != 0 && at < (int)sizeof(line) - 1; i++) {
+		for (uint32_t i = 0; i < 8 && top[i].size != 0 && at < (int)sizeof(line) - 1; i++) {
 			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s(tag %u) %llu", top[i].name, top[i].tag, top[i].size >> 20);
 		}
-		hakios_tl("%s\n", line);
+		printf("%s\n", line);
 	}
 	kfree_data(info, n * sizeof(*info));
 }
@@ -239,7 +240,7 @@ memtop_tags(void)
 static void
 memtop_thread(void *arg __unused, wait_result_t w __unused)
 {
-	static char line[640];
+	static char line[1024];
 
 	for (;;) {
 		int at;
@@ -260,7 +261,9 @@ memtop_thread(void *arg __unused, wait_result_t w __unused)
 			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s[%d] %llu", memtop_wired[i].name, memtop_wired[i].pid,
 			    memtop_wired[i].wired >> 20);
 		}
-		hakios_tl("%s\n", line);
+		printf("%s\n", line);
+		hakios_iokit_line(line, sizeof(line));
+		printf("%s\n", line);
 		memtop_tags();
 	}
 }

@@ -102,6 +102,7 @@ static MiniIOSurface *  gSurfaceTable[MINISURF_TABLE_SIZE];     /* index = surfa
 static uint32_t         gSurfaceNext = 1;
 static uint32_t         gSurfaceCount;
 static uint64_t         gSurfaceBytes;
+static int64_t          gSnapshotBytes, gClientHeldBytes;       /* (memtop: wired memory of surfaces made around a program's memory, beside gSurfaceBytes) */
 static uint32_t         gSurfaceUnheld;         /* surfaces around client memory that could not be made (said a few times) */
 /* what making surfaces and taking them away has cost since it was last asked (MiniIOSurfaceCost()) */
 static uint64_t         gSurfaceMaking, gSurfaceFreeing;
@@ -463,9 +464,13 @@ MiniIOSurface::free(void)
 	}
 
 	OSSafeReleaseNULL(values);
+	if (snapshot != NULL) {
+		gSnapshotBytes -= (int64_t) snapshot->getCapacity();
+	}
 	OSSafeReleaseNULL(snapshot);
 	OSSafeReleaseNULL(clientMap);
 	if (client != NULL) {
+		gClientHeldBytes -= (int64_t) info.allocSize;
 		client->complete();
 		client->release();
 		client = NULL;
@@ -902,6 +907,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 			s->clientReadOnly = attempt != 0;
 		}
 		if (held == kIOReturnSuccess) {
+			gClientHeldBytes += (int64_t) alloc;
 			s->clientMap = s->client->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly);
 		} else {
 			OSSafeReleaseNULL(s->client);
@@ -922,6 +928,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache,
 		    (vm_size_t) round_page_64((uint64_t) alloc + 4 * (uint64_t) bpr) + PAGE_SIZE, PAGE_SIZE);
 		if (s->snapshot != NULL) {
+			gSnapshotBytes += (int64_t) s->snapshot->getCapacity();
 			memcpy(s->snapshot->getBytesNoCopy(), s->kpixels, alloc);
 			s->snapshotSeed = s->shared()->seed;
 		}
@@ -1036,6 +1043,23 @@ MiniIOSurfaceCopy(uint32_t sid)
 	}
 	IOLockUnlock(gSurfaceLock);
 	return s;
+}
+
+/* memtop: wired memory a surface holds besides its own (copies of a program's pixels, the program's pages held) and kept pieces */
+extern "C" void
+MiniIOSurfaceExtra(uint64_t * snapshots, uint64_t * held, uint64_t * kept)
+{
+	uint64_t k = 0;
+
+	*snapshots = gSnapshotBytes > 0 ? (uint64_t) gSnapshotBytes : 0;
+	*held = gClientHeldBytes > 0 ? (uint64_t) gClientHeldBytes : 0;
+	for (unsigned i = 0; i < SURFACE_KEPT; i++) {
+		k += gSurfaceKept[i].memory != NULL ? gSurfaceKept[i].memory->getCapacity() : 0;
+	}
+	for (unsigned i = 0; i < SCANOUT_SURFACES; i++) {
+		k += gScanoutPool[i].memory != NULL ? gScanoutPool[i].memory->getCapacity() : 0;
+	}
+	*kept = k;
 }
 
 /* How many surfaces there are and how much (wired) memory they hold: for the kernel's memory report. */

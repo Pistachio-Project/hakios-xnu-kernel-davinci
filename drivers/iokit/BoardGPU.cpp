@@ -49,6 +49,34 @@ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" unsigned int vm_page_free_count, vm_page_wire_count;
 /* every client's buffers together (the 5 s line "gpu memory"): what the GPU's clients hold in the kernel, wired and kept, against the pages left */
 static int64_t gAllBuffers, gAllBufferBytes, gAllKeptBytes;
+static int64_t gLeftBytes, gStuckBytes;   /* (memtop: given back while the GPU was busy; kept for good because the GPU could not be shown to be done) */
+extern "C" void MiniIOSurfaceExtra(uint64_t * snapshots, uint64_t * held, uint64_t * kept);
+/* The 5 s `memtop` lines: how many of the IOKit objects that hold memory there are alive, and what of it our own drivers know of
+ * (the IOKit tag's total is in the memtags line; what is neither here nor in the GPU and surface figures is somebody else's) */
+extern "C" void
+hakios_iokit_line(char * buf, size_t len)
+{
+	static const char * const names[] = { "IOBufferMemoryDescriptor", "IOGeneralMemoryDescriptor", "IOSubMemoryDescriptor",
+		                              "IOMemoryMap", "MiniIOSurface", "IOSurfaceRootUserClient", "HakiosGPUUserClient" };
+	static const char * const shown[] = { "IOBMD", "IOGenMD", "IOSubMD", "IOMap", "surfaces", "IOSurfClients", "GPUClients" };
+	uint64_t snap = 0, held = 0, kept = 0;
+	size_t at;
+
+	MiniIOSurfaceExtra(&snap, &held, &kept);
+	at = (size_t) snprintf(buf, len, "iokit: GPU buffers %lld (%lld MB), kept %lld MB, left %lld MB, stuck %lld MB; surface snapshots %llu MB, "
+	    "client memory held %llu MB, kept pieces %llu MB; live:", gAllBuffers, gAllBufferBytes >> 20, gAllKeptBytes >> 20,
+	    gLeftBytes >> 20, gStuckBytes >> 20, snap >> 20, held >> 20, kept >> 20);
+	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]) && at < len; i++) {
+		const OSSymbol * name = OSSymbol::withCString(names[i]);
+		const OSMetaClass * mc = name != NULL ? OSMetaClass::getMetaClassWithName(name) : NULL;
+
+		if (mc != NULL) {
+			at += (size_t) snprintf(buf + at, len - at, " %s %u", shown[i], mc->getInstanceCount());
+		}
+		OSSafeReleaseNULL(name);
+	}
+}
+
 extern "C" int64_t hakios_gpu_buffer_bytes(void) { return gAllBufferBytes + gAllKeptBytes; }   /* (memtop: the GPU's wired buffers, kept ones too, all clients) */
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
@@ -894,6 +922,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 		struct gpu_left * left = &fLeft[fLeftCount++];
 
 		left->memory = b->memory;
+		gLeftBytes += (int64_t) b->size;
 		left->map = b->map;
 		left->surface = b->surface;
 		left->client = b->client;
@@ -912,6 +941,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 			 * pages go
 			 */
 			b->memory->retain();
+			gStuckBytes += (int64_t) b->size;
 			if (b->surface != NULL) {
 				b->surface->retain();
 			}
@@ -925,7 +955,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 			if (hakios_gpu_unmap(b->address, b->size)) {
 				hakios_gpu_address_free(b->address, b->size);
 			} else {
-				if (b->memory != NULL) b->memory->retain();    /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
+				if (b->memory != NULL) { gStuckBytes += (int64_t) b->size; b->memory->retain(); }    /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
 			}
 		}
 		if (b->map != NULL) {
@@ -958,7 +988,7 @@ HakiosGPUUserClient::reap(void)
 			if (hakios_gpu_unmap(left->address, left->size)) {
 				hakios_gpu_address_free(left->address, left->size);
 			} else {
-				if (left->memory != NULL) left->memory->retain(); /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
+				if (left->memory != NULL) { gStuckBytes += (int64_t) left->size; left->memory->retain(); } /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
 			}
 		}
 		if (left->map != NULL) {
@@ -970,6 +1000,7 @@ HakiosGPUUserClient::reap(void)
 		if (left->surface != NULL) {
 			MiniIOSurfaceDrop(left->surface);
 		}
+		gLeftBytes -= (int64_t) left->size;
 		*left = fLeft[--fLeftCount];
 	}
 }
@@ -1156,6 +1187,7 @@ HakiosGPUUserClient::dropKept(struct gpu_kept * k)
 		if (hakios_gpu_unmap(k->address, k->size)) {
 			hakios_gpu_address_free(k->address, k->size);
 		} else {
+			gStuckBytes += (int64_t) k->size;
 			k->memory->retain();    /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
 		}
 	}
