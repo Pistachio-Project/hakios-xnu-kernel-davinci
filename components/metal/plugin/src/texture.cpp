@@ -478,7 +478,7 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
             refuse(why, "no UBWC layout for a " + n(desc.width) + " x " + n(desc.height) + " texture on this chip");
             return nullptr;
         }
-        std::shared_ptr<Buffer> buffer = newBuffer(gpu, l.size, why);
+        std::shared_ptr<Buffer> buffer = newBuffer(gpu, l.size, why, true);
         if (buffer == nullptr) return nullptr;
         // The flag buffer zeroed before the GPU first reads or writes the texture. Gallium's freedreno clears the flags
         // of every UBWC resource it allocates before the first write (freedreno_resource.c:213-222, needs_ubwc_clear;
@@ -510,7 +510,7 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         return nullptr;
 #endif
     }
-    std::shared_ptr<Buffer> buffer = newBuffer(gpu, bytes, why);
+    std::shared_ptr<Buffer> buffer = newBuffer(gpu, bytes, why, true);   // (a texture's memory is not promised zeroed: recycled, see Gpu::recycleBo)
     if (buffer == nullptr) {
         return nullptr;
     }

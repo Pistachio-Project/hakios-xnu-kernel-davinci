@@ -1336,3 +1336,20 @@ TEST(a_stencil_view_reads_the_s8_plane) {
     auto depthOnly = Texture::make(r.gpu, z, &why);
     CHECK(depthOnly != nullptr && Texture::view(depthOnly, PixelFormat::kX32Stencil8, TextureType::k2D, 0, 1, 0, 1, &why) == nullptr);
 }
+
+// a texture's memory given back is the next one's of its size: made once, found again (Gpu::recycleBo), and what the first drew is there
+TEST(a_texture_given_back_is_made_again_from_the_cache) {
+    Rig r;
+    uint64_t before = r.gpu.recycleStats(true).hits;
+    (void)before;
+    {
+        auto t = make(r, PixelFormat::kRGBA8Unorm, 128, 128);   // 64 KB
+        (void)t;
+    }
+    CHECK(r.gpu.recycleStats(false).cachedBytes >= (64u << 10));
+    auto again = make(r, PixelFormat::kRGBA8Unorm, 128, 128);
+    const Gpu::RecycleStats s = r.gpu.recycleStats(false);
+    CHECK(s.hits == 1);
+    CHECK(s.cachedBytes == 0);
+    CHECK(again != nullptr);
+}

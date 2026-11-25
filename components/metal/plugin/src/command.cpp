@@ -61,17 +61,19 @@ std::atomic<uint64_t> gBytesMade{0};
 std::atomic<uint32_t> gPrefilled{0}, gRefilled{0};
 std::atomic<uint32_t> gPoolGiven{0}, gPoolShared{0}, gPoolFull{0}, gBigMade{0};
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why) {
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, bool recycle) {
     gBuffersMade++;
     gBytesMade += length;
     if (length >= (1u << 20)) gBigMade++;
     int error = 0;
-    std::unique_ptr<Bo> bo = gpu.newBo(length, kBoWriteCombined, &error);
+    std::unique_ptr<Bo> bo = recycle ? gpu.newBoRecycled(length, kBoWriteCombined, &error) : gpu.newBo(length, kBoWriteCombined, &error);
     if (bo == nullptr) {
         *why = "the driver gave no buffer of " + std::to_string(length) + " bytes: " + strerror(error);
         return nullptr;
     }
-    return addressed(new Buffer(std::move(bo), length));
+    Buffer* raw = new Buffer(std::move(bo), length);
+    if (recycle) raw->setRecyclable();
+    return addressed(raw);
 }
 
 namespace {

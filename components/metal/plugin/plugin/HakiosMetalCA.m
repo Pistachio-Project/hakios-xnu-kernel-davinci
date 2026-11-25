@@ -2545,6 +2545,7 @@ hm_own_cache_dir(const char *dir)
 		}
 	}
 	setenv("HAKIOS_METAL_LISTING", "0", 0);
+	if (hm_boot_arg_set("metal_tex_pool=0")) setenv("HAKIOS_METAL_TEXPOOL_MB", "0", 1);
 	/* (on unless boot-arg metal_pool_prefill=0. It was off for one run, after a panic in vm_purgeable_object_remove that the pool
 	 * was suspected of; the modem's RMTFS buffer DMAing into kernel RAM (09576816) explains it. Heavy windows of the run before
 	 * made 100 to 335 buffers each -- 20 to 100 MB of fresh write-combined memory in draw calls -- and the core's time in
@@ -6991,6 +6992,14 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 "%u given up and kept, %u freed\n", made, bytes >> 10, reused, hm_memoryless_stat.made, hm_memoryless_stat.again,
 				 hm_memoryless_stat.kept, hm_memoryless_stat.freed);
 			memset(&hm_memoryless_stat, 0, sizeof(hm_memoryless_stat));
+			{
+				unsigned long long hits, misses, trimmed, cachedKb;
+
+				hakios_metal_texture_pool_counts(&hits, &misses, &trimmed, &cachedKb);
+				hm_print("fps: ... texture memory cache (metal_tex_pool=0 turns it off; HAKIOS_METAL_TEXPOOL_MB 256, kept %d s): %llu textures "
+					 "given memory that came back, %llu made afresh (a kernel call each), %llu let go, %llu KB held\n", 4, hits, misses,
+					 trimmed, cachedKb);
+			}
 			{
 				unsigned idles, flushes, waits;
 

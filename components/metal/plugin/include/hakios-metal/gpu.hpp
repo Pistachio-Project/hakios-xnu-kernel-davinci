@@ -12,6 +12,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -123,6 +125,7 @@ std::unique_ptr<Transport> openKernelGpu(std::string* why);
 // --- the GPU --------------------------------------------------------------------------------------------------------
 
 class Gpu;
+extern std::atomic<uint64_t> gRecycleHits, gRecycleMisses, gRecycleTrimmed, gRecycleCached;
 
 // One GEM object. It is the GPU's for as long as it lives; the destructor gives it back.
 class Bo {
@@ -135,6 +138,7 @@ public:
     uint64_t size() const { return size_; }
     uint64_t gpuAddress() const { return iova_; }
     void* cpu() const { return cpu_; }      // write-combined: write it in order, read it rarely
+    Gpu& gpu() const { return gpu_; }
 
 private:
     friend class Gpu;
@@ -145,6 +149,7 @@ private:
     uint64_t size_;
     uint64_t iova_;
     void* cpu_;
+    uint32_t flags_ = 0;
     bool owned_ = true;   // false: another Bo owns the handle (Gpu::disown)
     bool counted_ = false;   // in Gpu::allocatedBytes: memory this driver asked for (not an IOSurface's)
 };
@@ -187,6 +192,15 @@ public:
 
     // a buffer of SIZE bytes (rounded up to a page), its GPU address and its mapping; nullptr with *error set
     std::unique_ptr<Bo> newBo(uint64_t size, uint32_t flags, int* error);
+    // newBo, but from the Bos given back to recycleBo when one of this size and kind is there (not cleared: what the last owner
+    // wrote is in it, as the kernel's own kept buffers are given again), and made as newBo does when not
+    std::unique_ptr<Bo> newBoRecycled(uint64_t size, uint32_t flags, int* error);
+    // BO for the next newBoRecycled of its size, kept at most HAKIOS_METAL_TEXPOOL_MB (256; 0: none kept) and none for more than
+    // HAKIOS_METAL_TEXPOOL_SECONDS (4) -- CoreAnimation makes a texture for a blur or a backdrop each frame and lets it go
+    // a few frames later, each made fresh 0.4 to 1.5 ms in the kernel (the 5 s line of HakiosGPU) in the window server's frame
+    void recycleBo(std::unique_ptr<Bo> bo);
+    struct RecycleStats { uint64_t hits, misses, trimmed, cachedBytes; };
+    RecycleStats recycleStats(bool reset);
     // the bytes of every Bo newBo made and that is still the GPU's: MTLDevice's currentAllocatedSize, which a game
     // sizes what it keeps resident by (Resident Evil 4 asks)
     uint64_t allocatedBytes() const { return allocated_.load(std::memory_order_relaxed); }
@@ -232,6 +246,12 @@ private:
     std::condition_variable queuesGone_;
     uint32_t queues_ = 0;   // (under queuesLock_) QueueHolds alive
     std::atomic<uint64_t> allocated_{0};
+    struct Cached { std::unique_ptr<Bo> bo; std::chrono::steady_clock::time_point since; };
+    std::mutex cacheLock_;
+    std::map<std::pair<uint64_t, uint32_t>, std::vector<Cached>> cache_;   // by size and flags
+    uint64_t cachedBytes_ = 0;
+    uint64_t cacheHits_ = 0, cacheMisses_ = 0, cacheTrimmed_ = 0;
+    void trimLocked(std::chrono::steady_clock::time_point now, uint64_t room);
     void release(Bo& bo);
     std::unique_ptr<Transport> t_;
 };

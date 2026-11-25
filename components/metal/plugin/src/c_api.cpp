@@ -227,6 +227,13 @@ void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long 
     *bytes = hakios::metal::gBytesMade.exchange(0);
 }
 
+void hakios_metal_texture_pool_counts(unsigned long long* hits, unsigned long long* misses, unsigned long long* trimmed, unsigned long long* cachedKb) {
+    *hits = hakios::metal::gRecycleHits.exchange(0);
+    *misses = hakios::metal::gRecycleMisses.exchange(0);
+    *trimmed = hakios::metal::gRecycleTrimmed.exchange(0);
+    *cachedKb = hakios::metal::gRecycleCached.load() >> 10;
+}
+
 void hakios_metal_pool_counts(unsigned* given, unsigned* shared, unsigned* full, unsigned* big, unsigned* prefilled, unsigned* refills) {
     *prefilled = hakios::metal::gPrefilled.exchange(0);
     *refills = hakios::metal::gRefilled.exchange(0);
@@ -400,7 +407,7 @@ unsigned hakios_metal_kernel_threadgroup_memory(hakios_metal_kernel* k) { return
 
 hakios_metal_buffer* hakios_metal_buffer_new(hakios_metal_device* d, uint64_t length) {
     std::string why;
-    auto b = newBuffer(*d->gpu, length ? length : 1, &why);
+    auto b = newBuffer(*d->gpu, length ? length : 1, &why);   // (Metal's buffers are given zeroed: not recycled)
     if (b == nullptr) {
         failed(why);
         return nullptr;

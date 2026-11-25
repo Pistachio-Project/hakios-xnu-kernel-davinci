@@ -44,6 +44,14 @@ class Texture;
 class Buffer {
 public:
     Buffer(std::unique_ptr<Bo> bo, uint64_t length) : bo_(std::move(bo)), length_(length) {}
+    ~Buffer() {
+        // a buffer newBuffer made for recycling (not one a program asked for: Metal gives those zeroed) goes to its Gpu's cache
+        if (recyclable_ && bo_ != nullptr) {
+            Gpu& gpu = bo_->gpu();
+            gpu.recycleBo(std::move(bo_));
+        }
+    }
+    void setRecyclable() { recyclable_ = true; }
     uint64_t length() const { return length_; }
     void* contents() const { return bo_->cpu(); }
     uint64_t gpuAddress() const { return bo_->gpuAddress(); }
@@ -53,9 +61,10 @@ public:
 private:
     std::unique_ptr<Bo> bo_;
     uint64_t length_;
+    bool recyclable_ = false;
 };
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why);
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, bool recycle = false);   // RECYCLE: a texture's memory, given back to its Gpu's cache (gpu.hpp: recycleBo) -- not zeroed when it comes again
 // the live Buffer whose memory holds GPU address ADDRESS, and *OFFSET its offset in it; nullptr when none does. An
 // argument buffer names a buffer member by the address it was encoded with (setBuffer:offset:atIndex:, or the
 // gpuAddress an application writes itself), and this is how the draw finds the Buffer to bind and keep.

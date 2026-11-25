@@ -2,6 +2,7 @@
 #include "hakios-metal/pm4.hpp"
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 
 namespace hakios::metal {
@@ -70,6 +71,7 @@ std::unique_ptr<Bo> Gpu::newBo(uint64_t size, uint32_t flags, int* error) {
     }
     std::unique_ptr<Bo> bo(new Bo(*this, n.handle, n.size, info.value, cpu));
     bo->counted_ = true;
+    bo->flags_ = flags;
     allocated_ += n.size;
     return bo;
 }
@@ -125,7 +127,106 @@ void Gpu::release(Bo& bo) {
     t_->call(kGemClose, &c, sizeof(c));
 }
 
+std::atomic<uint64_t> gRecycleHits{0}, gRecycleMisses{0}, gRecycleTrimmed{0}, gRecycleCached{0};   // (c_api.cpp's tally, all Gpus)
+
+namespace {
+uint64_t poolBytes() {
+    static const uint64_t v = [] {
+        const char* e = getenv("HAKIOS_METAL_TEXPOOL_MB");
+        const long mb = e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : 256;
+        return uint64_t(mb < 0 ? 0 : mb) << 20;
+    }();
+    return v;
+}
+std::chrono::seconds poolSeconds() {
+    static const long v = [] {
+        const char* e = getenv("HAKIOS_METAL_TEXPOOL_SECONDS");
+        return e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : 4L;
+    }();
+    return std::chrono::seconds(v);
+}
+}  // namespace
+
+// (under cacheLock_) what is older than the time, then the oldest until ROOM more bytes fit under the cap; the Bos freed
+// here are closed under the lock, which is a kernel call each: few, and only when the cache is full or old
+void Gpu::trimLocked(std::chrono::steady_clock::time_point now, uint64_t room) {
+    for (auto it = cache_.begin(); it != cache_.end();) {
+        auto& v = it->second;
+        while (!v.empty() && now - v.front().since > poolSeconds()) {
+            cachedBytes_ -= v.front().bo->size();
+            v.erase(v.begin());
+            cacheTrimmed_++;
+            gRecycleTrimmed++;
+        }
+        it = v.empty() ? cache_.erase(it) : std::next(it);
+    }
+    while (cachedBytes_ + room > poolBytes() && !cache_.empty()) {
+        auto oldest = cache_.begin();
+        for (auto it = cache_.begin(); it != cache_.end(); ++it) {
+            if (it->second.front().since < oldest->second.front().since) oldest = it;
+        }
+        cachedBytes_ -= oldest->second.front().bo->size();
+        oldest->second.erase(oldest->second.begin());
+        cacheTrimmed_++;
+        gRecycleTrimmed++;
+        if (oldest->second.empty()) cache_.erase(oldest);
+    }
+}
+
+std::unique_ptr<Bo> Gpu::newBoRecycled(uint64_t size, uint32_t flags, int* error) {
+    const uint64_t rounded = (size + kPage - 1) & ~(kPage - 1);
+    if (poolBytes() != 0) {
+        std::lock_guard<std::mutex> g(cacheLock_);
+        auto it = cache_.find({rounded, flags});
+        if (it != cache_.end() && !it->second.empty()) {
+            std::unique_ptr<Bo> bo = std::move(it->second.back().bo);   // (the last given: warmest in the caches)
+            it->second.pop_back();
+            if (it->second.empty()) cache_.erase(it);
+            cachedBytes_ -= bo->size();
+            cacheHits_++;
+            gRecycleHits++;
+            gRecycleCached = cachedBytes_;
+            allocated_ += bo->size_;
+            bo->counted_ = true;
+            *error = 0;
+            return bo;
+        }
+        cacheMisses_++;
+        gRecycleMisses++;
+    }
+    return newBo(size, flags, error);
+}
+
+void Gpu::recycleBo(std::unique_ptr<Bo> bo) {
+    if (bo == nullptr) return;
+    // (only what this driver made and still owns, of a size worth keeping: not a surface's memory, nor a handle another owns)
+    if (poolBytes() == 0 || !bo->owned_ || !bo->counted_ || bo->cpu_ == nullptr || bo->size_ < (64u << 10) || bo->size_ > poolBytes() / 4) return;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> g(cacheLock_);
+    trimLocked(now, bo->size_);
+    allocated_ -= bo->size_;
+    bo->counted_ = false;
+    cachedBytes_ += bo->size_;
+    const std::pair<uint64_t, uint32_t> key{bo->size_, bo->flags_};
+    cache_[key].push_back(Cached{std::move(bo), now});
+    gRecycleCached = cachedBytes_;
+}
+
+Gpu::RecycleStats Gpu::recycleStats(bool reset) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    trimLocked(std::chrono::steady_clock::now(), 0);   // (the time's trim, as the report comes round: an idle process lets go too)
+    gRecycleCached = cachedBytes_;
+    RecycleStats s{cacheHits_, cacheMisses_, cacheTrimmed_, cachedBytes_};
+    if (reset) cacheHits_ = cacheMisses_ = cacheTrimmed_ = 0;
+    return s;
+}
+
 Gpu::~Gpu() {
+    {
+        std::lock_guard<std::mutex> g(cacheLock_);
+        cache_.clear();
+        cachedBytes_ = 0;
+    }
     {
         std::unique_lock<std::mutex> g(queuesLock_);
         queuesGone_.wait(g, [this] { return queues_ == 0; });
