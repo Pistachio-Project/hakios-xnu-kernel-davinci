@@ -378,9 +378,11 @@ private:
         uint64_t gpuAddress() const { return buffer->gpuAddress() + offset; }
         uint8_t* contents() const { return static_cast<uint8_t*>(buffer->contents()) + offset; }
     };
-    bool piece(uint64_t bytes, Piece* out, std::string* why);
+    // ZERO: the bytes are zeros when handed out; false for a user that writes every word the GPU reads of it
+    bool piece(uint64_t bytes, Piece* out, std::string* why, bool zero = true);
     std::shared_ptr<Buffer> slab_;
     uint64_t slabUsed_ = 0;
+    bool slabFresh_ = true;   // slab_ is new from the kernel (zeros), not one the pool gave back
     std::vector<std::shared_ptr<Buffer>> slabs_;   // every slab this buffer took, given back to the queue when it is done
     // A program's words where they are already in this command buffer, so that every draw with the program does not
     // upload them again. Found by the caller's pointer, but taken only when the words still look the same: the pointer
@@ -468,11 +470,12 @@ public:
     // A slab for draw tables (CommandBuffer::piece): one a completed command buffer gave back, zeroed as a new one comes,
     // or a new one. The kernel's making of a 256 KB buffer, once every 32 draws, was most of a draw's CPU time on the
     // phone (40 us a draw on a fast core, where the same encoding on the host takes 5).
-    std::shared_ptr<Buffer> takeSlab(uint64_t bytes, std::string* why);
+    // (a slab is not zeroed: CommandBuffer::piece zeroes what it hands out, FRESH says it came new from the kernel)
+    std::shared_ptr<Buffer> takeSlab(uint64_t bytes, std::string* why, bool* fresh);
     void giveSlabs(std::vector<std::shared_ptr<Buffer>>* slabs);
     // ...and any other buffer a command buffer makes for itself (a large piece, its counter stamps): BYTES rounded up to
     // a power of two from 4 KB, zeroed; given back the same way, 32 MB of them kept at most
-    std::shared_ptr<Buffer> takeBuffer(uint64_t bytes, std::string* why);
+    std::shared_ptr<Buffer> takeBuffer(uint64_t bytes, std::string* why, bool zero = true, bool* fresh = nullptr);
     void giveBuffer(std::shared_ptr<Buffer> b);
     // whether GMEM passes may still be binned: no pass's visibility streams have overrun their pitch (render::kVscOverflowAt,
     // read by checkVsc once a buffer with a binned pass has completed)

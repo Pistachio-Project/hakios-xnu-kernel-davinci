@@ -129,6 +129,16 @@ public:
             count -= n;
         }
     }
+    // one packet of PREFIX (N words, the load's header and addresses) then DATA (M words) then PAD zeros: written in place
+    void packetOf(uint32_t opcode, const uint32_t* prefix, uint32_t n, const uint32_t* data, uint32_t m, uint32_t pad) {
+        assert(n + m + pad <= kMaxType7Count);
+        ready();
+        uint32_t* at = grow(1 + n + m + pad);
+        at[0] = type7(opcode, n + m + pad);
+        for (uint32_t i = 0; i < n; i++) at[1 + i] = prefix[i];
+        for (uint32_t i = 0; i < m; i++) at[1 + n + i] = data[i];
+        for (uint32_t i = 0; i < pad; i++) at[1 + n + m + i] = 0;
+    }
     void nop(uint32_t words = 0);
     void waitForIdle();
     void waitMemWrites();

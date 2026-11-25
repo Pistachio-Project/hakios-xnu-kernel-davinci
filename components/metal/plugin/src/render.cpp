@@ -97,14 +97,11 @@ void loadIndirect(pm4::Stream& st, const Stage& s, a6xx_state_type type, uint32_
     st.packet(loadOpcode(s), w, 3);
 }
 
-void loadDirect(pm4::Stream& st, const Stage& s, a6xx_state_type type, uint32_t dstOff, uint32_t units, const uint32_t* data, uint32_t dwords) {
-    std::vector<uint32_t> w;
-    w.reserve(3 + dwords);
-    w.push_back(loadState6_0(dstOff, type, SS6_DIRECT, shaderBlock(s), units));
-    w.push_back(0);
-    w.push_back(0);
-    w.insert(w.end(), data, data + dwords);
-    st.packet(loadOpcode(s), w.data(), uint32_t(w.size()));
+void loadDirect(pm4::Stream& st, const Stage& s, a6xx_state_type type, uint32_t dstOff, uint32_t units, const uint32_t* data, uint32_t dwords,
+                uint32_t padTo = 0) {
+    // (the packet written in place: a vector made for each, to be copied from, was an allocation a load, a dozen a draw)
+    const uint32_t header[3] = {loadState6_0(dstOff, type, SS6_DIRECT, shaderBlock(s), units), 0, 0};
+    st.packetOf(loadOpcode(s), header, 3, data, dwords, padTo > dwords ? padTo - dwords : 0);
 }
 
 // The colour target as RB_MRT[0], SP_FS_MRT_REG[0] and the sRGB registers name it, off the Texture's own fields: the
@@ -601,7 +598,6 @@ struct StageTextures {
     // a draw with no texture, most of them, does not pay for 1.3 KB of zeros a stage)
     uint32_t texWords[kMaxTextureSlots][16];
     uint32_t sampWords[kMaxTextureSlots][4];
-    std::vector<const Texture*> used;
 };
 
 const char* elementOf(uint8_t e) { return e == kElemFloat ? "float" : e == kElemUint ? "uint" : e == kElemInt ? "int" : "?"; }
@@ -705,7 +701,6 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
             // through it reads its one texel as the 2D sample does (probe 9s), so whatever is in that texel is what both read.
             TexConst d = tex->sampledDescriptor();
             memcpy(out->texWords[t], d.dword, sizeof d.dword);
-            out->used.push_back(tex);
             continue;
         }
         if (!tex->isShaped(kt)) {
@@ -723,7 +718,6 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
         }
         TexConst d = tex->sampledDescriptor();
         memcpy(out->texWords[t], d.dword, sizeof d.dword);
-        out->used.push_back(tex);
     }
     out->numSamp = 1;
     for (uint32_t m = 0; m < kMaxTextureSlots; m++) {
@@ -812,7 +806,6 @@ static_assert(kMaxGfxIbos >= kMaxVertexBuffers, "the table holds an IBO per Meta
 struct GfxIbos {
     uint32_t count = 0;
     uint32_t words[kMaxVertexBuffers][16] = {};
-    std::vector<const Buffer*> used;
 };
 
 bool gfxIbos(const Stage& vs, const Bindings& vsb, const Stage& fs, const Bindings& fsb, uint32_t fsBase, GfxIbos* out, std::string* why) {
@@ -851,7 +844,6 @@ bool gfxIbos(const Stage& vs, const Bindings& vsb, const Stage& fs, const Bindin
                 }
                 TexConst d = bufferIbo(x.buffer->gpuAddress() + x.offset, uint32_t(elements));
                 memcpy(out->words[tableSlot], d.dword, sizeof d.dword);
-                out->used.push_back(x.buffer);
             }
             out->count = std::max(out->count, tableSlot + 1);
         }
@@ -1029,42 +1021,45 @@ bool checkTarget(const RenderPass& pass, std::string* why) {
         const Texture& t = *a.texture;
         const FormatInfo& f = t.info();
         // (attachment 0's sentences are the ones a single target always had; a later one's name its index)
-        const std::string which = "colour attachment " + n(i), of = i == 0 ? std::string() : " of " + which, at = i == 0 ? std::string() : which + ": ";
+        // (made when a sentence needs them: three strings of 20 characters or more are three allocations, for each attachment of each draw)
+        const auto which = [&] { return "colour attachment " + n(i); };
+        const auto of = [&] { return i == 0 ? std::string() : " of " + which(); };
+        const auto at = [&] { return i == 0 ? std::string() : which() + ": "; };
         if ((t.usage() & kTextureUsageRenderTarget) == 0) {
-            return refuse(why, "the " + n(t.width()) + " x " + n(t.height()) + " " + f.name + " texture" + of +
+            return refuse(why, "the " + n(t.width()) + " x " + n(t.height()) + " " + f.name + " texture" + of() +
                                    " was made without render-target usage (MTLTextureUsageRenderTarget, 4); a draw needs it");
         }
         if (t.type() != TextureType::k2D && t.type() != TextureType::k2DMultisample && t.type() != TextureType::k2DArray && t.type() != TextureType::kCube &&
             t.type() != TextureType::k3D && t.type() != TextureType::kCubeArray) {
-            return refuse(why, at + "a colour attachment of texture type " + n(uint32_t(t.type())) +
+            return refuse(why, at() + "a colour attachment of texture type " + n(uint32_t(t.type())) +
                                    ": 2D (2), 2D multisample (4), a 2D array's layer (3), a cube's or cube array's face (5, 6) and a 3D texture's plane (7) are served");
         }
         // a slice of a 2D array, a cube (array) or a 3D texture (Texture::depth() counts them all: layers, faces, planes)
         const uint32_t slices = (t.type() == TextureType::k2DArray || t.type() == TextureType::kCube || t.type() == TextureType::kCubeArray ||
                                  t.type() == TextureType::k3D) ? t.depth() : 1;
         if (a.slice >= slices) {
-            return refuse(why, at + "slice " + n(a.slice) + " of a texture of " + n(slices));
+            return refuse(why, at() + "slice " + n(a.slice) + " of a texture of " + n(slices));
         }
         if (!rbMrtPitchValid(uint32_t(t.bytesPerRow())) || t.buffer()->length() >= (1ull << 32)) {
-            return refuse(why, at + "the target's pitch of " + n(t.bytesPerRow()) + " bytes or its " + n(t.buffer()->length()) +
+            return refuse(why, at() + "the target's pitch of " + n(t.bytesPerRow()) + " bytes or its " + n(t.buffer()->length()) +
                                    " bytes do not fit RB_MRT_PITCH / RB_MRT_ARRAY_PITCH");
         }
         if (a.load != LoadAction::kLoad && a.load != LoadAction::kDontCare && a.load != LoadAction::kClear) {
-            return refuse(why, at + "load action " + n(uint32_t(a.load)) + ": MTLLoadAction is DontCare (0), Load (1) or Clear (2)");
+            return refuse(why, at() + "load action " + n(uint32_t(a.load)) + ": MTLLoadAction is DontCare (0), Load (1) or Clear (2)");
         }
         // DontCare is served as a Store: in sysmem the RB writes the target's memory as it draws, and what DontCare
         // allows -- the contents undefined after the pass -- includes keeping them
         if (a.store != StoreAction::kStore && a.store != StoreAction::kDontCare) {
-            return refuse(why, at + "store action " + n(uint32_t(a.store)) + ": Store (1) and DontCare (0) are served");
+            return refuse(why, at() + "store action " + n(uint32_t(a.store)) + ": Store (1) and DontCare (0) are served");
         }
         if (f.depth) {
-            return refuse(why, std::string("a ") + f.name + " texture as " + which + ": a depth format is the depth attachment's");
+            return refuse(why, std::string("a ") + f.name + " texture as " + which() + ": a depth format is the depth attachment's");
         }
         if (a.level >= t.levels()) {
-            return refuse(why, which + " names mip level " + n(a.level) + " of a texture of " + n(t.levels()));
+            return refuse(why, which() + " names mip level " + n(a.level) + " of a texture of " + n(t.levels()));
         }
         if (t.samples() != firstAttachment(pass)->samples()) {
-            return refuse(why, which + " has " + n(t.samples()) + " sample(s) beside another attachment's " + n(firstAttachment(pass)->samples()) +
+            return refuse(why, which() + " has " + n(t.samples()) + " sample(s) beside another attachment's " + n(firstAttachment(pass)->samples()) +
                                    ": a pass's attachments share one sample count");
         }
         // (attachments of different sizes are Metal's to allow: the window is the smallest of them, windowOf below)
@@ -1787,9 +1782,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
         loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
         if (s.k.numImmediates != 0) {
-            std::vector<uint32_t> imm(s.k.immediates, s.k.immediates + s.k.numImmediates);
-            imm.resize((imm.size() + 3) & ~size_t(3), 0);
-            loadDirect(stream, s, ST6_CONSTANTS, s.k.immediatesOffsetVec4, uint32_t(imm.size() / 4), imm.data(), uint32_t(imm.size()));
+            const uint32_t padded = (s.k.numImmediates + 3) & ~3u;   // (whole vec4: the tail zeros)
+            loadDirect(stream, s, ST6_CONSTANTS, s.k.immediatesOffsetVec4, padded / 4, s.k.immediates, s.k.numImmediates, padded);
         }
         for (const PushedRange& r : ranges) {
             if (r.copy) {
@@ -2941,7 +2935,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         return fail(std::string("no memory for the fragment program: ") + why);
     }
     Piece table;
-    if (!piece(render::kTableBytes, &table, &why)) {
+    // (not zeroed: encodeDraw writes every word of it that a load or a flush reads)
+    if (!piece(render::kTableBytes, &table, &why, false)) {
         return fail(std::string("no memory for the draw's table: ") + why);
     }
     // A draw into the open pass's attachments joins it: no batch start, no pass begin and no tail of its own, which a
@@ -3113,7 +3108,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     if (dual) {
         // the same draw for sysmem: its table the same words but for a fetch's descriptor, which reads memory there
         Piece sysTable = table;
-        if (program.fs.fbRead && !piece(render::kTableBytes, &sysTable, &why)) {
+        if (program.fs.fbRead && !piece(render::kTableBytes, &sysTable, &why, false)) {
             gmemClears_ = 0;
             return fail(std::string("no memory for the draw's table: ") + why);
         }

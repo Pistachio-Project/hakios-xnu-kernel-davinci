@@ -78,7 +78,7 @@ constexpr uint64_t kPieceAlign = 256;
 constexpr uint64_t kPageAlign = 4096;
 }  // namespace
 
-bool CommandBuffer::piece(uint64_t bytes, Piece* out, std::string* why) {
+bool CommandBuffer::piece(uint64_t bytes, Piece* out, std::string* why, bool zero) {
     bytes = (std::max<uint64_t>(bytes, 1) + kPieceAlign - 1) & ~(kPieceAlign - 1);
     const uint64_t align = bytes >= kPageAlign ? kPageAlign : kPieceAlign;
     if (slab_ != nullptr) {
@@ -91,13 +91,17 @@ bool CommandBuffer::piece(uint64_t bytes, Piece* out, std::string* why) {
         if (out->buffer != nullptr) slabs_.push_back(out->buffer);
     } else {
         if (slab_ == nullptr || kSlabBytes - slabUsed_ < bytes) {
-            slab_ = queue_.takeSlab(kSlabBytes, why);
+            slab_ = queue_.takeSlab(kSlabBytes, why, &slabFresh_);
             slabUsed_ = 0;
             if (slab_ != nullptr) slabs_.push_back(slab_);
         }
         out->buffer = slab_;
         out->offset = slabUsed_;
         if (slab_ != nullptr) {
+            // (a slab from the pool is not zeroed whole when it is taken, as it was -- 256 KB of write-combined memory
+            // written for the 31 draws it holds -- but a piece of it when it is handed out, unless its user writes every
+            // word it reads: a draw's table does, and was 8 KB of zeros a draw that nothing read)
+            if (zero && !slabFresh_) memset(static_cast<uint8_t*>(slab_->contents()) + slabUsed_, 0, bytes);
             slabUsed_ += bytes;
         }
     }
@@ -141,7 +145,7 @@ uint64_t sizeClass(uint64_t bytes) {
 }
 }  // namespace
 
-std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* why) {
+std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* why, bool zero, bool* fresh) {
     const uint64_t size = sizeClass(bytes);
     std::shared_ptr<Buffer> b;
     {
@@ -153,9 +157,10 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
             freeBytes_ -= size;
         }
     }
+    if (fresh != nullptr) *fresh = b == nullptr;
     if (b == nullptr) return newBuffer(gpu_, size, why);
     gBuffersReused++;
-    memset(b->contents(), 0, size);   // (as a new one comes from the kernel)
+    if (zero) memset(b->contents(), 0, size);   // (as a new one comes from the kernel)
     return b;
 }
 
@@ -168,7 +173,7 @@ void CommandQueue::giveBuffer(std::shared_ptr<Buffer> b) {
     freeBuffers_[b->length()].push_back(std::move(b));
 }
 
-std::shared_ptr<Buffer> CommandQueue::takeSlab(uint64_t bytes, std::string* why) { return takeBuffer(bytes, why); }
+std::shared_ptr<Buffer> CommandQueue::takeSlab(uint64_t bytes, std::string* why, bool* fresh) { return takeBuffer(bytes, why, false, fresh); }
 
 size_t CommandQueue::quarantinedCount() {
     std::lock_guard<std::mutex> g(lock_);
