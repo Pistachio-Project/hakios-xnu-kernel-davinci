@@ -4176,6 +4176,14 @@ hm_compress_ok(void)
  */
 static unsigned hm_ubwc_rt_made, hm_ubwc_rt_linear, hm_ubwc_rt_reported;
 /* textures made by layout: UBWC 8-bit, UBWC fp16, linear under 65536 pixels, linear mipped, linear non-2D, linear large 2D (the ones UBWC missed) */
+static BOOL
+hm_memoryless_load_dropped(void)
+{
+	static int on = -1;
+
+	if (on < 0) on = !hm_boot_arg_set("metal_memoryless_gmem=0");
+	return on;
+}
 static unsigned hm_layouts_made[6], hm_layouts_reported[6];
 /* the linear textures by why-not: storage, usage, format, size class (big/small), view bit, CPU-visible; the commonest printed with the layout line */
 static struct hm_linear_kind { uint32_t key; unsigned count; unsigned w, h; } hm_linear_kinds[24];
@@ -6349,6 +6357,12 @@ hm_read_render_pass(MTLRenderPassDescriptor *d, struct hakios_metal_render_pass 
 			m->level = (unsigned)[c level];
 			m->slice = (unsigned)([t textureType] == MTLTextureType3D ? [c depthPlane] : [c slice]);
 			m->load_action = (unsigned)[c loadAction];
+			/* ...and nothing of one is there to load: Load (1) of a memoryless texture reads memory no pass of this frame wrote; DontCare
+			 * keeps the tiles from fetching it from DRAM (metal_memoryless_gmem=0: as before) */
+			if ([(HakiosMetalTexture *)t hakiosMemoryless] && m->load_action == MTLLoadActionLoad && hm_memoryless_load_dropped()) {
+				HM_ONCE("a memoryless colour attachment asked to be loaded: not loaded (its contents are undefined at the start of a pass)\n");
+				m->load_action = MTLLoadActionDontCare;
+			}
 			m->store_action = store;
 			m->clear_color[0] = cc.red;
 			m->clear_color[1] = cc.green;
