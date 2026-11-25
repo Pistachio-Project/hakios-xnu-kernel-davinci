@@ -2110,6 +2110,12 @@ static const struct {
 	 * that holds for any chip. At 355 MHz CoreAnimation drew 20-24 frames a second.
 	 */
 	{ 0, 0 }, { 180000, 48 }, { 267000, 64 }, { 355000, 128 }, { 430000, 192 }, { 565000, 256 },
+	/*
+	 * Only with boot-arg adreno_speed=6 (the default stays 5): the fastest that speed bin 0x80 (this Mi 9T) reaches, 610 MHz at
+	 * the rail's TURBO level 320 (RPMh's gfx.lvl, mx.lvl have it: logs/145651-run.log). Untested on the phone; the
+	 * "adreno: gpu clock" line (every 5 s) and step 17's "measured" line say what the core really runs at.
+	 */
+	{ 610000, 320 },
 };
 #define GPU_SPEEDS              ((uint32_t)(sizeof(gpu_speeds) / sizeof(gpu_speeds[0])))
 static uint32_t gpu_votes[GPU_SPEEDS], gpu_speed = GPU_SPEEDS - 1;
@@ -2899,6 +2905,7 @@ uint32_t a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint3
 void a618_gpu_report(const char *why);
 
 static bool gpu_kept;
+static uint64_t gpu_submissions, gpu_submitted_at;       /* for the 5 s clock line (gpu_clock_thread) */
 static uint32_t gpu_fence;              /* the number of the last submission */
 static struct {
 	uint64_t start, size;
@@ -3072,6 +3079,8 @@ a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 	if (++gpu_fence == 0) {
 		gpu_fence = 1;
 	}
+	gpu_submissions++;
+	gpu_submitted_at = mach_absolute_time();
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
@@ -3105,6 +3114,73 @@ a618_gpu_report(const char *why)
 	space_faulted(&core_space);
 }
 
+/*
+ * Every 5 s while the GPU is kept (boot-arg adreno_clk=0 for none): what the core really runs at and how busy it is, from
+ * the hardware itself and not from what was asked -- the clock of the 3D core as the SoC's frequency counter measures it
+ * (sampled only while a submission is under way: the GMU gates it when idle), the GMU's own speed setting and power
+ * state, the 3D core's busy bit sampled every 10 ms, and the submissions. A GMU that dropped the core to a lower level, or
+ * collapsed its power between submissions, would show here as a clock below the one asked for.
+ */
+static void
+gpu_clock_thread(__unused void *arg, __unused wait_result_t result)
+{
+	uint64_t last_submissions = 0;
+	uint32_t cap = 0, vote = 0x3fff;
+
+	PE_parse_boot_argn("ddr_cap", &cap, sizeof(cap));
+	PE_parse_boot_argn("ddr_vote", &vote, sizeof(vote));
+	for (;;) {
+		uint32_t ticks = 0, busy = 0, samples = 0, idle = 0, low = ~0u, high = 0, sum_khz = 0, gx_off = 0;
+		uint64_t period = mach_absolute_time(), submissions;
+
+		for (int i = 0; i < 500; i++) {
+			uint64_t now, age;
+
+			sleep_ms(10);
+			if (!gpu_kept) {
+				(void)thread_terminate(current_thread());
+				thread_block(THREAD_CONTINUE_NULL);
+			}
+			if (!gx_on()) {
+				gx_off++;
+				continue;
+			}
+			ticks++;
+			if (rd(gpu.base + RBBM_STATUS) & RBBM_STATUS_BUSY) {
+				busy++;
+			}
+			now = mach_absolute_time();
+			absolutetime_to_nanoseconds(now - gpu_submitted_at, &age);
+			if (age < 30 * NSEC_PER_MSEC && samples + idle < 6 && i % 50 == 25) {
+				uint32_t hz;
+
+				lck_mtx_lock(&gpu_dcvs_lock);
+				hz = measure(GPUCC_DEBUG_GX_GFX3D);
+				lck_mtx_unlock(&gpu_dcvs_lock);
+				if (hz == 0 || hz == MEASURE_FAILED) {
+					idle++;
+				} else {
+					samples++;
+					sum_khz += hz / 1000;
+					low = MIN(low, hz / 1000);
+					high = MAX(high, hz / 1000);
+				}
+			}
+		}
+		submissions = gpu_submissions;
+		(void)period;
+		hakios_say("adreno: gpu clock: asked %u MHz (level %u of %u, GMU setting %#x, return %d), measured under load %u times "
+		    "%u-%u MHz (mean %u; %u reads of a stopped clock), core busy %u%% of %u looks, %llu submissions in 5 s, gx %s, "
+		    "GMU rpmh state %#x; memory: host votes %u on MC0/SH0 (ddr_cap %u), GMU's bus table one off level (as Linux's "
+		    "a618)\n", gpu_speeds[gpu_applied].khz / 1000, gpu_applied, gpu_speed, rd(gmu.base + GMU_DCVS_PERF_SETTING),
+		    (int)rd(gmu.base + GMU_DCVS_RETURN), samples, samples ? low / 1000 : 0, samples ? high / 1000 : 0,
+		    samples ? sum_khz / samples / 1000 : 0, idle, ticks ? 100 * busy / ticks : 0, ticks,
+		    submissions - last_submissions, gx_off ? "OFF some of the time" : "on", rd(gmu.base + GMU_RPMH_POWER_STATE), vote,
+		    cap);
+		last_submissions = submissions;
+	}
+}
+
 /* After step 21, with adreno_keep=1: the GPU is the system's from here on. */
 static bool
 gpu_keep(void)
@@ -3123,6 +3199,15 @@ gpu_keep(void)
 	gpu_kept = true;
 	hakios_say("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
 	HakiosGPUStart();
+	{
+		uint32_t clock_log = 1;
+		thread_t thread;
+
+		PE_parse_boot_argn("adreno_clk", &clock_log, sizeof(clock_log));
+		if (clock_log && kernel_thread_start(gpu_clock_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+	}
 	return true;
 }
 
