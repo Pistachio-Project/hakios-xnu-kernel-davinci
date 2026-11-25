@@ -4568,6 +4568,11 @@ dpu_pipeline(void)
 #define SRC_FORMAT_ALPHA        (1u << 8)
 #define DPU_QSEED               0xa00u
 #define QSEED_OP_MODE           0x004u
+#define QSEED_PRELOAD           0x020u          /* (Linux's QSEED3 layout, dpu_hw_util.c; scaler version 0x2004 here) */
+#define QSEED_SRC_SIZE_Y_RGB_A  0x040u
+#define QSEED_SRC_SIZE_UV       0x044u
+#define QSEED_DST_SIZE          0x048u
+#define QSEED_PHASE_INIT_Y_H    0x090u          /* ... Y V, UV H, UV V after it */
 #define QSEED_STEP(n)           (0x010u + 4 * (n))      /* Y h, Y v, UV h, UV v: 1 << 21 is 1:1 (the reset value) */
 #define QSEED_WORDS             28u                     /* of the scaler's registers, from +0, said back after it is programmed */
 
@@ -4730,11 +4735,28 @@ hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint
 	if (scanout.mode == 2) {
 		uint32_t h = (uint32_t)(((uint64_t)width << 21) / scanout.panel_w), v = (uint32_t)(((uint64_t)height << 21) / scanout.panel_h);
 
+		/*
+		 * As Linux's DPU programs a QSEED3 (dpu_hw_util.c dpu_hw_setup_scaler3, dpu_plane.c _dpu_plane_setup_scaler3) for an
+		 * RGB surface: the steps, the preload, the sizes in and out, the initial phases, then the mode -- bilinear, which
+		 * needs no coefficient tables (the edge-directed filter the mode's reset value picks reads tables nobody loaded:
+		 * a black screen, 25 November), not 10-bit (bit 14), blended (bit 31). With only the steps and bit 0 the scaler had
+		 * no source size and gave nothing.
+		 */
+		const uint32_t src_size = (width & 0x1ffffu) | (height & 0x1ffffu) << 16;
+		const uint32_t dst_size = (scanout.panel_w & 0x1ffffu) | (scanout.panel_h & 0x1ffffu) << 16;
+
 		scanout_put(DPU_QSEED + QSEED_STEP(0), h);
 		scanout_put(DPU_QSEED + QSEED_STEP(1), v);
 		scanout_put(DPU_QSEED + QSEED_STEP(2), h);
 		scanout_put(DPU_QSEED + QSEED_STEP(3), v);
-		scanout_put(DPU_QSEED + QSEED_OP_MODE, scanout.saved[11] | 1u);
+		scanout_put(DPU_QSEED + QSEED_PRELOAD, 4u | 3u << 8 | 4u << 16 | 3u << 24);
+		scanout_put(DPU_QSEED + QSEED_SRC_SIZE_Y_RGB_A, src_size);
+		scanout_put(DPU_QSEED + QSEED_SRC_SIZE_UV, src_size);
+		scanout_put(DPU_QSEED + QSEED_DST_SIZE, dst_size);
+		for (uint32_t i = 0; i < 4; i++) {
+			scanout_put(DPU_QSEED + QSEED_PHASE_INIT_Y_H + 4 * i, 0);
+		}
+		scanout_put(DPU_QSEED + QSEED_OP_MODE, 1u | 3u << 16 | 1u << 14 | 1u << 31);
 	} else {
 		scanout_put(DPU_QSEED + QSEED_OP_MODE, scanout.saved[11] & ~1u);
 	}
