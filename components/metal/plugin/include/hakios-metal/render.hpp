@@ -614,12 +614,13 @@ public:
     void swap(GroupCache& o);
     size_t entries(uint32_t g) const { return g_[g].entries.size(); }
 private:
-    struct Delta { int from; std::vector<uint32_t> words; };   // [reg, count, values...]*
+    struct Delta { int from; std::vector<uint32_t> wire; };   // the packets that change the registers from what key FROM left to this key's
     struct Entry {
         uint64_t hash;
         int program;                   // the program key's number, -1 for a group that has none
         std::vector<uint8_t> key;      // the group's own bytes
         std::vector<uint32_t> words;   // the group's writes in order, [reg, count, values...]*
+        std::vector<uint32_t> wire;    // ...as the packets that make them
         std::vector<Delta> deltas;
     };
     struct G {

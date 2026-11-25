@@ -2328,15 +2328,12 @@ bool flatten(const pm4::Stream& s, std::vector<uint32_t>* flat) {
     }
     return true;
 }
-void emitFlat(pm4::Stream& to, const std::vector<uint32_t>& flat) {
-    for (size_t i = 0; i < flat.size(); i += 2 + flat[i + 1]) to.registers(flat[i], &flat[i + 2], flat[i + 1]);
-}
 }  // namespace
 
 const std::vector<uint32_t>& GroupCache::delta(G& grp, int from, int to) {
     Entry& dst = grp.entries[size_t(to)];
     for (const Delta& d : dst.deltas) {
-        if (d.from == from) return d.words;
+        if (d.from == from) return d.wire;
     }
     // the registers the last key's words left, then the new key's, each written only if it differs
     std::unordered_map<uint32_t, uint32_t> held;
@@ -2344,15 +2341,13 @@ const std::vector<uint32_t>& GroupCache::delta(G& grp, int from, int to) {
     for (size_t i = 0; i < before.size(); i += 2 + before[i + 1]) {
         for (uint32_t k = 0; k < before[i + 1]; k++) held[before[i] + k] = before[i + 2 + k];
     }
-    Delta d{from, {}};
+    pm4::Stream out;
     const std::vector<uint32_t>& now = dst.words;
     for (size_t i = 0; i < now.size(); i += 2 + now[i + 1]) {
         uint32_t runStart = 0, runLen = 0;
         auto flush = [&] {
             if (runLen == 0) return;
-            d.words.push_back(now[i] + runStart);
-            d.words.push_back(runLen);
-            d.words.insert(d.words.end(), now.begin() + long(i) + 2 + runStart, now.begin() + long(i) + 2 + runStart + runLen);
+            out.registers(now[i] + runStart, &now[i + 2 + runStart], runLen);
             runLen = 0;
         };
         for (uint32_t k = 0; k < now[i + 1]; k++) {
@@ -2369,8 +2364,8 @@ const std::vector<uint32_t>& GroupCache::delta(G& grp, int from, int to) {
         }
         flush();
     }
-    dst.deltas.push_back(std::move(d));
-    return dst.deltas.back().words;
+    dst.deltas.push_back(Delta{from, out.release()});
+    return dst.deltas.back().wire;
 }
 
 void GroupCache::emit(pm4::Stream& to) {
@@ -2396,11 +2391,11 @@ void GroupCache::emit(pm4::Stream& to) {
                 grp.entries.clear();
                 grp.last = -1;
             }
-            grp.entries.push_back(Entry{newHash_[g], newProgram_[g], std::move(newKey_[g]), std::move(flat), {}});
+            grp.entries.push_back(Entry{newHash_[g], newProgram_[g], std::move(newKey_[g]), std::move(flat), out[g].words(), {}});
             p = int(grp.entries.size()) - 1;
         }
-        if (grp.last < 0) emitFlat(to, grp.entries[size_t(p)].words);
-        else emitFlat(to, delta(grp, grp.last, p));
+        const std::vector<uint32_t>& wire = grp.last < 0 ? grp.entries[size_t(p)].wire : delta(grp, grp.last, p);
+        to.append(wire.data(), wire.size());
         grp.last = p;
     }
 }

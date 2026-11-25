@@ -155,6 +155,11 @@ public:
         for (uint32_t i = 0; i < count; i++) at[1 + i] = words[i];
     }
 
+    // packets already encoded (another stream's words, or what the encoder wrote earlier), as they are
+    void append(const uint32_t* words, size_t count) {
+        ready();
+        words_.insert(words_.end(), words, words + count);
+    }
     const std::vector<uint32_t>& words() const { return words_; }
     size_t size() const { return words_.size(); }
     size_t capacity() const { return words_.capacity(); }
