@@ -242,16 +242,17 @@ if os.path.basename(os.environ.get('DARWIN_FW', '').rstrip('/')).startswith('dar
             # every run, saying nothing (cputop: 4.9 s of CPU in every 5 s), with the cores at 102-105 C; only Settings >
             # Battery's charts miss it. ALLOW=PerfPowerServices to have it back.)
             'PerfPowerServices')
-    #
-    # CPU on the 2+6 cores of the Mi 9T (logs/124355-run.log, 123155, 121024, 232116, 113203): jobs that crash at every
-    # start or can never work here, each asked for on demand by some client, so each was started and died again and
-    # again. Without the job its Mach services are unknown and the clients fail at once (as for ScreenTimeAgent).
-    #  fileindexerd: "FileIndexerDaemon.swift:638: Fatal error: Failed to init ... POSIX 19 (ENODEV)": SIGTRAP, 14
-    #    spawns in one run (41 "ends by signal 5" lines, the log repeats each; 17 / 38 in the others);
-    #  spotlightknowledged.updater: "UpdaterDaemon.swift:978: Fatal error: DocumentProcessing directory has unexpected
-    #    protection class NSURLFileProtectionNone": SIGTRAP at every start, asked for again;
-    #  icloudmailagent: SIGTRAP, no mail account, push (apsd) or network to talk to.
-    DENY += ('fileindexerd', 'spotlightknowledged.updater', 'icloudmailagent')
+
+# (root26-darwin.sh does not set DARWIN_FW, so Darwin 27's images use the first list above; what follows is for both.)
+# CPU on the 2+6 cores of the Mi 9T (logs/124355-run.log, 123155, 121024, 232116, 113203): jobs that crash at every
+# start or can never work here, each asked for on demand by some client, so each was started and died again and
+# again. Without the job its Mach services are unknown and the clients fail at once (as for ScreenTimeAgent).
+#  fileindexerd: "FileIndexerDaemon.swift:638: Fatal error: Failed to init ... POSIX 19 (ENODEV)": SIGTRAP, 14
+#    spawns in one run (41 "ends by signal 5" lines, the log repeats each; 17 / 38 in the others);
+#  spotlightknowledged.updater: "UpdaterDaemon.swift:978: Fatal error: DocumentProcessing directory has unexpected
+#    protection class NSURLFileProtectionNone": SIGTRAP at every start, asked for again;
+#  icloudmailagent: SIGTRAP, no mail account, push (apsd) or network to talk to.
+DENY += ('fileindexerd', 'spotlightknowledged.updater', 'icloudmailagent')
 
 # Only the Xiaomi Mi 9T (davinci, SM7150: two A76 and six A55, seven for the kernel, held back to four at 70 C in the
 # runs): jobs with nothing to talk to on it, which burn CPU the window server needs. Measured with the ps TIME column
@@ -261,7 +262,7 @@ if os.path.basename(os.environ.get('DARWIN_FW', '').rstrip('/')).startswith('dar
 # network, no location) 0.7 / 0.9 s, nearbyd (UWB) 0.5 s, audioaccessoryd (no accessories) 0.8 s, carkitd (no
 # CarPlay) 0.2 s. All are on-demand jobs here, so nothing waits for them. ALLOW="sharingd" etc. puts one back.
 DENY_DAVINCI = ('sharingd', 'searchpartyd', 'findmydeviced', 'findmylocated', 'nearbyd', 'audioaccessoryd', 'carkitd')
-if os.environ.get('BOARD') == 'davinci' and os.path.basename(os.environ.get('DARWIN_FW', '').rstrip('/')).startswith('darwin26'):
+if os.environ.get('BOARD') == 'davinci':
     DENY += DENY_DAVINCI
 
 # Jobs that stay (their services are used) but are never urgent: the window server and SpringBoard get the cores first.
