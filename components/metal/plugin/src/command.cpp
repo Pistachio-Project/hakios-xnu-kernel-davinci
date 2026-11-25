@@ -174,12 +174,12 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
             b = std::move(it->second.back());
             it->second.pop_back();
             freeBytes_ -= size;
-            low = size == kSlabBytes && it->second.size() < 16;
+            low = size == kSlabBytes && it->second.size() < 64;
         }
     }
     if (low) {
-        gRefilled += 16;
-        wantSlabs(16);
+        gRefilled += 64;
+        wantSlabs(64);
     }
     if (fresh != nullptr) *fresh = b == nullptr;
     if (b == nullptr) return newBuffer(gpu_, size, why);
@@ -698,7 +698,7 @@ std::shared_ptr<CommandQueue> CommandQueue::make(Gpu& gpu, std::string* why) {
     // addresses of their memory, which a thread making slabs of its own would change from run to run)
     if (pre != nullptr && pre[0] != '0' && pre[0] != 0) {
         const char* mb = getenv("HAKIOS_METAL_PREFILL_MB");
-        const long want = mb != nullptr && mb[0] != 0 ? strtol(mb, nullptr, 0) : 16;
+        const long want = mb != nullptr && mb[0] != 0 ? strtol(mb, nullptr, 0) : 24;
         q->warm_ = std::thread([p = q.get()] { p->warmer(); });
         q->wantSlabs(unsigned(want <= 0 ? 0 : want * 4));   // (256 KB slabs: 4 to the MB)
     }

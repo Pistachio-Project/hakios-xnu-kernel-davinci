@@ -2544,9 +2544,11 @@ hm_own_cache_dir(const char *dir)
 		}
 	}
 	setenv("HAKIOS_METAL_LISTING", "0", 0);
-	/* (off unless boot-arg metal_pool_prefill=1: the run that panicked in vm_purgeable_object_remove, logs/182504-run.log, had it on; no
-	 * purgeable call is in this plug-in or the drivers, so it is off until a run with it on shows it was innocent) */
-	setenv("HAKIOS_METAL_PREFILL", hm_boot_arg_set("metal_pool_prefill=1") ? "1" : "0", 1);
+	/* (on unless boot-arg metal_pool_prefill=0. It was off for one run, after a panic in vm_purgeable_object_remove that the pool
+	 * was suspected of; the modem's RMTFS buffer DMAing into kernel RAM (09576816) explains it. Heavy windows of the run before
+	 * made 100 to 335 buffers each -- 20 to 100 MB of fresh write-combined memory in draw calls -- and the core's time in
+	 * draws grew with it: 68 ms a window with under 5 made, 266 with 30 to 99, 422 with more than 100.) */
+	setenv("HAKIOS_METAL_PREFILL", hm_boot_arg_set("metal_pool_prefill=0") ? "0" : "1", 1);
 	hm_ensure_spi([self class]);
 	hm_functions_encode_from_metadata();
 	self = [super init];
@@ -6972,7 +6974,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 
 				hakios_metal_pool_counts(&given, &shared, &full, &big, &prefilled, &refills);
 				hm_print("fps: ... buffer pool: %u given back, %u kept by another owner (not pooled), %u refused as the pool was full "
-					 "(HAKIOS_METAL_POOL_MB, 128), %u of the made 1 MB or more; prefill (metal_pool_prefill=1 turns it on): %u slabs made ahead "
+					 "(HAKIOS_METAL_POOL_MB, 128), %u of the made 1 MB or more; prefill (metal_pool_prefill=0 turns it off): %u slabs made ahead "
 					 "by the pool's thread, %u asked for; page faults of the process in this window: %ld\n", given, shared, full, big,
 					 prefilled, refills, now - faults);
 				faults = now;
