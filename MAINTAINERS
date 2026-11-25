@@ -320,6 +320,7 @@ F:	drivers/board/smp2p.h
 F:	drivers/board/smmu.h
 F:	drivers/board/scm.h
 F:	drivers/board/mdt.h
+F:	drivers/board/fat_core.h
 F:	drivers/board/ipc.h
 F:	drivers/board/glink_queue.h
 F:	drivers/board/qrtr_frame.h
@@ -335,6 +336,7 @@ T:	workbench/rpmh_test.c
 T:	workbench/cmd_db_test.c
 T:	workbench/smem_test.c
 T:	workbench/mdt_test.c
+T:	workbench/fat_test.c
 T:	workbench/ipc_test.c
 T:	workbench/glink_queue_test.c
 T:	workbench/qrtr_frame_test.c

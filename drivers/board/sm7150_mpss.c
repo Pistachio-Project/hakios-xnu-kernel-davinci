@@ -45,6 +45,7 @@ extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, int
 #include <vm/vm_kern.h>
 #include <vm/vm_kern_xnu.h>  /* xnu-12377: the KMA flags and kmem_alloc moved to the internal header */
 #include "board.h"            /* hakios_board_has(): only on a board that lists wifi-wcn3990 */
+#include "fat_core.h"         /* firmware read out of the phone's own modem partition (wcn3990 { firmware-partition }) */
 #include "log.h"              /* hakios_say(): to the loader's log as well, read while the phone runs */
 #include <sys/sysctl.h>
 #include <sys/random.h>
@@ -241,6 +242,94 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 	return -1;
 }
 
+/*
+ * Firmware out of the phone's own storage, where the board says so (wcn3990 { firmware-partition = "modem"; }, with ufs=2): the
+ * `modem` partition is a FAT volume with the phone's firmware in image/ (what Android mounts on /vendor/firmware_mnt), so
+ * /hakios/fw/{modem,tftp,wlan}/NAME that the root does not have is image/NAME of it, read only, a piece at a time (modem.b22
+ * alone is 27 MB). The root's own file comes first, so that one put there still wins. The Pixel 4a has no such key.
+ */
+extern int hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, uint64_t len, uint64_t *bytes);  /* (board/ufs.c) */
+static const char *g_fw_partition;
+static struct fat g_fwp;
+static bool g_fwp_failed;
+static char g_fwp_path[96];
+static struct fat_file g_fwp_file;
+static LCK_GRP_DECLARE(g_fwp_grp, "mpss-fwpart");
+static LCK_MTX_DECLARE(g_fwp_lock, &g_fwp_grp);
+static uint64_t g_fwp_bytes;
+
+static int
+fwp_read(__unused void *context, uint64_t offset, uint8_t *dst, uint64_t len)
+{
+	return hakios_ufs_read_partition(g_fw_partition, offset, dst, len, NULL);
+}
+
+/* The file of the partition that /hakios/fw/DIR/NAME stands for: its size, and bytes [offset, offset + length). */
+static int
+fwp_file(const char *path, uint64_t offset, void *buffer, int length, uint64_t *size)
+{
+	static const char *const dirs[] = { "/hakios/fw/modem/", "/hakios/fw/tftp/", "/hakios/fw/wlan/" };
+	char inside[96];
+	const char *name = NULL;
+	int error = 0;
+
+	if (g_fw_partition == NULL || g_fwp_failed) {
+		return ENOENT;
+	}
+	for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		size_t n = strlen(dirs[i]);
+
+		if (strncmp(path, dirs[i], n) == 0 && path[n] != 0) {
+			name = path + n;
+		}
+	}
+	if (name == NULL) {
+		return ENOENT;
+	}
+	snprintf(inside, sizeof(inside), "image/%s", name);
+	lck_mtx_lock(&g_fwp_lock);
+	if (g_fwp.table == NULL) {
+		error = hakios_ufs_read_partition(g_fw_partition, 0, NULL, 0, &g_fwp_bytes);
+		if (error == 0) {
+			error = fat_mount(&g_fwp, fwp_read, NULL, g_fwp_bytes);
+		}
+		if (error != 0) {
+			/* (ENXIO: the storage is not up yet, or ufs=2 was not asked for: asked again next time) */
+			hakios_say("mpss: the \"%s\" partition is not read as a FAT volume: error %d (%s)\n", g_fw_partition, error,
+			    error == ENXIO ? "no storage yet" : error == ENOENT ? "no such partition" : error == EINVAL ? "not a FAT volume" : "not read");
+			g_fwp_failed = error != ENXIO;
+			goto out;
+		}
+		hakios_say("mpss: the \"%s\" partition (%llu bytes) is a FAT%u volume of %u clusters of %u bytes: image/ is the firmware\n",
+		    g_fw_partition, g_fwp_bytes, g_fwp.is32 ? 32 : 16, g_fwp.clusters, g_fwp.cluster_bytes);
+	}
+	if (strcmp(g_fwp_path, inside) != 0) {
+		struct fat_file file;
+
+		g_fwp_path[0] = 0;
+		error = fat_open(&g_fwp, inside, &file);
+		if (error == 0 && file.directory) {
+			error = EISDIR;
+		}
+		if (error != 0) {
+			hakios_say("mpss: %s: %s in the \"%s\" partition\n", inside, error == ENOENT ? "not" : "unreadable", g_fw_partition);
+			goto out;
+		}
+		g_fwp_file = file;
+		strlcpy(g_fwp_path, inside, sizeof(g_fwp_path));
+		hakios_say("mpss: %s: from the \"%s\" partition (%u bytes)\n", inside, g_fw_partition, file.size);
+	}
+	if (size != NULL) {
+		*size = g_fwp_file.size;
+	}
+	if (length > 0) {
+		error = fat_read_range(&g_fwp, &g_fwp_file, offset, buffer, (uint64_t)length);
+	}
+out:
+	lck_mtx_unlock(&g_fwp_lock);
+	return error;
+}
+
 /* Bytes [offset, offset + length) of a firmware file into buffer; the file's size if size != NULL. */
 static int
 fw_read(const char *name, off_t offset, void *buffer, int length, off_t *size)
@@ -254,6 +343,12 @@ fw_read(const char *name, off_t offset, void *buffer, int length, off_t *size)
 	snprintf(path, sizeof(path), FW_DIRECTORY "%s", name);
 	error = vnode_open(path, FREAD, 0, 0, &vnode, context);
 	if (error != 0) {
+		uint64_t from_partition = 0;
+
+		if (g_fw_partition != NULL && (error = fwp_file(path, (uint64_t)offset, buffer, length, &from_partition)) == 0 &&
+		    size != NULL) {
+			*size = (off_t)from_partition;
+		}
 		return error;
 	}
 	if (size != NULL) {
@@ -1788,7 +1883,7 @@ tftp_file(const char *path, uint64_t offset, void *buffer, int length, uint64_t 
 
 	error = vnode_open(path, FREAD, 0, 0, &vnode, context);
 	if (error != 0) {
-		return error;
+		return g_fw_partition != NULL ? fwp_file(path, offset, buffer, length, size) : error;
 	}
 	if (size != NULL) {
 		VATTR_INIT(&attributes);
@@ -8130,6 +8225,7 @@ wcn3990_board_setup(void)
 	uint64_t lowdma = 0;
 	uint32_t low_mb = 0;
 
+	g_fw_partition = b->wcn3990.firmware_partition;
 	if (b->wcn3990.mpss_size) {
 		g_mpss_size = b->wcn3990.mpss_size;
 	}

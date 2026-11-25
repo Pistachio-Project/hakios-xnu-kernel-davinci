@@ -166,7 +166,8 @@ BOARD_SCHEMA = {
     # what differs between phones that run a WCN3990 through an SM7150's modem (board/sm7150_mpss.c, feature wifi-wcn3990);
     # every key is optional and the Pixel 4a's value is the default
     'wcn3990': {'mpss_size': (int, False), 'msa': (int, False), 'msa_size': (int, False), 'rmtfs': (int, False),
-                'rmtfs_size': (int, False), 'bdf': ([str], False), 'rails': ([str], False), 'rail_mv': ([int], False)},
+                'rmtfs_size': (int, False), 'bdf': ([str], False), 'rails': ([str], False), 'rail_mv': ([int], False),
+                'firmware_partition': (str, False)},
     'adsp': {'firmware': (str, True), 'memory': (int, True), 'memory_size': (int, True),
              'charge_counter_divisor': (int, False)},
     'gpu': {'model': (str, True), 'chip_id': (int, True), 'firmware': (str, True), 'gmem_kb': (int, True),
@@ -875,6 +876,8 @@ def load(problems=None):
                 problems.add(where, 'rails: up to eight RPMh regulators by their command database names, rail_mv one voltage (300 to 3600 mV) each')
             if len(wcn.get('bdf', [])) > 3 or any(not re.fullmatch(r'[A-Za-z0-9._%-]{1,48}', n) for n in wcn.get('bdf', [])):
                 problems.add(where, 'bdf: up to three board data file names (a %02x or %03x takes the chip\'s board id)')
+            if 'firmware_partition' in wcn and not re.fullmatch(r'[A-Za-z0-9_]{1,24}', wcn['firmware_partition']):
+                problems.add(where, 'firmware_partition: the name of a partition of the phone, as its partition table has it')
         adsp = data.get('adsp')
         if adsp is not None:
             if adsp['memory_size'] == 0 or adsp['memory_size'] & 0xfff:
@@ -1177,6 +1180,8 @@ def table_text(socs, boards):
             if wcn.get('rails'):
                 parts.append('.rails = { ' + ', '.join(c_string(n) for n in wcn['rails']) + ' }')
                 parts.append('.rail_mv = { ' + ', '.join(str(n) for n in wcn['rail_mv']) + ' }')
+            if 'firmware_partition' in wcn:
+                parts.append(f'.firmware_partition = {c_string(wcn["firmware_partition"])}')
             out.append('\t\t.wcn3990 = { ' + ', '.join(parts) + ' },')
         motor = board.get('haptic')
         if motor:

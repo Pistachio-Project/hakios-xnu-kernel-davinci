@@ -251,6 +251,8 @@ struct hakios_board {
 		const char *bdf[3];             /* board data files of the Wi-Fi's directory, in order; a %02x takes the chip's board id */
 		const char *rails[8];           /* the chip's supplies (RPMh regulators of the command database), NULL after the last */
 		uint16_t rail_mv[8];            /* ... and the voltage of each */
+		const char *firmware_partition; /* a partition of the phone's storage (a FAT volume with image/ in it, the modem's) that the
+		                                 * modem's, TFTP's and the board data's files are read from when /hakios/fw has none (ufs=2) */
 	} wcn3990;
 
 	/* the vibration motor's chip (board: haptic { }): which of the SoC's pins it is on, and this motor's calibration */
