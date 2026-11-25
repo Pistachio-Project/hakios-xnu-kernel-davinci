@@ -1049,6 +1049,13 @@ void hakios_metal_cb_gmem_counts(hakios_metal_cb* cb, unsigned* passes, unsigned
 const char* hakios_metal_cb_gmem_refusal(hakios_metal_cb* cb) {
     syncOne(cb); return cb->cb->gmemRefusal().c_str(); }
 
+void hakios_metal_cb_pass_detail(hakios_metal_cb* cb, unsigned i, char* buf, size_t size) {
+    syncOne(cb);
+    if (size == 0) return;
+    const std::string d = cb->cb->passDetail(i);
+    snprintf(buf, size, "%s", d.c_str());
+}
+
 const char* hakios_metal_cb_pass_sysmem_why(hakios_metal_cb* cb, unsigned i) {
     syncOne(cb); return cb->cb->passSysmemWhy(i); }
 

@@ -168,7 +168,13 @@ public:
     // what each costs, beside what it was (a draw pass with its target's size and its draws, a copy, a clear, a
     // dispatch). Read once the buffer has completed. metal_fps names a frame's slowest passes with it.
     enum PassKind : uint32_t { kPassDraw = 0, kPassCopy = 1, kPassClear = 2, kPassDispatch = 3 };
-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0, touched = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0, touched = 0; std::string sysmemWhy;
+        // what the pass is, for the slowest-passes line: its target, loads and stores, and its draws' programs (names, counts) and sampling
+        std::string head;
+        std::vector<std::pair<std::string, uint32_t>> names;   // the first 6 programs, draws each
+        uint32_t sampled = 0, sampledMips = 0, blended = 0, maxFsWords = 0;
+        uint64_t sampledPixels = 0;
+        uint32_t maxSampledW = 0, maxSampledH = 0; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
@@ -239,6 +245,8 @@ public:
     size_t streamCapacity() const { return stream_.capacity(); }   // (words it holds room for: the queue's memory, takePass)
     std::vector<PassTime> passTimes() const;
     // why profiled pass I of a draw was drawn in sysmem ("" for a GMEM pass, or one not profiled); valid while the buffer lives
+    // PassTime's what-is-in-it as one line ("" past the passes)
+    std::string passDetail(size_t i) const;
     const char* passSysmemWhy(size_t i) const { return i < profiled_.size() ? profiled_[i].sysmemWhy.c_str() : ""; }
 
 private:

@@ -3444,6 +3444,23 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
             stampStart(kPassDraw, first ? first->width() : 0, first ? first->height() : 0);
             if (profiled_.size() > stamped) {
                 profiled_.back().tuneKey = tuneKey;
+                {
+                    // what the pass is: the target (format, size, level), its loads and stores, the depth, the samples, GMEM or sysmem
+                    static const char* const la[] = {"dontcare", "load", "clear"};
+                    static const char* const sa[] = {"discard", "store"};
+                    std::string h = first != nullptr ? std::string(first->info().name) + " " + std::to_string(first->width()) + "x" + std::to_string(first->height()) : "no target";
+                    if (pass.color0 != nullptr) {
+                        h += std::string(" ") + la[uint32_t(pass.load) % 3] + "/" + sa[uint32_t(pass.store) % 2];
+                        if (pass.color0->compressed()) h += " ubwc";
+                    }
+                    uint32_t extra = 0;
+                    for (uint32_t m = 0; m + 1 < kMaxColorOutputs; m++) extra += pass.more[m].texture != nullptr;
+                    if (extra != 0) h += " +" + std::to_string(extra) + " colours";
+                    if (pass.depth != nullptr) h += std::string(" depth ") + la[uint32_t(pass.depthLoad) % 3] + "/" + sa[uint32_t(pass.depthStore) % 2];
+                    if (pass.level != 0) h += " level " + std::to_string(pass.level);
+                    h += gmem ? " GMEM" : " sysmem";
+                    profiled_.back().head = h;
+                }
                 // (why not GMEM, pass by pass: the last reason alone named whichever pass came last, and the heavy
                 // full-screen pass of SpringBoard's "home" stayed in sysmem without its reason ever being seen)
                 if (!gmem) {
@@ -3543,7 +3560,26 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
     }
     if (timed) drawStamp(uint32_t(2 * (timedDraws_ - 1) + 1));
     counts_.draws++;
-    if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().draws++;
+    if ((profile_ || tuning_) && !profiled_.empty()) {
+        PassTime& pt = profiled_.back();
+        pt.draws++;
+        pt.maxFsWords = std::max(pt.maxFsWords, program.fs.k.numWords);
+        pt.blended += program.blend.enabled ? 1 : 0;
+        const std::string pn = program.name != nullptr ? program.name : "?";
+        bool found = false;
+        for (auto& n : pt.names) {
+            if (n.first == pn) { n.second++; found = true; break; }
+        }
+        if (!found && pt.names.size() < 6) pt.names.emplace_back(pn, 1);
+        for (size_t i = 0; i < fsb->textures.size(); i++) {
+            const Texture* t = fsb->textures[i];
+            if (t == nullptr || ((fsb->nullMask >> i) & 1)) continue;
+            pt.sampled++;
+            pt.sampledPixels += uint64_t(t->width()) * t->height();
+            if (uint64_t(t->width()) * t->height() > uint64_t(pt.maxSampledW) * pt.maxSampledH) { pt.maxSampledW = t->width(); pt.maxSampledH = t->height(); }
+            if (t->levels() > 1) pt.sampledMips++;
+        }
+    }
     // a stage with device buffers may write them (ldib's table is stib's): its whole table is used for writing
     for (const auto& [b, writes] : {std::pair<const Bindings*, bool>{vsb, program.vs.k.numSsbos != 0}, {fsb, program.fs.k.numSsbos != 0}}) {
         for (const Binding& x : b->buffers) {

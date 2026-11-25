@@ -6437,7 +6437,7 @@ static struct {
 	unsigned passes, draws, dispatches, copies, gmemPasses, tiles;
 	double shadowIn, shadowOut;   /* seconds in surface copies: taken from the surface, written back into it */
 	unsigned shadowIns, shadowOuts;
-	struct { unsigned kind, width, height, draws, tiles; double us; char why[96]; } slowest[4];   /* the slowest passes of the period (WHY: a sysmem pass's reason) */
+	struct { unsigned kind, width, height, draws, tiles; double us; char why[96]; char detail[360]; } slowest[4];   /* the slowest passes of the period (WHY: a sysmem pass's reason) */
 	double passUs;                /* all passes timed, together */
 	char gmemWhy[160];            /* the last reason a pass stayed in sysmem */
 	struct { char name[96]; unsigned count; double us; } programs[48];   /* metal_fps=draws: GPU time by program */
@@ -6927,6 +6927,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 						hm_fps.slowest[k].draws = draws;
 						hm_fps.slowest[k].tiles = (unsigned)MAX(hakios_metal_cb_pass_tiles(cb, i), 0);
 						strlcpy(hm_fps.slowest[k].why, hakios_metal_cb_pass_sysmem_why(cb, i), sizeof(hm_fps.slowest[k].why));
+						hakios_metal_cb_pass_detail(cb, i, hm_fps.slowest[k].detail, sizeof(hm_fps.slowest[k].detail));
 						hm_fps.slowest[k].us = us;
 						break;
 					}
@@ -7062,6 +7063,9 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				n = MIN(n, sizeof(line) - 1);   /* (snprintf says what it would have written: never past the line) */
 			}
 			hm_print("fps: ... passes timed by the GPU: %.0f ms in all; the slowest:%s\n", hm_fps.passUs / 1e3, line);
+			for (int k = 0; k < 4 && hm_fps.slowest[k].us > 0; k++) {
+				hm_print("fps: ... slow pass %d, %.2f ms: %s\n", k + 1, hm_fps.slowest[k].us / 1e3, hm_fps.slowest[k].detail);
+			}
 		}
 		for (int shown = 0; shown < 8; shown++) {
 			int best = -1;

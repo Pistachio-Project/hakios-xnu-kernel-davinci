@@ -521,6 +521,22 @@ std::vector<CommandBuffer::DrawTime> CommandBuffer::drawTimes() const {
     return out;
 }
 
+std::string CommandBuffer::passDetail(size_t i) const {
+    if (i >= profiled_.size()) return {};
+    const PassTime& t = profiled_[i];
+    std::string out = t.head;
+    out += " " + std::to_string(t.draws) + " draws";
+    if (t.blended != 0) out += " (" + std::to_string(t.blended) + " blended)";
+    out += ", fs up to " + std::to_string(t.maxFsWords) + " words";
+    if (t.sampled != 0) {
+        out += ", " + std::to_string(t.sampled) + " texture reads of " + std::to_string(t.sampledPixels / 1000000) + " Mpx in all (largest " +
+               std::to_string(t.maxSampledW) + "x" + std::to_string(t.maxSampledH) + ", " + std::to_string(t.sampledMips) + " mipped)";
+    }
+    out += ":";
+    for (const auto& n : t.names) out += " " + n.first + "x" + std::to_string(n.second);
+    return out;
+}
+
 std::vector<CommandBuffer::PassTime> CommandBuffer::passTimes() const {
     std::vector<PassTime> out = profiled_;
     if (profileStamps_ == nullptr) return {};
