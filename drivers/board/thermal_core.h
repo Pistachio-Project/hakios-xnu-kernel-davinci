@@ -49,6 +49,23 @@ th_hottest(const int32_t *tenths, unsigned n)
 }
 
 /*
+ * The hottest of the readings a domain follows: bit N of `mask` is reading N (a board's thermal { } cpu-sensors and
+ * gpu-sensors: controller * 16 + sensor, so 32 readings). A mask of 0 is no domain at all: TH_NONE. `n` readings.
+ */
+static inline int32_t
+th_masked_hottest(const int32_t *tenths, unsigned n, uint32_t mask)
+{
+	int32_t hottest = TH_NONE;
+
+	for (unsigned i = 0; i < n && i < 32; i++) {
+		if ((mask >> i & 1) && tenths[i] != TH_NONE && tenths[i] > hottest) {
+			hottest = tenths[i];
+		}
+	}
+	return hottest;
+}
+
+/*
  * How far the processors are held back: 0 not at all, each step one row of every group's frequency
  * table lower, up to `most`. Above `trip` a step more each look; at or below `clear` a step less; in
  * between it stays (so it does not go up and down around one temperature); at `critical` all the way at
@@ -89,6 +106,16 @@ th_row(uint32_t top, uint32_t floor, uint32_t step)
 		floor = top;
 	}
 	return top - floor < step ? floor : top - step;
+}
+
+/*
+ * The GPU's frequency cap, a level between `lowest` and `top` (its levels, the top the one it was started at): the same steps
+ * (th_next_step, with most = top - lowest) as a group's rows, the level `top` less the step, never below `lowest`.
+ */
+static inline uint32_t
+th_level(uint32_t top, uint32_t lowest, uint32_t step)
+{
+	return th_row(top, lowest, step);
 }
 
 /*

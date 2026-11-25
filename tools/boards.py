@@ -135,7 +135,8 @@ BOARD_SCHEMA = {
     'backlight': {'type': (('dcs', 'soft', 'none'), True), 'panel_mode': (('command', 'video'), False),
                   'min': (int, False), 'max': (int, False), 'restore': (int, False), 'bytes': (int, False),
                   'byte_order': (('msb-first', 'lsb-first'), False)},
-    'thermal': {'floor_mhz': ([int], False)},
+    'thermal': {'floor_mhz': ([int], False), 'cpu_sensors': ([int], False), 'gpu_sensors': (int, False),
+                'gpu_trip': (int, False), 'gpu_clear': (int, False), 'gpu_critical': (int, False)},
     'torch': {'flash': (int, True), 'alarm': (int, True)},
     'haptic': {'sda': (int, True), 'scl': (int, True), 'reset': (int, True), 'interrupt': (int, True),
                'f0_calibration': (int, True)},
@@ -961,6 +962,15 @@ def load(problems=None):
             if groups and len(thermal.get('floor_mhz', [])) != len(groups):
                 problems.add(f'{rel} [thermal]', f'floor_mhz: one value for each of the {len(groups)} groups of cores '
                                                  f'(soc.dtsi [cpufreq] domain_cores)')
+            if 'cpu_sensors' in thermal and groups and len(thermal['cpu_sensors']) != len(groups):
+                problems.add(f'{rel} [thermal]', f'cpu_sensors: one mask for each of the {len(groups)} groups of cores')
+            if 'cpu_sensors' in thermal and 0 in thermal['cpu_sensors']:
+                problems.add(f'{rel} [thermal]', 'cpu_sensors: a group\'s mask is not 0 (bit N: sensor N % 16 of controller N / 16)')
+            if thermal.get('gpu_sensors', 1) == 0:
+                problems.add(f'{rel} [thermal]', 'gpu_sensors: not 0 (leave the key out for no GPU limit)')
+            gt = [thermal.get(k, v) for k, v in (('gpu_clear', 620), ('gpu_trip', 700), ('gpu_critical', 950))]
+            if not 0 <= gt[0] < gt[1] < gt[2] <= 1250:
+                problems.add(f'{rel} [thermal]', 'gpu_clear < gpu_trip < gpu_critical (tenths of a degree, at most 1250; defaults 620, 700, 950)')
             if 'thermal' not in soc:
                 problems.add(rel, '[thermal] needs [thermal] in soc.dtsi')
             if 'cpufreq' not in soc and 'scmi_perf' not in soc:
@@ -1285,6 +1295,10 @@ def table_text(socs, boards):
                 '\t\t.thermal = {',
                 f'\t\t\t.tsens = {{ {", ".join(f"{v:#010x}" for v in tsens)} }},',
                 f'\t\t\t.floor_mhz = {{ {floors} }},',
+                f'\t\t\t.cpu_sensors = {{ {", ".join(f"{v:#x}" for v in thermal.get("cpu_sensors", [])) or "0"} }},',
+                f'\t\t\t.gpu_sensors = {thermal.get("gpu_sensors", 0):#x},',
+                f'\t\t\t.gpu_trip = {thermal.get("gpu_trip", 0)}, .gpu_clear = {thermal.get("gpu_clear", 0)}, '
+                f'.gpu_critical = {thermal.get("gpu_critical", 0)},',
                 '\t\t},',
             ]
         out.append('\t},')

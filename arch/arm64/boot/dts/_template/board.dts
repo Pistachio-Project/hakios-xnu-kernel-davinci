@@ -49,6 +49,10 @@
 	// thermal {
 		// floor-mhz = <1000 1100 1100>; // the slowest each group of cores is held back to: one value for each
 		//                              // group of the SoC file's cpufreq { } domain-cores
+		// cpu-sensors = <0x7e 0x1e00>; // optional, with gpu-sensors: each group of cores is held back by ITS OWN sensors, a
+		//                              // mask each (bit N: sensor N % 16 of TSENS controller N / 16). Without: one hottest of all
+		// gpu-sensors = <0x6000>;      // optional: the GPU's frequency is capped from these (A618 only), its own thresholds:
+		// gpu-trip = <700>; gpu-clear = <620>; gpu-critical = <950>; // tenths of a degree (these are the defaults)
 	// };
 
 	// The keys, for the feature "buttons-pmic". A peripheral is SPMI slave << 8 | the high byte of its

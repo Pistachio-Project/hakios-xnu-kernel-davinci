@@ -18,6 +18,8 @@
 
 	thermal {
 		floor-mhz = <1000 1100>;
+		cpu-sensors = <0x8 0x18>;       // each group its own sensors (bit N: sensor N of controller 0)
+		gpu-sensors = <0x60>;
 	};
 
 	haptic {

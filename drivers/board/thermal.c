@@ -15,6 +15,14 @@
  *   - the panel's light: hakios_backlight_set_cap(), from full when nothing is held back down to 60%
  *     when everything is (an AMOLED at full white is heat as well), as an iPhone dims when hot.
  *
+ * Per domain, Android-style (a board that says which sensors are whose: thermal { cpu-sensors gpu-sensors } of its board.dts; one
+ * without keeps the single hottest of all above): each group of cores follows the hottest of ITS OWN sensors (the same stepwise
+ * policy: a row a second down at or above th_trip, up at or below th_clear, the floor at th_critical, never below floor-mhz),
+ * and the GPU's frequency (an A618: hakios_adreno_set_cap(), the GMU's own DCVS request) is capped from the GPU's sensors: a
+ * level down a look at or above gpu-trip, up at or below gpu-clear, the lowest level at gpu-critical (700, 620, 950 unless the
+ * board or th_gpu_trip=N th_gpu_clear=N th_gpu_critical=N say). The panel's light follows the overall hottest, as before.
+ * thermal=1 only reads: the line has each domain's hottest.
+ *
  * At the run's end the rows are given back, so the loader is not left slow.
  *
  * And every look a line, "tl: h at US hottest TENTHS sensor N limit MHz,... asked MHz,... gpu MHz": the
@@ -64,6 +72,9 @@
 extern void hakios_backlight_set_cap(uint32_t level);
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 extern uint32_t hakios_adreno_core_mhz(void);
+extern bool hakios_adreno_cap_range(uint32_t *lowest, uint32_t *top);
+extern bool hakios_adreno_set_cap(uint32_t max_level);
+extern uint32_t hakios_adreno_cap_mhz(void);
 extern int hakios_scmi_perf_domain(unsigned domain, uint32_t *found, uint32_t *top);
 extern int hakios_scmi_perf_set(unsigned domain, uint32_t level);
 
@@ -96,6 +107,17 @@ static unsigned groups;                         /* how many groups of cores the 
 static bool scmi;                               /* the groups are SCMI performance domains (no EPSS) */
 static volatile int32_t hottest = TH_NONE;
 static volatile uint32_t step, most;
+
+/* ---- the domains (the board's cpu-sensors, gpu-sensors): each its own hottest and its own steps ---- */
+static bool domains;                            /* the board names the sensors of each domain */
+static uint32_t cpu_mask[TH_DOMAINS];           /* a group's sensors, bit N: reading N (controller * 16 + sensor); 0: the overall hottest */
+static uint32_t gpu_mask;                       /* the GPU's; 0: the GPU is not held back */
+static struct th_policy gpu_policy = { 700, 620, 950 }, gpu_in_force = { 700, 620, 950 };
+static uint32_t dstep[TH_DOMAINS], dmost[TH_DOMAINS];   /* how far each group is held back, and can be */
+static volatile int32_t dhot[TH_DOMAINS] = { TH_NONE, TH_NONE, TH_NONE, TH_NONE }, ghot = TH_NONE;
+static volatile uint32_t gstep, gmost;          /* the GPU: how many levels down from the top, of how many there are */
+static uint32_t glow, gtop, gapplied;           /* its levels (gtop: where it was found), and the level asked of it now */
+static bool gpu_known;                          /* the GPU's levels are known (it is up) */
 
 #define HAKIOS_MMIO_SYNC
 #include "mmio.h"
@@ -130,6 +152,8 @@ tenths_text(int32_t t, char *text, size_t size)
  * the phone was held back for. Its silence is no reason to give anything back (th_thread).
  */
 static bool answered[TH_CONTROLLERS * TH_SENSORS];
+static bool silent_at[TH_CONTROLLERS * TH_SENSORS];     /* answered before, none now */
+static int32_t last_readings[TH_CONTROLLERS * TH_SENSORS];
 
 /*
  * the hottest reading of every sensor of every controller, and which it is (controller * 16 + sensor); `*silent`: how many
@@ -151,11 +175,14 @@ read_hottest(unsigned *which, unsigned *silent)
 			for (unsigned again = 0; tsens[c] != 0 && again < 4 && t == TH_NONE; again++) {
 				t = th_tsens_tenths(rd(tsens[c] + TSENS_STATUS(s)));
 			}
+			silent_at[n] = false;
 			if (t != TH_NONE) {
 				answered[n] = true;
 			} else if (answered[n]) {
 				(*silent)++;
+				silent_at[n] = true;
 			}
+			last_readings[n] = t;
 			readings[n++] = t;
 		}
 	}
@@ -168,6 +195,18 @@ read_hottest(unsigned *which, unsigned *silent)
 		}
 	}
 	return hot;
+}
+
+/* how many of a domain's sensors (mask) answered before and are silent now */
+static unsigned
+silent_in(uint32_t mask)
+{
+	unsigned n = 0;
+
+	for (unsigned i = 0; i < 32 && i < TH_CONTROLLERS * TH_SENSORS; i++) {
+		n += (mask >> i & 1) && silent_at[i];
+	}
+	return n;
 }
 
 /* a row's frequency in a group's table, in MHz */
@@ -190,6 +229,18 @@ tell_look(int32_t t, unsigned which)
 		aa += (size_t)snprintf(asked + aa, sizeof(asked) - aa, "%s%u", d ? "," : "", row_mhz(d, rd(epss[d] + layout->perf_state)));
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+	if (domains) {
+		char hot[48] = "";
+		size_t ah = 0;
+
+		for (unsigned d = 0; d < groups; d++) {
+			ah += (size_t)snprintf(hot + ah, sizeof(hot) - ah, "%s%d", d ? "," : "", dhot[d]);
+		}
+		hakios_tl("tl: h at %llu hottest %d sensor %u limit %s asked %s gpu %u cpuh %s gpuh %d gcap %u glvl %u/%u\n", now_ns / 1000,
+		    t, which, limits[0] ? limits : "-", asked[0] ? asked : "-", hakios_adreno_core_mhz(), hot, ghot,
+		    hakios_adreno_cap_mhz(), gstep, gmost);
+		return;
+	}
 	hakios_tl("tl: h at %llu hottest %d sensor %u limit %s asked %s gpu %u\n", now_ns / 1000, t, which,
 	    limits[0] ? limits : "-", asked[0] ? asked : "-", hakios_adreno_core_mhz());
 }
@@ -239,7 +290,7 @@ static void
 apply(uint32_t s)
 {
 	for (unsigned d = 0; d < TH_DOMAINS; d++) {
-		uint32_t row = th_row(top_row[d], floor_row[d], s);
+		uint32_t row = th_row(top_row[d], floor_row[d], domains ? dstep[d] : s);
 
 		if (d < groups && scmi && row != row_now[d]) {
 			if (hakios_scmi_perf_set(d, row) == 0) {
@@ -258,18 +309,96 @@ static uint32_t period_ms = PERIOD_MS;          /* boot-arg th_period_ms (100 to
 
 static int poke;
 
+/*
+ * The domains' steps of this look (mode 2, the board names the sensors): each group's from its own hottest, the GPU's cap from
+ * the GPU's. As for the overall step: nothing given back while one of the domain's sensors that answered before is silent.
+ */
+static void
+domain_steps(bool *held_groups, bool *held_gpu)
+{
+	bool silence = false;
+
+	for (unsigned d = 0; d < groups; d++) {
+		uint32_t next = th_next_step(dstep[d], dmost[d], dhot[d], &in_force);
+
+		if (cpu_mask[d] != 0 && silent_in(cpu_mask[d]) != 0 && next < dstep[d]) {
+			next = dstep[d];
+			silence = true;
+		}
+		if (next != dstep[d]) {
+			char degrees[16];
+
+			dstep[d] = next;
+			say("thermal: group %u: %s C: held back %u of %u\n", d, tenths_text(dhot[d], degrees, sizeof(degrees)), next,
+			    dmost[d]);
+		}
+	}
+	*held_groups = silence;
+	if (gpu_mask == 0) {
+		return;
+	}
+	if (!gpu_known) {
+		uint32_t low, top;
+
+		/* (the GPU comes up some time after the start: its levels are asked at each look until it is) */
+		if (hakios_adreno_cap_range(&low, &top)) {
+			glow = low;
+			gtop = gapplied = top;
+			gmost = top > low ? top - low : 0;
+			gpu_known = true;
+			say("thermal: gpu: levels %u (lowest) to %u (asked at the start), trip %d.%d C, clear %d.%d C, critical %d.%d C\n",
+			    low, top, gpu_in_force.trip / 10, gpu_in_force.trip % 10, gpu_in_force.clear / 10, gpu_in_force.clear % 10,
+			    gpu_in_force.critical / 10, gpu_in_force.critical % 10);
+		}
+	}
+	if (gpu_known) {
+		struct th_policy now = gpu_policy;
+		uint32_t next, level;
+
+		if (now.clear < now.trip && now.trip < now.critical) {
+			gpu_in_force = now;
+		}
+		next = th_next_step(gstep, gmost, ghot, &gpu_in_force);
+		if (silent_in(gpu_mask) != 0 && next < gstep) {
+			next = gstep;
+			*held_gpu = true;
+		}
+		if (next != gstep) {
+			char degrees[16];
+
+			say("thermal: gpu: %s C: capped %u of %u levels\n", tenths_text(ghot, degrees, sizeof(degrees)), next, gmost);
+		}
+		gstep = next;
+		level = th_level(gtop, glow, gstep);
+		/* only when the cap changes -- and asked again at the next look if the GMU would not take it */
+		if (level != gapplied && hakios_adreno_set_cap(level)) {
+			gapplied = level;
+		}
+	}
+}
+
 static void
 th_thread(__unused void *argument, __unused wait_result_t result)
 {
 	uint32_t looks = 0, said_step = 0;
 	bool held_for_silence = false;          /* (said once each time it begins) */
+	bool held_groups = false, held_gpu = false;
 
 	for (;;) {
 		unsigned which = 0, silent = 0;
 		int32_t t = read_hottest(&which, &silent);
 
 		hottest = t;
+		if (domains) {
+			for (unsigned d = 0; d < groups; d++) {
+				dhot[d] = cpu_mask[d] != 0 ? th_masked_hottest(last_readings, 32, cpu_mask[d]) : t;
+			}
+			ghot = gpu_mask != 0 ? th_masked_hottest(last_readings, 32, gpu_mask) : TH_NONE;
+		}
 		tell_look(t, which);
+		if (mode >= 2 && domains) {
+			domain_steps(&held_groups, &held_gpu);
+		}
 		if (mode >= 2) {
 			/*
 			 * applied at every look, not only when the step changes: apply() writes only the groups that are not
@@ -340,6 +469,12 @@ SYSCTL_UINT(_hw_thermal, OID_AUTO, step, CTLFLAG_RD | CTLFLAG_LOCKED, __DEVOLATI
     "how far held back");
 SYSCTL_UINT(_hw_thermal, OID_AUTO, most, CTLFLAG_RD | CTLFLAG_LOCKED, __DEVOLATILE(uint32_t *, &most), 0,
     "how far it can be held back");
+SYSCTL_INT(_hw_thermal, OID_AUTO, gpu_hottest, CTLFLAG_RD | CTLFLAG_LOCKED, __DEVOLATILE(int32_t *, &ghot), 0,
+    "the hottest of the GPU's sensors, tenths of a degree (domains boards)");
+SYSCTL_UINT(_hw_thermal, OID_AUTO, gpu_step, CTLFLAG_RD | CTLFLAG_LOCKED, __DEVOLATILE(uint32_t *, &gstep), 0,
+    "how many GPU levels it is capped below where it started");
+SYSCTL_UINT(_hw_thermal, OID_AUTO, gpu_most, CTLFLAG_RD | CTLFLAG_LOCKED, __DEVOLATILE(uint32_t *, &gmost), 0,
+    "how many GPU levels it can be capped");
 /* a threshold root sets: 0 to TH_THRESHOLD_MOST, or refused (EINVAL) and left as it was */
 static int
 sysctl_threshold SYSCTL_HANDLER_ARGS
@@ -416,6 +551,30 @@ hakios_thermal_init(void)
 		policy = (struct th_policy){ 700, 620, 950 };
 	}
 	in_force = policy;
+	{
+		const typeof(this_board->thermal) *bt = &this_board->thermal;
+
+		gpu_policy = (struct th_policy){ bt->gpu_trip ? bt->gpu_trip : 700, bt->gpu_clear ? bt->gpu_clear : 620,
+			bt->gpu_critical ? bt->gpu_critical : 950 };
+		if (PE_parse_boot_argn("th_gpu_trip", &value, sizeof(value))) {
+			gpu_policy.trip = value;
+		}
+		if (PE_parse_boot_argn("th_gpu_clear", &value, sizeof(value))) {
+			gpu_policy.clear = value;
+		}
+		if (PE_parse_boot_argn("th_gpu_critical", &value, sizeof(value))) {
+			gpu_policy.critical = value;
+		}
+		if (gpu_policy.clear < 0 || gpu_policy.clear >= gpu_policy.trip || gpu_policy.trip >= gpu_policy.critical ||
+		    gpu_policy.critical > TH_THRESHOLD_MOST) {
+			say("thermal: gpu: 0 <= clear < trip < critical <= %d does not hold (%d, %d, %d): the defaults\n",
+			    TH_THRESHOLD_MOST, gpu_policy.clear, gpu_policy.trip, gpu_policy.critical);
+			gpu_policy = (struct th_policy){ 700, 620, 950 };
+		}
+		gpu_in_force = gpu_policy;
+		gpu_mask = bt->gpu_sensors;
+		domains = bt->gpu_sensors != 0 || bt->cpu_sensors[0] != 0;
+	}
 	for (unsigned c = 0; c < TH_CONTROLLERS; c++) {
 		tsens[c] = this_board->thermal.tsens[c] ? ml_io_map(this_board->thermal.tsens[c], 0x200) : 0;
 	}
@@ -441,6 +600,16 @@ hakios_thermal_init(void)
 			most = top_row[d] - floor_row[d] > most ? top_row[d] - floor_row[d] : most;
 		}
 	}
+	for (unsigned d = 0; d < groups && d < TH_DOMAINS; d++) {
+		cpu_mask[d] = this_board->thermal.cpu_sensors[d];
+		dmost[d] = floor_row[d] < top_row[d] ? top_row[d] - floor_row[d] : 0;
+	}
+	if (domains) {
+		say("thermal: per domain: the groups' sensors %#x %#x %#x %#x, the GPU's %#x (gpu: trip %d.%d C, clear %d.%d C, critical %d.%d C)%s\n",
+		    cpu_mask[0], cpu_mask[1], cpu_mask[2], cpu_mask[3], gpu_mask, gpu_policy.trip / 10, gpu_policy.trip % 10,
+		    gpu_policy.clear / 10, gpu_policy.clear % 10, gpu_policy.critical / 10, gpu_policy.critical % 10,
+		    mode >= 2 ? "" : " (thermal=1: looking only)");
+	}
 	{
 		char tops[48], floors[48];
 
@@ -461,16 +630,19 @@ hakios_thermal_quiesce(void)
 {
 	/* SCMI: nothing is asked here -- hakios_scmi_perf_quiesce(), called after this, asks each domain back to the level
 	 * it was found at, held back or not */
-	if (mode < 2 || step == 0 || scmi) {
+	bool any = false;
+
+	if (mode < 2 || (step == 0 && !domains) || scmi) {
 		return;
 	}
 	for (unsigned d = 0; d < TH_DOMAINS; d++) {
 		if (epss[d] != 0 && row_now[d] != top_row[d]) {
 			apply_row(d, top_row[d]);
 			row_now[d] = top_row[d];
+			any = true;
 		}
 	}
-	{
+	if (any || !domains) {
 		char rows[48];
 
 		say("thermal: at the run's end: the groups back at rows %s\n", rows_text(top_row, rows, sizeof(rows)));

@@ -425,6 +425,14 @@ struct hakios_board {
 	struct {
 		uint32_t tsens[HAKIOS_TSENS_MAX];       /* the TSENS controllers' readings, 0: none */
 		uint32_t floor_mhz[HAKIOS_CPU_GROUPS];  /* the slowest each group of cores is held back to */
+		/*
+		 * Android-style domains (all optional; 0: the old way, one hottest of all sensors for everything): a mask of the
+		 * sensors each group of cores follows and one for the GPU (bit N: sensor N % 16 of controller N / 16), and the
+		 * GPU's own thresholds in tenths of a degree (0: 700, 620, 950)
+		 */
+		uint32_t cpu_sensors[HAKIOS_CPU_GROUPS];
+		uint32_t gpu_sensors;
+		int32_t gpu_trip, gpu_clear, gpu_critical;
 	} thermal;
 };
 

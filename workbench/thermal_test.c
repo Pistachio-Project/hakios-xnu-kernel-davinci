@@ -26,6 +26,27 @@ main(void)
 	/* the hottest */
 	CHECK(th_hottest(r, 4) == 712, "%d", th_hottest(r, 4));
 	CHECK(th_hottest(r, 1) == TH_NONE, "none");
+	/* a domain's own hottest: the readings of its mask (bit N: reading N) */
+	{
+		int32_t d[16] = { TH_NONE, 500, 510, 520, 530, 540, 550, 560, 0, 910, 920, 900, 880, 700, 750, TH_NONE };
+		struct th_policy g = { 450, 400, 900 };
+
+		CHECK(th_masked_hottest(d, 16, 0x7e) == 550, "A55s: %d", th_masked_hottest(d, 16, 0x7e));
+		CHECK(th_masked_hottest(d, 16, 0x1e00) == 920, "A76s: %d", th_masked_hottest(d, 16, 0x1e00));
+		CHECK(th_masked_hottest(d, 16, 0x6000) == 750, "GPU: %d", th_masked_hottest(d, 16, 0x6000));
+		CHECK(th_masked_hottest(d, 16, 0x8001) == TH_NONE, "only silent sensors: none");
+		CHECK(th_masked_hottest(d, 16, 0) == TH_NONE, "no mask: none");
+		CHECK(th_masked_hottest(d, 4, 0x6000) == TH_NONE, "bits beyond n are not read");
+		/* the GPU's levels 1..5 (most 4): a level down a look from its own trip, to the lowest at critical */
+		s = 0;
+		for (int i = 0; i < 6; i++) {
+			s = th_next_step(s, 4, 460, &g);
+		}
+		CHECK(s == 4 && th_level(5, 1, s) == 1 && th_level(5, 1, 2) == 3 && th_level(5, 1, 0) == 5, "levels: step %u", s);
+		CHECK(th_next_step(0, 4, 900, &g) == 4 && th_level(5, 1, 4) == 1, "critical: the lowest at once");
+		CHECK(th_level(5, 1, th_next_step(4, 4, 400, &g)) == 2, "at clear: a level back");
+		CHECK(th_level(1, 1, 3) == 1, "a GPU at its lowest has nowhere to go");
+	}
 	/* the steps */
 	CHECK(th_next_step(0, 5, 650, &p) == 0, "between clear and trip from cool: stays cool");
 	CHECK(th_next_step(2, 5, 650, &p) == 2, "between: stays held");

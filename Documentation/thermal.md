@@ -25,8 +25,21 @@ The limiter never raises a group above the row it found at start: without `cpufr
 
 The panel's cap goes to `hakios_backlight_set_cap()` (`Documentation/backlight.md`, `hw.backlight.cap`): an AMOLED
 at full white is heat as well, and an iPhone dims when hot. The GPU's speed is not changed here, because it
-belongs to its GMU (`adreno_speed`). `hakios_thermal_step()` exposes how far things are held back, for when the
-GPU driver wants to follow.
+belongs to its GMU (`adreno_speed`), except per domain (below). `hakios_thermal_step()` exposes how far things are held
+back.
+
+### Per domain (Android style)
+
+A board that names which sensors are whose is held back per domain; one that does not keeps the single hottest of all
+above. In the board's `thermal { }`: `cpu-sensors = <mask mask ...>` (one per group of cores) and `gpu-sensors = <mask>`,
+optionally `gpu-trip`, `gpu-clear`, `gpu-critical` (tenths of a degree, 700/620/950). Bit N of a mask is sensor N % 16 of TSENS
+controller N / 16 (the `sensor N` of the `tl:` line). Each group follows the hottest of its own sensors with the stepwise policy
+above (never below `floor-mhz`); the GPU follows the hottest of its own, a level cap one level down a look at or above
+`gpu-trip`, up at or below `gpu-clear`, the lowest level at `gpu-critical`, applied by `hakios_adreno_set_cap()` only when the
+cap changes (A618: the GMU's DCVS request; A660 is unchanged). The panel's light follows the overall hottest. Boot-arguments
+`th_gpu_trip=`, `th_gpu_clear=`, `th_gpu_critical=` override the GPU's thresholds (to test at 45 C: `th_gpu_trip=450
+th_gpu_clear=400`). `thermal=1` only adds `cpuh a,b gpuh N gcap MHz glvl step/most` to the `tl:` line; `hw.thermal.gpu_hottest`,
+`gpu_step`, `gpu_most` are read-only.
 
 ## Boot arguments and sysctl
 

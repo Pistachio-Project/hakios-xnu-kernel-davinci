@@ -89,6 +89,7 @@
 #include <sys/systm.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/locks.h>
 #include <kern/sched_prim.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -2112,6 +2113,11 @@ static const struct {
 };
 #define GPU_SPEEDS              ((uint32_t)(sizeof(gpu_speeds) / sizeof(gpu_speeds[0])))
 static uint32_t gpu_votes[GPU_SPEEDS], gpu_speed = GPU_SPEEDS - 1;
+/* what the GMU was last asked for (the thermal cap may lower it below gpu_speed, never raise it above); 0: not yet asked */
+static uint32_t gpu_applied;
+/* every talk to the GMU after the steps: the thermal limiter's (a618_gpu_set_cap) */
+static LCK_GRP_DECLARE(gpu_dcvs_lock_group, "hakios-a618-dcvs");
+static LCK_MTX_DECLARE(gpu_dcvs_lock, &gpu_dcvs_lock_group);
 
 static bool
 step_gmu_queues(void)
@@ -2315,6 +2321,7 @@ step_core_power(void)
 	} else {
 		hakios_say("adreno: %u: no speed set: the core runs at whatever the GMU chose; going on\n", step);
 	}
+	gpu_applied = gpu_speed;
 	returned = get(&gmu, "dcvs_return", GMU_DCVS_RETURN);
 	hakios_say("adreno: %u: measured: the 3D core's clock runs at %u Hz (dcvs_return %d)\n", step,
 	    measure_quietly(GPUCC_DEBUG_GX_GFX3D), (int)returned);
@@ -3295,6 +3302,63 @@ a618_adreno_quiesce(void)
 void
 a618_adreno_minute(void)
 {
+}
+
+/*
+ * The thermal limiter's way in (drivers/board/thermal.c, through hakios_adreno_set_cap() in adreno.c): the speeds are the
+ * levels 1 (lowest) to the one asked for at the start (gpu_speed), and a cap is one of them: the core is asked for
+ * min(asked, cap) by the same DCVS request as step 17 (put the setting, OOB_DCVS, give it back). From a thread only (the
+ * request sleeps), serialized by gpu_dcvs_lock, and only while the GPU is up and kept.
+ */
+bool
+a618_gpu_cap_range(uint32_t *lowest, uint32_t *top)
+{
+	if (!gpu_kept || gpu_applied == 0) {
+		return false;
+	}
+	*lowest = 1;
+	*top = gpu_speed;
+	return true;
+}
+
+/* the speed the core was last asked for, in MHz; 0 when the GPU is not up */
+uint32_t
+a618_gpu_cap_mhz(void)
+{
+	return gpu_kept && gpu_applied != 0 ? gpu_speeds[gpu_applied].khz / 1000 : 0;
+}
+
+/* true if the core is now asked for min(asked, max_level) (or already was); false: not done, to be asked again */
+bool
+a618_gpu_set_cap(uint32_t max_level)
+{
+	uint32_t want = max_level < gpu_speed ? max_level : gpu_speed;
+	bool done = false;
+
+	if (want < 1) {
+		want = 1;
+	}
+	lck_mtx_lock(&gpu_dcvs_lock);
+	if (!gpu_kept || gpu_applied == 0) {
+		lck_mtx_unlock(&gpu_dcvs_lock);
+		return false;
+	}
+	if (want == gpu_applied) {
+		lck_mtx_unlock(&gpu_dcvs_lock);
+		return true;
+	}
+	put(&gmu, "dcvs_ack_option", GMU_DCVS_ACK_OPTION, 0);
+	put(&gmu, "dcvs_perf_setting", GMU_DCVS_PERF_SETTING, 3u << 28 | want);
+	put(&gmu, "dcvs_bw_setting", GMU_DCVS_BW_SETTING, 0xff);
+	if (oob_set("for the thermal speed", OOB_DCVS)) {
+		oob_clear(OOB_DCVS);
+		hakios_say("adreno: thermal: 3D core %s at %u MHz (level %u of %u)\n", want < gpu_applied ? "capped" : "released",
+		    gpu_speeds[want].khz / 1000, want, gpu_speed);
+		gpu_applied = want;
+		done = true;
+	}
+	lck_mtx_unlock(&gpu_dcvs_lock);
+	return done;
 }
 
 /* How long the core has worked: not measured on this chip yet. */

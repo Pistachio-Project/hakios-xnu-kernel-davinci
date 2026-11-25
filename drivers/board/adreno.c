@@ -138,6 +138,9 @@ uint32_t a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint3
 void a618_gpu_report(const char *why);
 bool a618_gpu_recover(void);
 void a618_adreno_minute(void);
+bool a618_gpu_cap_range(uint32_t *lowest, uint32_t *top);
+uint32_t a618_gpu_cap_mhz(void);
+bool a618_gpu_set_cap(uint32_t max_level);
 void a618_adreno_init(void);
 
 static inline bool
@@ -3435,6 +3438,30 @@ hakios_adreno_core_mhz(void)
 	}
 	hz = measure(GPUCC_DEBUG_GX_GFX3D);
 	return hz == MEASURE_FAILED ? 0 : (hz + 500000) / 1000000;
+}
+
+/*
+ * The thermal limiter's GPU frequency cap (drivers/board/thermal.c), on an A618 only: the levels from `*lowest` to `*top` (the
+ * one the GPU was asked for at the start), false while the GPU is not up (or on an A660: its speed is not touched here).
+ * hakios_adreno_set_cap(): the core is asked for no more than `max_level`; true when it is (or already was). Thread context only.
+ */
+bool
+hakios_adreno_cap_range(uint32_t *lowest, uint32_t *top)
+{
+	return gpu_is_a618() && a618_gpu_cap_range(lowest, top);
+}
+
+bool
+hakios_adreno_set_cap(uint32_t max_level)
+{
+	return gpu_is_a618() && a618_gpu_set_cap(max_level);
+}
+
+/* the speed the core was last asked for, in MHz (A618; 0 otherwise) */
+uint32_t
+hakios_adreno_cap_mhz(void)
+{
+	return gpu_is_a618() ? a618_gpu_cap_mhz() : 0;
 }
 
 /* The answers to msm's GET_PARAM (Linux's adreno_get_param for this GPU; the numbers are msm_drm.h's). */

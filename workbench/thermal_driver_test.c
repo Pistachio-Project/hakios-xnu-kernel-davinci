@@ -131,6 +131,32 @@ hakios_test_wr(vm_offset_t a, uint32_t v)
 vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size __unused) { return phys; }
 void hakios_backlight_set_cap(uint32_t level) { cap = level; }
 uint32_t hakios_adreno_core_mhz(void) { return 550; }
+/* the GPU's levels 1 to 5 (the A618's): up or not yet, and what it was asked */
+static bool gpu_up = true;
+static unsigned gpu_cap_calls, gpu_refusals;
+static uint32_t gpu_level = 5;
+bool
+hakios_adreno_cap_range(uint32_t *lowest, uint32_t *top)
+{
+	if (!gpu_up) {
+		return false;
+	}
+	*lowest = 1;
+	*top = 5;
+	return true;
+}
+bool
+hakios_adreno_set_cap(uint32_t max_level)
+{
+	gpu_cap_calls++;
+	if (!gpu_up || gpu_refusals > 0) {
+		gpu_refusals -= gpu_refusals > 0;
+		return false;
+	}
+	gpu_level = max_level;
+	return true;
+}
+uint32_t hakios_adreno_cap_mhz(void) { return gpu_up ? 100 * gpu_level : 0; }
 
 void
 hakios_tl(const char *format, ...)
@@ -749,6 +775,85 @@ scmi_without_levels(void)
 	    get("step"), scmi_asked);
 }
 
+/* a board that names each domain's sensors: a group is held back by its own, the GPU's cap follows the GPU's */
+static void
+domains_heat_and_cool(void)
+{
+	phone(500);
+	board = "phone-keys";
+	osm = true;
+	lmh[1] = 600;
+	gpu_up = false;
+	temperature(0, 3, 500);                 /* group 0's */
+	temperature(0, 4, 720);                 /* group 1's (and not group 0's) */
+	temperature(0, 5, 500);                 /* the GPU's */
+	boot_args = "thermal=2 th_period_ms=100";
+	hakios_thermal_init();
+	WAIT_FOR(perf[1] == 4, 3000);
+	CHECK(perf[1] == 4, "group 1 follows its own hot sensor: row %u", perf[1]);
+	CHECK(perf[0] == ROWS - 1, "group 0, whose sensors are cool, is not held back: row %u", perf[0]);
+	CHECK(logged("thermal: group 1: 72.0 C: held back 1 of 4") && !logged("thermal: group 0:"), "said per group: %s", log_text);
+	/* the GPU: hot while not up: nothing asked until it is up */
+	temperature(0, 6, 800);
+	usleep(400000);
+	CHECK(gpu_cap_calls == 0 && gpu_level == 5, "the GPU is not up: %u calls", gpu_cap_calls);
+	gpu_up = true;
+	WAIT_FOR(gpu_level == 1, 3000);
+	CHECK(gpu_level == 1, "capped a level a look to the lowest: %u", gpu_level);
+	usleep(400000);
+	CHECK(gpu_cap_calls == 4, "asked only when the cap changes: %u calls", gpu_cap_calls);
+	CHECK(logged("thermal: gpu: 80.0 C: capped 1 of 4 levels") && logged("capped 4 of 4"), "said: %s", log_text);
+	CHECK(strstr(tl_lines, "cpuh 500,720 gpuh 800 gcap 100 glvl 4/4") != NULL, "the line: %.300s", tl_lines);
+	/* between clear and trip: held; below clear: given back a level a look */
+	temperature(0, 6, 660);
+	usleep(400000);
+	CHECK(gpu_level == 1, "held between clear and trip: %u", gpu_level);
+	temperature(0, 6, 500);
+	WAIT_FOR(gpu_level == 5, 3000);
+	CHECK(gpu_level == 5 && gpu_cap_calls == 8, "given back, level %u, %u calls", gpu_level, gpu_cap_calls);
+	/* critical: the lowest at once; a refusal is asked again at the next look */
+	gpu_refusals = 2;
+	temperature(0, 6, 960);
+	WAIT_FOR(gpu_level == 1, 3000);
+	CHECK(gpu_level == 1 && gpu_cap_calls >= 11, "critical: the lowest at once, a refused ask repeated: level %u, %u calls", gpu_level, gpu_cap_calls);
+	CHECK(foreign == 0, "no other register: %u", foreign);
+}
+
+/* the GPU's own thresholds from boot-args: lowered to trigger at 45 C */
+static void
+gpu_thresholds_by_boot_arg(void)
+{
+	phone(400);
+	board = "phone-keys";
+	osm = true;
+	gpu_up = true;
+	temperature(0, 5, 470);
+	boot_args = "thermal=2 th_period_ms=100 th_gpu_trip=450 th_gpu_clear=400 th_gpu_critical=900";
+	hakios_thermal_init();
+	WAIT_FOR(gpu_level == 1, 3000);
+	CHECK(gpu_level == 1, "capped from 45 C: %u", gpu_level);
+	CHECK(perf[0] == ROWS - 1 && perf[1] == ROWS - 1, "the cores, not near their trip, untouched: %u %u", perf[0], perf[1]);
+	temperature(0, 5, 390);
+	WAIT_FOR(gpu_level == 5, 3000);
+	CHECK(gpu_level == 5, "given back below 40 C: %u", gpu_level);
+}
+
+/* thermal=1: the domains' hottest are in the line, nothing is asked of the GPU or the cores */
+static void
+domains_look_only(void)
+{
+	phone(400);
+	board = "phone-keys";
+	osm = true;
+	temperature(0, 5, 800);
+	boot_args = "thermal=1 th_period_ms=100";
+	hakios_thermal_init();
+	WAIT_FOR(strstr(tl_lines, "gpuh 800") != NULL, 1000);
+	CHECK(strstr(tl_lines, "gpuh 800") != NULL, "the line: %.300s", tl_lines);
+	usleep(300000);
+	CHECK(gpu_cap_calls == 0 && writes == 0, "looked only: %u calls, %u writes", gpu_cap_calls, writes);
+}
+
 /* at the run's end on a phone that never got hot: nothing written, nothing said */
 static void
 quiesce_when_cool(void)
@@ -773,7 +878,7 @@ main(int argc, char **argv)
 		{ "bad_policy", bad_policy }, { "clear_at_the_trip", clear_at_the_trip }, { "said_off", said_off },
 		{ "slowest_period", slowest_period }, { "too_short_a_period", too_short_a_period }, { "scmi_heat_and_cool", scmi_heat_and_cool }, { "scmi_refused", scmi_refused }, { "scmi_refused_at_critical", scmi_refused_at_critical },
 		{ "said_every_tenth_look", said_every_tenth_look }, { "below_freezing_said", below_freezing_said }, { "step_for_the_gpu", step_for_the_gpu },
-		{ "scmi_without_levels", scmi_without_levels }, { "quiesce_when_cool", quiesce_when_cool },
+		{ "scmi_without_levels", scmi_without_levels }, { "domains_heat_and_cool", domains_heat_and_cool }, { "gpu_thresholds_by_boot_arg", gpu_thresholds_by_boot_arg }, { "domains_look_only", domains_look_only }, { "quiesce_when_cool", quiesce_when_cool },
 	};
 
 	if (argc < 2) {
