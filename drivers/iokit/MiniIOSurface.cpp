@@ -218,7 +218,7 @@ surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unu
  * made of such memory, as many as SCANOUT_SURFACES alive at once (a piece is 6 MB of the scarce contiguous kind); the others
  * are as ever, and so is any that cannot be had in one piece -- those are copied to the panel.
  */
-#define SCANOUT_SURFACES        6               /* (backboardd's of the display's size alive at once: more than four on the Mi 9T, 1, 3, 4, 7 and those it makes anew) */
+#define SCANOUT_SURFACES        10              /* (backboardd keeps more alive than its swap chain: 1, 3, 4, 7 and later ones such as 1019 and 1043 on the Mi 9T; six were all taken at times) */
 static uint32_t gScanoutWidth, gScanoutHeight;
 static volatile SInt32 gScanoutLive;
 static uint32_t gScanoutRefused;
