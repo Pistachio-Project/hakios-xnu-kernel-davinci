@@ -779,6 +779,158 @@ stream_start(int slot, uint64_t bytes)
 
 /* ---- the slots ---- */
 
+/*
+ * Kept across boots all the same, when the system image is the one the store was saved under (unless boot-arg
+ * var_store_ls=0, which drops it at every boot as above): the icon caches (IconServices', in which the Settings list's
+ * icons are held) are keyed to the database's entries, and with the database made anew every boot they were rebuilt, late,
+ * every boot. The image's identity is written into the archive's header block at save, and compared at load with the
+ * image of this boot: the file /System/Library/HakiOS/image-id (mkimage26.py writes one, new at every build), or, for an
+ * image built without it, a hash of what an added application changes: SystemVersion.plist's size and time and
+ * /Applications' names, sizes and times. A different image, an archive without an identity, or no identity to be had:
+ * the database and the icon caches are both dropped, as before, so that they are made again from the image.
+ */
+#ifndef IMAGE_ID_FILE
+#define IMAGE_ID_FILE   "/System/Library/HakiOS/image-id"
+#define IMAGE_SYSVER    "/System/Library/CoreServices/SystemVersion.plist"
+#define IMAGE_APPS      "/Applications"
+#endif
+#define ID_AT           256             /* in the header block, after the structure */
+#define ID_MAX          96
+#define ID_MAGIC        "IMGID1\0"
+
+static int ls_wanted = -1;
+
+static int
+ls_on(void)
+{
+	if (ls_wanted < 0) {
+		ls_wanted = !boot_arg_is("var_store_ls", "0");
+	}
+	return ls_wanted;
+}
+
+static int ls_keep;                     /* load: the saved identity is this boot's image's */
+
+/* IconServices' caches: the system group's, and the mobile user's */
+static int
+is_icon_cache(const char *relative)
+{
+	static const char *const names[] = {
+		"containers/Shared/SystemGroup/systemgroup.com.apple.lsd.iconscache",
+		"mobile/Library/Caches/com.apple.IconsCache",
+		NULL,
+	};
+
+	for (int i = 0; names[i] != NULL; i++) {
+		const size_t n = strlen(names[i]);
+
+		if (strncmp(relative, names[i], n) == 0 && (relative[n] == '/' || relative[n] == 0)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* The identity of the image this boot runs from, in ID (ID_MAX bytes); 0 when there is none to be had. */
+static int
+image_identity(char *id)
+{
+	char text[ID_MAX];
+	struct stat st;
+	int f = open(IMAGE_ID_FILE, O_RDONLY, 0);
+
+	if (f >= 0) {
+		ssize_t got = read(f, text, sizeof(text) - 8);
+
+		close(f);
+		while (got > 0 && (text[got - 1] == '\n' || text[got - 1] == ' ' || text[got - 1] == '\r')) {
+			got--;
+		}
+		if (got > 0) {
+			memcpy(id, "id:", 3);
+			memcpy(id + 3, text, (size_t)got);
+			id[3 + got] = 0;
+			for (char *c = id; *c != 0; c++) {
+				if ((unsigned char)*c < 0x20) {
+					*c = '?';
+				}
+			}
+			return 1;
+		}
+	}
+	/* no file: what the image's applications and version say */
+	if (lstat(IMAGE_SYSVER, &st) != 0) {
+		return 0;
+	}
+	{
+		static char buf[8192];
+		off_t position = 0;
+		ssize_t got;
+		uint32_t sum = 0, count = 0;
+		uint32_t base = crc_add(0xffffffffu, &st.st_size, sizeof(st.st_size));
+		int dir = open(IMAGE_APPS, O_RDONLY | O_DIRECTORY, 0);
+
+		base = crc_add(base, &st.st_mtimespec.tv_sec, sizeof(st.st_mtimespec.tv_sec));
+		if (dir < 0) {
+			return 0;
+		}
+		while ((got = getdirentries(dir, buf, sizeof(buf), &position)) > 0) {
+			for (ssize_t at = 0; at < got; at += ((struct dirent *)(buf + at))->d_reclen) {
+				const char *name = ((struct dirent *)(buf + at))->d_name;
+				char full[MAX_PATH];
+				uint32_t c;
+
+				if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+				    sizeof(IMAGE_APPS) + strlen(name) + 1 >= sizeof(full)) {
+					continue;
+				}
+				memcpy(full, IMAGE_APPS "/", sizeof(IMAGE_APPS));
+				strcpy(full + sizeof(IMAGE_APPS), name);
+				if (lstat(full, &st) != 0) {
+					continue;
+				}
+				c = crc_add(0xffffffffu, name, strlen(name));
+				c = crc_add(c, &st.st_size, sizeof(st.st_size));
+				c = crc_add(c, &st.st_mtimespec.tv_sec, sizeof(st.st_mtimespec.tv_sec));
+				sum += c;       /* (the order of the names does not matter) */
+				count++;
+			}
+		}
+		close(dir);
+		{
+			static const char hex[] = "0123456789abcdef";
+			const uint32_t part[3] = { base ^ 0xffffffffu, sum, count };
+			char *o = id;
+
+			*o++ = 'f';
+			*o++ = 'b';
+			for (int k = 0; k < 3; k++) {
+				*o++ = ':';
+				for (int sh = 28; sh >= 0; sh -= 4) {
+					*o++ = hex[(part[k] >> sh) & 15];
+				}
+			}
+			*o = 0;
+		}
+	}
+	return 1;
+}
+
+/* the identity a slot's header block holds, if any */
+static int
+slot_identity(int slot, char *id)
+{
+	static uint8_t block[BLOCK];
+
+	if (!device_read(slot_at(slot), block, BLOCK) || memcmp(block + ID_AT, ID_MAGIC, 8) != 0 ||
+	    block[ID_AT + 8 + ID_MAX - 1] != 0 || block[ID_AT + 8] == 0) {
+		return 0;
+	}
+	memcpy(id, block + ID_AT + 8, ID_MAX);
+	return 1;
+}
+
+
 /* The slot's header, if it is one of ours and says of itself what it should. */
 static int
 read_head(int slot, struct head *into)
@@ -1383,7 +1535,7 @@ pack_tree(const char *relative)
 			} else {
 				strcpy(child, name);
 			}
-			if (!is_launchservices_store(child)) {
+			if (ls_on() || !is_launchservices_store(child)) {
 				ok = pack_tree(child);
 			}
 			path[base] = 0;
@@ -1507,6 +1659,17 @@ save(void)
 	}
 	memset(block, 0, sizeof(block));
 	memcpy(block, &h, sizeof(h));
+	{
+		char id[ID_MAX];
+
+		if (ls_on() && image_identity(id)) {
+			memcpy(block + ID_AT, ID_MAGIC, 8);
+			memcpy(block + ID_AT + 8, id, ID_MAX);
+			printf("var_store: the image is %s\n", id);
+		} else {
+			printf("var_store: no image identity kept (LaunchServices store and icon caches are dropped at the next boot)\n");
+		}
+	}
 	/* the table of the blocks, after the archive and before the header that vouches for both */
 	if (new_hash != NULL && hashed_blocks == (h.bytes + BLOCK - 1) / BLOCK && hashed_blocks != 0) {
 		struct tblhead t;
@@ -1660,7 +1823,7 @@ unpack_one(int make)
 		make = 0;
 		skipped_load++;
 	}
-	if (make && is_launchservices_store(relative)) {
+	if (make && !ls_keep && (is_launchservices_store(relative) || (ls_on() && is_icon_cache(relative)))) {
 		make = 0;
 		skipped_load++;
 	}
@@ -1914,8 +2077,26 @@ load(void)
 			return 1;
 		}
 		h = other;
+		best = left;
 		printf("var_store: slot %d is good after all: generation %llu\n", left,
 		    (unsigned long long)h.generation);
+	}
+	{
+		char saved[ID_MAX], now[ID_MAX];
+
+		ls_keep = 0;
+		if (!ls_on()) {
+			printf("var_store: LaunchServices store dropped (var_store_ls=0)\n");
+		} else if (!slot_identity(best, saved)) {
+			printf("var_store: LaunchServices store dropped (the archive knows no image)\n");
+		} else if (!image_identity(now)) {
+			printf("var_store: LaunchServices store dropped (this image has no identity)\n");
+		} else if (strcmp(saved, now) != 0) {
+			printf("var_store: LaunchServices store dropped (image changed: %s -> %s)\n", saved, now);
+		} else {
+			ls_keep = 1;
+			printf("var_store: LaunchServices store kept (image unchanged: %s)\n", now);
+		}
 	}
 	if (!pass(&h, 1)) {
 		printf("var_store: the archive read differently the second time: what was made stays\n");

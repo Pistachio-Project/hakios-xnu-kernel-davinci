@@ -150,6 +150,10 @@ host_path(const char *p)
 		snprintf(o, sizeof(buf[0]), "%s/var%s", test_root, p + sizeof(ROOT) - 1);
 		return o;
 	}
+	if (strncmp(p, "/System/", 8) == 0 || strncmp(p, "/Applications", 13) == 0) {
+		snprintf(o, sizeof(buf[0]), "%s/img%s", test_root, p);     /* the system image, a directory of the test's */
+		return o;
+	}
 	return p;
 }
 
@@ -593,6 +597,80 @@ main(void)
 	keychain_wanted = -1;
 	links = (void *)link_space;
 	snprintf(test_root, sizeof(test_root), "%s.d", name);
+
+	/*
+	 * The LaunchServices store and the icon caches: kept while the system image is the one they were saved under
+	 * (var_store_ls=0: never), dropped together when it changed or has no identity.
+	 */
+	{
+		char p[8192], q[256];
+		const char *cs = "containers/Data/Application/AAAA/Library/Preferences/com.apple.LaunchServices-1234.csstore";
+		const char *ic = "containers/Shared/SystemGroup/systemgroup.com.apple.lsd.iconscache/Library/Caches/x.cache";
+		const char *mi = "mobile/Library/Caches/com.apple.IconsCache/y.cache";
+		const char *ot = "mobile/Library/Preferences/keep.plist";
+		const char *files[3] = { cs, ic, mi };
+
+		boot_line = "var_store=1";
+		ls_wanted = -1;
+		snprintf(p, sizeof(p), "rm -rf %s/var %s/img; mkdir -p %s/img/System/Library/HakiOS %s/img/System/Library/CoreServices "
+		    "%s/img/Applications/A.app %s/var/mobile/Library/Preferences", test_root, test_root, test_root, test_root, test_root, test_root);
+		CHECK(system(p) == 0, "image and volume");
+		snprintf(p, sizeof(p), "echo build-1 > %s/img/System/Library/HakiOS/image-id; echo v > %s/img/System/Library/CoreServices/SystemVersion.plist",
+		    test_root, test_root);
+		CHECK(system(p) == 0, "image id");
+		for (int i = 0; i < 3; i++) {
+			snprintf(p, sizeof(p), "mkdir -p $(dirname %s/var/%s); echo data > %s/var/%s", test_root, files[i], test_root, files[i]);
+			CHECK(system(p) == 0, "file %d", i);
+		}
+		snprintf(p, sizeof(p), "echo keep > %s/var/%s", test_root, ot);
+		CHECK(system(p) == 0, "other file");
+		CHECK(save(), "saved with an identity");
+		CHECK(image_identity(q) && strcmp(q, "id:build-1") == 0, "identity from the file: %s", q);
+		snprintf(p, sizeof(p), "rm -rf %s/var/containers %s/var/mobile", test_root, test_root);
+		CHECK(system(p) == 0 && load(), "load, same image");
+		CHECK(ls_keep == 1, "kept when the image is the same");
+		snprintf(p, sizeof(p), "test -f %s/var/%s && test -f %s/var/%s && test -f %s/var/%s && test -f %s/var/%s", test_root, cs, test_root, ic,
+		    test_root, mi, test_root, ot);
+		CHECK(system(p) == 0, "csstore, both icon caches and the rest are back");
+		/* the image changed: the identity file */
+		snprintf(p, sizeof(p), "echo build-2 > %s/img/System/Library/HakiOS/image-id; rm -rf %s/var/containers %s/var/mobile", test_root, test_root, test_root);
+		CHECK(system(p) == 0 && load() && ls_keep == 0, "load, image changed");
+		snprintf(p, sizeof(p), "test ! -e %s/var/%s && test ! -e %s/var/%s && test ! -e %s/var/%s && test -f %s/var/%s", test_root, cs, test_root, ic,
+		    test_root, mi, test_root, ot);
+		CHECK(system(p) == 0, "csstore and icon caches dropped together, the rest kept");
+		/* var_store_ls=0 */
+		snprintf(p, sizeof(p), "echo build-1 > %s/img/System/Library/HakiOS/image-id; rm -rf %s/var/containers %s/var/mobile", test_root, test_root, test_root);
+		CHECK(system(p) == 0 && load() && ls_keep == 1, "same image again");
+		boot_line = "var_store=1 var_store_ls=0";
+		ls_wanted = -1;
+		snprintf(p, sizeof(p), "rm -rf %s/var/containers %s/var/mobile", test_root, test_root);
+		CHECK(system(p) == 0 && load() && ls_keep == 0, "load, var_store_ls=0");
+		snprintf(p, sizeof(p), "test ! -e %s/var/%s && test -f %s/var/%s && test -f %s/var/%s", test_root, cs, test_root, ic, test_root, mi);
+		CHECK(system(p) == 0, "var_store_ls=0 drops the csstore alone, as before");
+		CHECK(save(), "save with var_store_ls=0");
+		/* no id file: the fallback follows /Applications */
+		boot_line = "var_store=1";
+		ls_wanted = -1;
+		snprintf(p, sizeof(p), "rm %s/img/System/Library/HakiOS/image-id; mkdir -p %s/var/%s; echo data > %s/var/%s", test_root, test_root,
+		    "mobile/Library/Caches/com.apple.IconsCache", test_root, mi);
+		CHECK(system(p) == 0, "no id file");
+		for (int i = 0; i < 3; i++) {
+			snprintf(p, sizeof(p), "mkdir -p $(dirname %s/var/%s); echo data > %s/var/%s", test_root, files[i], test_root, files[i]);
+			(void)system(p);
+		}
+		CHECK(image_identity(q) && strncmp(q, "fb:", 3) == 0, "fallback identity: %s", q);
+		CHECK(save(), "save with the fallback identity");
+		snprintf(p, sizeof(p), "rm -rf %s/var/containers", test_root);
+		CHECK(system(p) == 0 && load() && ls_keep == 1, "kept: same applications");
+		snprintf(p, sizeof(p), "mkdir %s/img/Applications/Sileo.app; rm -rf %s/var/containers", test_root, test_root);
+		CHECK(system(p) == 0 && load() && ls_keep == 0, "dropped: an application added");
+		snprintf(p, sizeof(p), "test ! -e %s/var/%s", test_root, cs);
+		CHECK(system(p) == 0, "the csstore is gone");
+		/* an archive with no identity at all */
+		snprintf(p, sizeof(p), "rm -rf %s/img/System %s/var/containers", test_root, test_root);
+		CHECK(system(p) == 0 && !image_identity(q), "no identity to be had");
+	}
+
 	{
 		char p[1024];
 

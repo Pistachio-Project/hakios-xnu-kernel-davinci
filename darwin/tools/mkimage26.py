@@ -33,6 +33,7 @@ PACSTRIP=FILE: the pacstrip the arm64e files go through, by default arch/arm64/t
 """
 import importlib.util
 import os
+import time
 import plistlib
 import re
 import shutil
@@ -493,6 +494,12 @@ def main():
             continue
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         os.symlink(target, dst)
+    # this build's identity (init/var_store.c): the data volume's saved LaunchServices database and icon caches are
+    # kept across boots only while the system image is the same one; a new image has them made again
+    ident = os.path.join(WORK, 'System/Library/HakiOS/image-id')
+    os.makedirs(os.path.dirname(ident), exist_ok=True)
+    with open(ident, 'w') as f:
+        f.write(f'{time.strftime("%Y%m%d-%H%M%S")}-{os.urandom(4).hex()}\n')
     # the audio server's output device (root26-darwin.sh): the HAL loads plug-ins from this directory only
     hal = os.path.join(WORK, 'System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver')
     if not os.path.lexists(hal):
