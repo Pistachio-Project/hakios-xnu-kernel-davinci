@@ -80,6 +80,9 @@
  *   adreno_return=1    when all is over, go back to the loader instead of starting the system
  *   display_probe=1    before any step: read what the firmware left the display controller
  *                      doing (display_probe() below; two clocks are turned on, nothing else written)
+ *   display_probe=2    that, and first every source pipe, control, mixer, ping-pong and interface of the display
+ *                      block, and the SMMU's match for its stream (dpu_pipeline() below: how the firmware built the
+ *                      scan-out; nothing more is written)
  * The system does not go on starting until all of this is over, so that the end of the log is
  * ours; the touch screen driver's start would talk across it (leave touchscreen=1 out).
  *
@@ -4111,8 +4114,181 @@ display_layout_known(void)
 #define INTF_FRAME_COUNT        (display->intf_at + 0x0ac)
 #define INTF_LINE_COUNT         (display->intf_at + 0x0b0)
 
+/* ---- display_probe=2: how the firmware built the display pipeline (read only; display_probe=1's two writes happen first) ---- */
+
+/*
+ * Wanted: whether the display block can fetch a surface of ours by itself (a pipe's own scaler 828 x 1792 -> 1080 x 2340) instead
+ * of the CPU copying it. For that one needs to know which source pipe (SSPP), control (CTL), mixer (LM) and ping-pong the
+ * firmware used, and what it left in them. The layout is the phone's device tree (qcom,mdss_mdp@ae00000, offsets from the
+ * block's start; sdmmagpie, SDE 5.x), the registers' meaning Linux's dpu_hw_sspp.c, dpu_hw_ctl.c, dpu_hw_lm.c, dpu_hw_util.h
+ * (QSEED3) and dpu_hw_pingpong.c. Nothing here is written. Every block is announced before it is read (the loader keeps the
+ * line), the pipes last: a pipe whose clock is gated could hang the bus, and then everything before is in the log.
+ * Each block is also printed as raw words (only the quarters that are not all zero: "+offset: w0 w1 w2 w3"), so a wrong guess
+ * of mine at a register's place costs only a label, not the fact.
+ */
+#define DPU_SDE_OFF             0x6b800u        /* qcom,sde-intf-off[1]: board.display.intf minus this is the block's start */
+#define DPU_SIZE                0x84208u        /* mdp_phys' length */
+#define DPU_TOP                 0x1000u         /* qcom,sde-off, qcom,sde-len 0x45c */
+#define DPU_TOP_LEN             0x45cu
+static const uint32_t dpu_ctl[] = { 0x2000, 0x2200, 0x2400, 0x2600, 0x2800, 0x2a00 };       /* qcom,sde-ctl-off, -size 0x1e0 */
+#define DPU_CTL_LEN             0x1e0u
+static const uint32_t dpu_lm[] = { 0x45000, 0x46000, 0x47000, 0x48000 };                    /* qcom,sde-mixer-off, -size 0x320 */
+#define DPU_LM_LEN              0x320u
+static const uint32_t dpu_sspp[] = { 0x5000, 0x7000, 0x25000, 0x27000, 0x29000 };           /* "vig", "vig", "dma", "dma", "dma" */
+static const char *const dpu_sspp_name[] = { "vig0", "vig1", "dma0", "dma1", "dma2" };
+#define DPU_SSPP_LEN            0x1f0u          /* qcom,sde-sspp-src-size */
+#define DPU_QSEED               0xa00u          /* qcom,sde-sspp-qseed-off ("qseedv3lite"), vig only */
+#define DPU_QSEED_LEN           0x100u
+static const uint32_t dpu_intf[] = { 0x6b000, 0x6b800, 0x6c000, 0x6c800 };                  /* qcom,sde-intf-off, -size 0x2b8 */
+#define DPU_INTF_LEN            0x2b8u
+#define DPU_PP_LEN              0xd4u           /* qcom,sde-pp-off 0x71000 + n * 0x800 */
+#define DPU_FB_BASE             0x9c000000u     /* the loader's fb-base (board.dts); the firmware's pipe should point at it */
+#define DPU_FB_SPAN             0x01000000u
+/* the apps SMMU's stream of the display: phone.dts iommus = <&apps_smmu 0x800 0x440> */
+#define DPU_STREAM              0x800u
+#define DPU_STREAM_MASK         0x440u
+
+static vm_offset_t dpu_at;
+
+/* the words of [offset, offset + length) of the display block that are not zero, four to a line */
 static void
-display_probe(void)
+dpu_dump(const char *name, uint32_t offset, uint32_t length)
+{
+	printf("adreno: dpu: %s at +%#x, %#x long\n", name, offset, length);
+	for (uint32_t at = 0; at < length; at += 16) {
+		uint32_t w[4] = { 0 };
+		bool any = false;
+
+		for (uint32_t i = 0; i < 4 && at + 4 * i < length; i++) {
+			w[i] = rd(dpu_at + offset + at + 4 * i);
+			any = any || w[i] != 0;
+		}
+		if (any) {
+			printf("adreno: dpu: %s +%03x: %08x %08x %08x %08x\n", name, at, w[0], w[1], w[2], w[3]);
+		}
+	}
+}
+
+#define R(block, off) rd(dpu_at + (block) + (off))
+
+static void
+dpu_pipeline(void)
+{
+	const struct hakios_board *board = hakios_board();
+	struct block mdp = { "mdp", board->display.intf - DPU_SDE_OFF, DPU_SIZE };
+	char name[16];
+
+	need(&mdp);
+	if (mdp.base == 0) {
+		printf("adreno: dpu: the display block cannot be mapped\n");
+		return;
+	}
+	dpu_at = mdp.base;
+	printf("adreno: dpu: THE DISPLAY BLOCK at %#x: hw version %#x (mdp clock %#x)\n", mdp.phys, rd(dpu_at),
+	    rd(dispcc.base + DISPCC_MDSS_MDP_CBCR));
+	if (rd(dispcc.base + DISPCC_MDSS_MDP_CBCR) & CBCR_OFF) {
+		/* the firmware took it away: the pipes are behind it and hang the bus. Nothing in that block is read. */
+		printf("adreno: dpu: the mdp clock is off: nothing is read behind it\n");
+		return;
+	}
+	/* the top: which interface is wired to what (DISP_INTF_SEL +0x004: 3 bits an interface), split display, clock gating */
+	dpu_dump("top", DPU_TOP, DPU_TOP_LEN);
+	printf("adreno: dpu: top: disp_intf_sel %#x (intf1 = bits [11:8]? the raw words are above)\n", R(DPU_TOP, 0x004));
+	for (int i = 0; i < 4; i++) {
+		snprintf(name, sizeof(name), "intf%d", i);
+		dpu_dump(name, dpu_intf[i], DPU_INTF_LEN);
+	}
+	/* the ping-pongs: tear check, autorefresh (cmdpanel.c's), and the rest of them */
+	for (int i = 0; i < 4; i++) {
+		snprintf(name, sizeof(name), "pp%d", i);
+		dpu_dump(name, 0x71000 + 0x800 * i, DPU_PP_LEN);
+		printf("adreno: dpu: pp%d: tear_check_en %#x sync_config_vsync %#x autorefresh %#x line_count %u\n", i,
+		    R(0x71000 + 0x800 * i, 0x000), R(0x71000 + 0x800 * i, 0x004), R(0x71000 + 0x800 * i, 0x030),
+		    R(0x71000 + 0x800 * i, 0x02c));
+	}
+	/* the controls: CTL_LAYER(lm) +4 lm, TOP +0x14, FLUSH +0x18, START +0x1c, LAYER_EXT +0x40.., INTF_ACTIVE +0xf4, ... */
+	for (unsigned i = 0; i < 6; i++) {
+		uint32_t c = dpu_ctl[i];
+
+		snprintf(name, sizeof(name), "ctl%u", i);
+		dpu_dump(name, c, DPU_CTL_LEN);
+		printf("adreno: dpu: ctl%u: layer lm0 %#x lm1 %#x, ext lm0 %#x lm1 %#x, ext2 lm0 %#x, ext3 lm0 %#x; top %#x flush %#x "
+		    "start %#x prepare %#x intf_active %#x intf_flush %#x intf_master %#x fetch_active %#x merge3d %#x\n", i,
+		    R(c, 0x00), R(c, 0x04), R(c, 0x40), R(c, 0x44), R(c, 0x70), R(c, 0xa0), R(c, 0x14), R(c, 0x18), R(c, 0x1c),
+		    R(c, 0xd0), R(c, 0xf4), R(c, 0x110), R(c, 0x134), R(c, 0xfc), R(c, 0xe4));
+	}
+	/* the mixers: OP_MODE +0, OUT_SIZE +4 (height << 16 | width), BORDER_COLOR +8, stage n's blend at +0x20 + 0x18 n */
+	for (unsigned i = 0; i < sizeof(dpu_lm) / sizeof(dpu_lm[0]); i++) {
+		uint32_t m = dpu_lm[i];
+
+		snprintf(name, sizeof(name), "lm%u", i);
+		dpu_dump(name, m, DPU_LM_LEN);
+		printf("adreno: dpu: lm%u: op_mode %#x out %ux%u border %#x stage0 blend %#x %#x %#x, stage1 blend %#x %#x %#x\n", i,
+		    R(m, 0x00), R(m, 0x04) & 0xffff, R(m, 0x04) >> 16, R(m, 0x08), R(m, 0x20), R(m, 0x24), R(m, 0x28), R(m, 0x38),
+		    R(m, 0x3c), R(m, 0x40));
+	}
+	/* the apps SMMU, the display's stream: is there a match register for it, and what does it do (translate / bypass / fault) */
+	if (board->smmu.apps != 0) {
+		struct block smmu = { "apps smmu", board->smmu.apps, 0x1000 };
+
+		need(&smmu);
+		if (smmu.base) {
+			uint32_t scr0 = rd(smmu.base + SMMU_SCR0), idr0 = rd(smmu.base + SMMU_IDR0), matches = idr0 & 0xff, found = 0;
+
+			printf("adreno: dpu: apps smmu: scr0 %#x idr0 %#x (%u match registers, bit 3 of scr0: 16 bit streams)\n", scr0,
+			    idr0, matches);
+			for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
+				uint32_t smr = rd(smmu.base + SMMU_SMR(n)), s2cr = rd(smmu.base + SMMU_S2CR(n));
+				uint32_t stream = smr & 0x7fff, mask = smr >> 16 & 0x7fff;
+
+				if ((smr >> 31) && ((stream ^ DPU_STREAM) & ~mask) == 0) {
+					printf("adreno: dpu: apps smmu: match %u covers the display's stream %#x/%#x: stream %#x mask %#x "
+					    "s2cr %#x (%s, context %u)\n", n, DPU_STREAM, DPU_STREAM_MASK, stream, mask, s2cr,
+					    (s2cr >> 16 & 3) == 0 ? "TRANSLATED" : (s2cr >> 16 & 3) == 1 ? "bypass" : "fault", s2cr & 0xff);
+					found++;
+				}
+			}
+			printf("adreno: dpu: apps smmu: %u match registers cover stream %#x (none: the display's accesses are not "
+			    "matched: scr0 bit 10 or a default decides)\n", found, DPU_STREAM);
+		}
+	}
+	/* the pipes, last. src_size/img_size are height << 16 | width, xy y << 16 | x; stride0 [15:0], stride1 [31:16] */
+	for (unsigned i = 0; i < sizeof(dpu_sspp) / sizeof(dpu_sspp[0]); i++) {
+		uint32_t s = dpu_sspp[i], addr, size, img, xy, out, outxy, stride, format, unpack, opmode;
+
+		printf("adreno: dpu: %s about to be read at %#x\n", dpu_sspp_name[i], mdp.phys + s);
+		snprintf(name, sizeof(name), "%s", dpu_sspp_name[i]);
+		dpu_dump(name, s, DPU_SSPP_LEN);
+		size = R(s, 0x00);
+		img = R(s, 0x04);
+		xy = R(s, 0x08);
+		out = R(s, 0x0c);
+		outxy = R(s, 0x10);
+		addr = R(s, 0x14);
+		stride = R(s, 0x24);
+		format = R(s, 0x30);
+		unpack = R(s, 0x34);
+		opmode = R(s, 0x38);
+		printf("adreno: dpu: %s: src %ux%u at (%u,%u) of image %ux%u -> out %ux%u at (%u,%u); addr0 %#x%s addr1 %#x stride %u/%u "
+		    "format %#x unpack %#x op_mode %#x constant color %#x excl %#x\n", dpu_sspp_name[i], size & 0xffff, size >> 16,
+		    xy & 0xffff, xy >> 16, img & 0xffff, img >> 16, out & 0xffff, out >> 16, outxy & 0xffff, outxy >> 16, addr,
+		    addr - DPU_FB_BASE < DPU_FB_SPAN ? " (THE LOADER'S FRAMEBUFFER)" : "", R(s, 0x18), stride & 0xffff, stride >> 16,
+		    format, unpack, opmode, R(s, 0x3c), R(s, 0x50));
+		if (i < 2) {
+			snprintf(name, sizeof(name), "%s.qseed", dpu_sspp_name[i]);
+			dpu_dump(name, s + DPU_QSEED, DPU_QSEED_LEN);
+			printf("adreno: dpu: %s: scaler version %#x op_mode %#x (bit 0: on) phase step y h %#x v %#x uv h %#x v %#x "
+			    "(1 << 21 is 1:1) src %#x dst %#x\n", dpu_sspp_name[i], R(s + DPU_QSEED, 0x00), R(s + DPU_QSEED, 0x04),
+			    R(s + DPU_QSEED, 0x1c), R(s + DPU_QSEED, 0x20), R(s + DPU_QSEED, 0x24), R(s + DPU_QSEED, 0x28),
+			    R(s + DPU_QSEED, 0x54), R(s + DPU_QSEED, 0x5c));
+		}
+	}
+	printf("adreno: dpu: done: nothing was written\n");
+}
+#undef R
+
+static void
+display_probe(uint32_t level)
 {
 	uint32_t saved_fine = fine, line, frame, shown, counting, frames[2], lines[2], bus;
 	uint64_t times[2];
@@ -4156,6 +4332,9 @@ display_probe(void)
 		/* (Linux waits for this bit to go, and gives up if it does not: there is no clock to read the block with) */
 		printf("adreno: 0: the bus clock of the display block's registers does not run (%#x): nothing more is read\n", bus);
 		goto out;
+	}
+	if (level >= 2) {
+		dpu_pipeline();
 	}
 	announce("the timing of the interface the panel hangs on (NOT READ BEFORE)");
 	get(&disp_intf, "timing_engine_en", INTF_TIMING_ENGINE_EN);
@@ -4418,7 +4597,7 @@ hakios_adreno_init(void)
 	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		if (display_layout_known()) {
-			display_probe();
+			display_probe(only);
 		} else {
 			printf("adreno: display_probe=1: this board's SoC file has no display { } intf1 and clocks { }: nothing read\n");
 		}
