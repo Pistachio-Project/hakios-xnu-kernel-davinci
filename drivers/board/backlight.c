@@ -683,6 +683,8 @@ hakios_als_report(uint32_t millilux, const char *source)
 
 /* ---- sysctl hw.backlight ------------------------------------------------------------------------ */
 
+extern void hakios_pm_screen(bool off);
+
 SYSCTL_NODE(_hw, OID_AUTO, backlight, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "the panel's light");
 
 static int
@@ -711,6 +713,7 @@ sysctl_level SYSCTL_HANDLER_ARGS
 		automatic = value;
 	} else if (arg1 == &power) {
 		power = value > 2 ? 1 : value;
+		hakios_pm_screen(power == 0);   /* (pm_screen=1: cpufreq.c) */
 	} else if (arg1 == &ambient_mlx) {
 		ambient_mlx = value;
 		ambient_source = "virtual";
