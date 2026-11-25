@@ -308,6 +308,12 @@ static TUNABLE(uint32_t, gScanoutAsync, "fb_scanout_async", 1);
  * 0: the surface itself is fetched (zero copy), held and counted as in use until its successor has latched (nothing keeps the window server out).
  */
 static TUNABLE(uint32_t, gScanoutRing, "fb_scanout_ring", 1);
+/* fb_scanout_par=0 (default 1): the ring copy is made by the presenter alone, not shared out with the scaling's helper threads (fb_threads) */
+static TUNABLE(uint32_t, gScanoutPar, "fb_scanout_par", 1);
+/* fb_scanout_late=0 (default 1): the flip is waited for and kicked before the swap completes, as before (late: after it) */
+static TUNABLE(uint32_t, gScanoutLate, "fb_scanout_late", 1);
+static uint32_t gScanoutStride, gScanoutW, gScanoutH;   /* of the picture in the buffer waiting to be flipped to */
+static uint32_t gScanoutFlipK = ~0u;                    /* the ring buffer copied and waiting to be flipped to */
 #define SCANOUT_RING 3
 static IOBufferMemoryDescriptor * gScanoutRingMemory[SCANOUT_RING];
 static uint32_t gScanoutRingAddress[SCANOUT_RING], gScanoutRingBytes, gScanoutRingNext;
@@ -555,6 +561,8 @@ public:
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
 	bool scanoutFrame(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void ringCopy(uint8_t * to, const uint8_t * from, size_t bytes);
+	void scanoutFlip(void);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -1052,7 +1060,55 @@ struct RowJob {
 	int32_t         cy0, cy1;               /* the rows of [py0, py1) that are on the panel (as cx0, cx1 its columns) */
 	bool            filter, unscaled, over;
 	uint64_t        target;                 /* the panel's readout it is for (scanWaitRows()) */
+	uint8_t *       ringTo;                 /* (fb_scanout_ring) a copy shared out instead: bytes from ringFrom to ringTo */
+	const uint8_t * ringFrom;
+	size_t          ringBytes;
 };
+
+/* The share `share` of `threads` of a copy of `bytes` (in cache lines), out of the processor's cache afterwards for the display to read. */
+static void
+ringSlice(uint8_t * to, const uint8_t * from, size_t bytes, unsigned share, unsigned threads)
+{
+	size_t lines = bytes / 64;
+	size_t a = lines * share / threads * 64, b = share + 1 == threads ? bytes : lines * (share + 1) / threads * 64;
+
+	if (b <= a) {
+		return;
+	}
+	memcpy(to + a, from + a, b - a);
+	for (uintptr_t line = (uintptr_t) (to + a) & ~(uintptr_t) 63; line < (uintptr_t) (to + b); line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* (fb_scanout_ring) the picture into a ring buffer: by the presenter and the helpers of the scaling together, or by the presenter alone */
+void
+IOMobileFramebuffer::ringCopy(uint8_t * to, const uint8_t * from, size_t bytes)
+{
+	if (!gScanoutPar || fThreads <= 1 || fHelpersStarted + 1 < fThreads) {
+		ringSlice(to, from, bytes, 0, 1);
+		return;
+	}
+	RowJob job;
+
+	bzero(&job, sizeof(job));
+	job.ringTo = to;
+	job.ringFrom = from;
+	job.ringBytes = bytes;
+	IOLockLock(fHelperLock);
+	fHelperJob = &job;
+	fHelpersBusy = fThreads - 1;
+	fHelperGeneration++;
+	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
+	IOLockUnlock(fHelperLock);
+	ringSlice(to, from, bytes, 0, fThreads);
+	IOLockLock(fHelperLock);
+	while (fHelpersBusy != 0) {
+		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
+	}
+	IOLockUnlock(fHelperLock);
+}
 
 void
 IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow)
@@ -1198,7 +1254,9 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 			bound = true;           /* (at the first frame: every core is up by then) */
 			bindDrawer(index + 1, "a helper");
 		}
-		if (job->pixels == NULL) {
+		if (job->ringTo != NULL) {
+			ringSlice(job->ringTo, job->ringFrom, job->ringBytes, index + 1, fb->fThreads);
+		} else if (job->pixels == NULL) {
 			int32_t y0 = (int32_t) ((int64_t) fb->fPanelHeight * (index + 1) / fb->fThreads);
 			int32_t y1 = (int32_t) ((int64_t) fb->fPanelHeight * (index + 2) / fb->fThreads);
 			if (y1 > y0 && fb->fBackBuffer != NULL && fb->fBase != NULL) {
@@ -1900,38 +1958,15 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 			return false;
 		}
 		/* the picture into buffer k (neither fetched nor flipping, see fb_scanout_ring), out of the cache for the display */
-		uint8_t * to = (uint8_t *) gScanoutRingMemory[k]->getBytesNoCopy();
-
-		memcpy(to, s->pixels(), bytes);
-		for (uintptr_t line = (uintptr_t) to & ~(uintptr_t) 63; line < (uintptr_t) to + bytes; line += 64) {
-			__asm__ volatile ("dc cvac, %0" : : "r" (line) : "memory");
-		}
-		__asm__ volatile ("dsb sy" ::: "memory");
+		ringCopy((uint8_t *) gScanoutRingMemory[k]->getBytesNoCopy(), s->pixels(), bytes);
 		began = mach_absolute_time() - began;
 		gScanoutCopyTime += began;
 		gScanoutCopyMax = began > gScanoutCopyMax ? began : gScanoutCopyMax;
-		/* the flip before has latched before this one is written to the pipe (it did, by now, nearly always) */
-		uint64_t waitBegan = mach_absolute_time();
-
-		if (hakios_display_scanout_latched()) {
-			gScanoutSettled++;
-		} else {
-			gScanoutWaits++;
-		}
-		bool settled = hakios_display_scanout_settle();
-
-		waitBegan = mach_absolute_time() - waitBegan;
-		gScanoutWaited += waitBegan;
-		gScanoutWaitedMax = waitBegan > gScanoutWaitedMax ? waitBegan : gScanoutWaitedMax;
-		if (!settled || !hakios_display_scanout_show(gScanoutRingAddress[k], s->info.bytesPerRow, s->info.width, s->info.height,
-		    gScanoutAsync == 0)) {
-			gScanoutGaveUp = true;
-			gScanoutRingOn = false;
-			IOLockUnlock(gScanoutLock);
-			IOLog("MiniIOMobileFramebuffer: fb_scanout: the display did not take a frame: frames are copied from now on\n");
-			return false;
-		}
 		gScanoutRingNext = (k + 1) % SCANOUT_RING;
+		gScanoutFlipK = k;
+		gScanoutStride = s->info.bytesPerRow;
+		gScanoutW = s->info.width;
+		gScanoutH = s->info.height;
 		gScanoutRingOn = true;
 		if (!fGraphics) {
 			fGraphics = true;
@@ -1940,6 +1975,9 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 		}
 		IOLockUnlock(gScanoutLock);
 		gScanoutFrames++;
+		if (!gScanoutLate) {
+			scanoutFlip();          /* (the swap is completed after it) */
+		}
 		return true;
 	}
 	/* what the processor has drawn into the surface is in memory before the display reads it there */
@@ -1997,6 +2035,48 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 	IOLockUnlock(gScanoutLock);
 	gScanoutFrames++;
 	return true;
+}
+
+/*
+ * (fb_scanout_ring) the flip to the ring buffer the picture was copied into: after the flip before it has latched, and (fb_scanout_late) after the
+ * swap has been completed, so that the window server's next frame is not made to wait for the next refresh (the latch) as well as for the GPU
+ * and the copy: with the wait inside the swap, a frame that took a little more than 16.7 ms from its start missed the refresh after it and
+ * came out at 33 (logs/150829-run.log: 23 to 46 frames a second with the GPU 50 to 67% busy, 60 where 286 of 301 flips waited ~9.5 ms).
+ */
+void
+IOMobileFramebuffer::scanoutFlip(void)
+{
+	if (gScanoutLock == NULL) {
+		return;
+	}
+	IOLockLock(gScanoutLock);
+	uint32_t k = gScanoutFlipK;
+
+	gScanoutFlipK = ~0u;
+	if (k >= SCANOUT_RING || gScanoutGaveUp || gScanoutRingMemory[k] == NULL) {
+		IOLockUnlock(gScanoutLock);
+		return;
+	}
+	uint64_t waitBegan = mach_absolute_time();
+
+	if (hakios_display_scanout_latched()) {
+		gScanoutSettled++;
+	} else {
+		gScanoutWaits++;
+	}
+	bool settled = hakios_display_scanout_settle();
+
+	waitBegan = mach_absolute_time() - waitBegan;
+	gScanoutWaited += waitBegan;
+	gScanoutWaitedMax = waitBegan > gScanoutWaitedMax ? waitBegan : gScanoutWaitedMax;
+	if (!settled || !hakios_display_scanout_show(gScanoutRingAddress[k], gScanoutStride, gScanoutW, gScanoutH, gScanoutAsync == 0)) {
+		gScanoutGaveUp = true;
+		gScanoutRingOn = false;
+		IOLockUnlock(gScanoutLock);
+		IOLog("MiniIOMobileFramebuffer: fb_scanout: the display did not take a frame: frames are copied from now on\n");
+		return;
+	}
+	IOLockUnlock(gScanoutLock);
 }
 
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
@@ -2277,6 +2357,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fSwapsWaiting--;
 	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 	IOLockUnlock(fSwapLock);
+	if (direct && gScanoutLate && gScanoutRing != 0) {
+		scanoutFlip();
+	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
