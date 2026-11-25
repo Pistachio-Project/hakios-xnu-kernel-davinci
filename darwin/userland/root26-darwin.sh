@@ -372,6 +372,9 @@ echo "/hakios/lib/libhakios-brightness.dylib SpringBoard backboardd Preferences"
 # cameracaptured, iOS 27's camera daemon: the flashlight's server given the kernel's flashlight (src:
 # components/camera/src/inject_capture.c). It does nothing where the kernel has none (boot-arg torch=3).
 echo "/hakios/lib/libhakios-capture.dylib cameracaptured" >> $T/etc/inject.conf
+# ... and the Control Center flashlight in SpringBoard, which AVFlashlight lets be only where MobileGestalt has a camera-flash
+# (src: components/camera/src/inject_flashlight.c). It does nothing where the kernel has no flashlight.
+echo "/hakios/lib/libhakios-flash.dylib SpringBoard" >> $T/etc/inject.conf
 # Camera.app: its preview's picture given a size where AVFoundation leaves it none (components/camera/src/inject_camera_app.c)
 echo "/hakios/lib/libhakios-camapp.dylib Camera" >> $T/etc/inject.conf
 # locationd: its Mescal signer refused before it asks fairplayd, which never answers here and would hold one of
