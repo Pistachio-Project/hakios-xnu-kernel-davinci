@@ -13,6 +13,23 @@ struct swu_assoc {
 	size_t ap_ies_len;
 	const uint8_t *rsn_ie;
 	size_t rsn_ie_len;
+	uint16_t ht_cap_info;           /* our HT capabilities (0: the 20 MHz default) */
+	const uint8_t *vht_ie;          /* our VHT capabilities element, complete with id and length (NULL: none) */
+	size_t vht_ie_len;
+};
+
+/* the HT / VHT elements of a beacon, probe response or association response */
+struct swu_ap_caps {
+	bool ht, vht, ht_w40;                   /* HT capabilities present, VHT capabilities present, HT operation: STA channel width 40 */
+	uint8_t ht_sec;                         /* HT operation secondary channel offset: 0 none, 1 above, 3 below */
+	uint8_t primary;                        /* HT operation primary channel (0: unknown) */
+	uint8_t ht_ampdu;
+	uint8_t ht_mcs[16];                     /* supported MCS set */
+	uint16_t ht_cap;
+	uint8_t vht_width, vht_seg0, vht_seg1;  /* VHT operation: 0 20/40, 1 80 (or 160 / 80+80), 2 160, 3 80+80 */
+	bool vht_op;
+	uint32_t vht_cap;
+	uint16_t vht_rx_map, vht_rx_high, vht_tx_map, vht_tx_high;
 };
 
 struct swu_assoc_resp {
@@ -22,6 +39,7 @@ struct swu_assoc_resp {
 	bool ht;
 	uint16_t ht_caps;
 	uint8_t ht_ampdu;
+	struct swu_ap_caps caps;
 };
 
 struct swu_wpa_ops {
@@ -47,6 +65,7 @@ size_t swu_auth_req(uint8_t *f, size_t size, const uint8_t bssid[6], const uint8
 size_t swu_deauth(uint8_t *f, size_t size, const uint8_t bssid[6], const uint8_t sa[6], uint16_t reason);
 size_t swu_build_rsn(uint8_t *out, uint8_t group_type);
 extern int swu_no_ht;
+void swu_ap_parse(const uint8_t *ies, size_t len, struct swu_ap_caps *c);
 size_t swu_assoc_req(uint8_t *f, size_t size, const struct swu_assoc *a);
 int swu_auth_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t me[6], uint16_t *status);
 int swu_assoc_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t me[6], struct swu_assoc_resp *r);

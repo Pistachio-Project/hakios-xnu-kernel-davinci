@@ -3287,6 +3287,24 @@ wlfw_ce_rx_test(volatile uint32_t *regs)
  */
 #define WP_POOL         0x1000000u
 #define WP_HOSTMEM      0x100000u
+/* WMI phy modes (ath10k wmi.h enum wmi_phy_mode, the same numbers in the TLV firmware) */
+#define WPM_11A         0u
+#define WPM_11G         1u
+#define WPM_11NA_HT20   4u
+#define WPM_11NG_HT20   5u
+#define WPM_11NA_HT40   6u
+#define WPM_11NG_HT40   7u
+#define WPM_VHT20       8u
+#define WPM_VHT40       9u
+#define WPM_VHT80       10u
+/* boot-arg wlan_mode_max: how wide the station may go (default vht80); a failed join steps it down for the next try */
+enum { WLM_HT20, WLM_HT40, WLM_VHT20, WLM_VHT40, WLM_VHT80 };
+static unsigned g_mode_max = WLM_VHT80;
+static bool g_mode_explicit;
+static unsigned g_mode_demote;
+static uint32_t g_fw_vht_cap, g_fw_chains = 1;          /* from SERVICE_READY */
+static const char *const wlm_names[] = { "HT20", "HT40", "VHT20", "VHT40", "VHT80" };
+
 #define WP_BUF          2048u
 #define WP_NR           10
 #define WP_HTT_FRAG     0x400000u
@@ -3592,6 +3610,8 @@ wp_service_ready(const uint8_t *t, uint32_t len)
 	memset(wp.svc, 0, sizeof(wp.svc));
 	memcpy(wp.svc, bmap, MIN((uint32_t)bmapl, (uint32_t)sizeof(wp.svc)));
 	wp.svc_bytes = bmapl;
+	g_fw_vht_cap = e[11];
+	g_fw_chains = e[9] ? e[9] : 1;
 	ev("WMI: SERVICE_READY fw %#x abi %#x ns %#x %#x phy_cap %#x chains %u ht %#x vht %#x, %u memory requests, service map %u bytes",
 	    e[0], e[1], e[3], e[4], e[7], e[9], e[10], e[11], e[18], bmapl);
 	wp.nreq = 0;
@@ -3723,6 +3743,8 @@ static struct {
 	uint64_t tx_frames, tx_eapol, tx_fail, rx_drop, rx_eapol, rx_frames, rx_logged;
 	uint8_t txfree[256];
 	struct swu_assoc_resp ar;
+	struct swu_ap_caps bcaps;                       /* the beacon's HT/VHT elements */
+	struct { uint32_t mode, center; unsigned bw; bool vht; } plan;
 	struct swu_wpa wpa;
 } jn;
 
@@ -4648,20 +4670,129 @@ jn_vdev_wmm_params(void)
 	return wp_wmi("vdev set wmm", c, n);
 }
 
+/*
+ * The widest mode both sides do (ath10k_vdev_start / ath10k_peer_assoc_h_phymode): the AP's HT operation gives the 40 MHz
+ * secondary channel, its VHT operation whether the BSS is 80 MHz wide; the 80 MHz block is worked out from the primary
+ * channel (some APs put a wrong segment 0 for 160 MHz BSSs). Capped by wlan_mode_max, less one step per failed join.
+ */
+static void
+jn_plan(void)
+{
+	static const unsigned maxbw[5] = { 20, 40, 20, 40, 80 };
+	static const unsigned blocks[6] = { 36, 52, 100, 116, 132, 149 };
+	const struct swu_ap_caps *c = &jn.bcaps;
+	bool g5 = jn.mhz > 4900;
+	int lim = (int)g_mode_max - (int)g_mode_demote;
+	unsigned ch = g5 ? (unsigned)(jn.mhz - 5000) / 5u : 0, bw = 20, apbw = 20;
+	uint32_t center = jn.mhz;
+	bool ht = !swu_no_ht && c->ht, vht = false;
+
+	swu_ap_parse(wp.bss[jn.bss].ie, wp.bss[jn.bss].ie_len, &jn.bcaps);
+	ht = !swu_no_ht && c->ht;
+	if (lim < 0) {
+		lim = 0;
+	}
+	memset(&jn.plan, 0, sizeof(jn.plan));
+	jn.plan.bw = 20;
+	jn.plan.center = jn.mhz;
+	jn.plan.mode = g5 ? WPM_11A : WPM_11G;
+	if (!ht) {
+		return;
+	}
+	jn.plan.mode = g5 ? WPM_11NA_HT20 : WPM_11NG_HT20;
+	if (c->ht_w40 && (c->ht_sec == 1 || c->ht_sec == 3) && (c->ht_cap & 2) && (g5 || g_mode_explicit)) {
+		apbw = 40;
+		center = c->ht_sec == 1 ? jn.mhz + 10u : jn.mhz - 10u;
+	}
+	vht = g5 && c->vht && lim >= WLM_VHT20;
+	if (vht && c->vht_op && c->vht_width >= 1) {
+		for (unsigned b = 0; b < 6; b++) {
+			if (ch >= blocks[b] && ch <= blocks[b] + 12) {
+				if (maxbw[lim] >= 80 && apbw >= 40) {
+					apbw = 80;
+					center = 5000u + 5u * (blocks[b] + 6);
+				}
+				break;
+			}
+		}
+	}
+	bw = MIN(apbw, maxbw[lim]);
+	if (bw == 20) {
+		center = jn.mhz;
+	} else if (bw == 40 && apbw == 80) {
+		center = (c->ht_sec == 1) ? jn.mhz + 10u : jn.mhz - 10u;       /* the 40 MHz pair of the primary channel */
+	}
+	if (bw == 40 && !(c->ht_w40 && (c->ht_sec == 1 || c->ht_sec == 3))) {
+		bw = 20;
+		center = jn.mhz;
+	}
+	jn.plan.bw = bw;
+	jn.plan.center = center;
+	jn.plan.vht = vht;
+	if (vht) {
+		jn.plan.mode = bw == 80 ? WPM_VHT80 : bw == 40 ? WPM_VHT40 : WPM_VHT20;
+	} else {
+		jn.plan.mode = bw == 40 ? (g5 ? WPM_11NA_HT40 : WPM_11NG_HT40) : (g5 ? WPM_11NA_HT20 : WPM_11NG_HT20);
+	}
+	ev("JOIN: plan: AP HT %u (caps %#x, sec offset %u, width40 %u) VHT %u (op width %u seg0 %u seg1 %u), limit %s -> %u MHz, center %u, phy mode %u",
+	    c->ht, c->ht_cap, c->ht_sec, c->ht_w40, c->vht, c->vht_width, c->vht_seg0, c->vht_seg1, wlm_names[lim], bw, center, jn.plan.mode);
+}
+
+static const char *
+jn_mode_name(uint32_t m)
+{
+	switch (m) {
+	case WPM_11A: return "11a";
+	case WPM_11G: return "11g";
+	case WPM_11NA_HT20: case WPM_11NG_HT20: return "HT20";
+	case WPM_11NA_HT40: case WPM_11NG_HT40: return "HT40";
+	case WPM_VHT20: return "VHT20";
+	case WPM_VHT40: return "VHT40";
+	case WPM_VHT80: return "VHT80";
+	default: return "?";
+	}
+}
+
+/* highest 1-stream PHY rate of the negotiated mode (short GI), Mbit/s */
+static unsigned
+jn_phy_rate(void)
+{
+	unsigned m = 0;      /* VHT: highest MCS the AP takes at 1 stream: 7, 8 or 9 */
+
+	if (jn.plan.vht) {
+		unsigned f = jn.ar.caps.vht ? jn.ar.caps.vht_rx_map & 3u : jn.bcaps.vht_rx_map & 3u;
+
+		m = f == 0 ? 7 : f == 1 ? 8 : 9;
+		if (jn.plan.bw == 20 && m == 9) {
+			m = 8;
+		}
+		if (jn.plan.bw == 80) {
+			return m == 7 ? 292 : m == 8 ? 325 : 433;
+		}
+		if (jn.plan.bw == 40) {
+			return m == 7 ? 150 : m == 8 ? 180 : 200;
+		}
+		return m == 7 ? 72 : 86;
+	}
+	if (jn.plan.mode >= WPM_11NA_HT20 && jn.plan.mode <= WPM_11NG_HT40) {
+		return jn.plan.bw == 40 ? 150 : 72;
+	}
+	return 54;
+}
+
 static bool
 jn_vdev_start(void)
 {
 	uint8_t c[128];
 	uint32_t v[18], n;
 	bool g5 = jn.mhz > 4900, dfs = jn.mhz >= 5260 && jn.mhz <= 5720;
-	uint32_t mode = g5 ? 0u : 1u;                           /* 11A / 11G */
 	uint32_t ch[6];
 
-	if (!swu_no_ht && swu_ie_find(wp.bss[jn.bss].ie, wp.bss[jn.bss].ie_len, 45) != NULL) {
-		mode = g5 ? 4u : 5u;                            /* MODE_11NA_HT20 / MODE_11NG_HT20: the peer is associated as an HT peer */
-	}
-	ch[0] = jn.mhz; ch[1] = jn.mhz; ch[2] = 0; ch[3] = mode | (dfs ? (1u << 10) : 0);
+	jn_plan();
+	ch[0] = jn.mhz; ch[1] = jn.plan.center; ch[2] = 0; ch[3] = jn.plan.mode | (dfs ? (1u << 10) : 0);
 	ch[4] = 0u | (40u << 8) | (40u << 16); ch[5] = 0u | (40u << 8);
+	(void)g5;
+	ev("JOIN: vdev start %u MHz, center %u, phy mode %u (%s)", jn.mhz, jn.plan.center, jn.plan.mode, jn_mode_name(jn.plan.mode));
 	memset(v, 0, sizeof(v));
 	n = wp_cmd(c, 0x5003, 88, v, 72);
 	wp_tlv(c, &n, 80, ch, 24);
@@ -4675,13 +4806,18 @@ static bool
 jn_peer_assoc(void)
 {
 	static const uint8_t ours[12] = { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 };
-	static const uint8_t ht_rates[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+	uint8_t ht_rates[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
 	uint8_t legacy[16], c[8 + 76 + 4 + 16 + 4 + 16 + 4 + 16];
 	unsigned nl = 0, n_ht = 0;
 	bool g5 = jn.mhz > 4900;
 	uint32_t a[19], n;
 	uint8_t pad[16], pad_ht[16];
 	uint32_t vht[4] = { 0, 0, 0, 0 };
+	const struct swu_ap_caps *pc = (jn.ar.caps.vht || !jn.bcaps.vht) ? &jn.ar.caps : &jn.bcaps;
+	const struct swu_ap_caps *hc = jn.ar.caps.ht ? &jn.ar.caps : &jn.bcaps;
+	unsigned bw = jn.plan.bw, n_vht = 0, mpdu = 65535, dens = 0;
+	uint32_t rate_caps = 0;
+	bool vhtp = jn.plan.vht && pc->vht;
 
 	for (unsigned r = 0; r < 12; r++) {
 		if (g5 && r < 4) {
@@ -4703,16 +4839,64 @@ jn_peer_assoc(void)
 	if (jn.ar.ht) {
 		a[5] |= 0x1000;                                 /* WMI_PEER_HT */
 		a[8] = jn.ar.ht_caps ? jn.ar.ht_caps : 0x012d;  /* ht_caps */
-		a[9] = 65535;                                   /* max_mpdu (64k) */
-		a[10] = 0;                                      /* mpdu_density */
-		a[11] |= 0x08;                                  /* WMI_RC_HT_FLAG */
+		if (hc->ht) {
+			static const unsigned dmap[8] = { 0, 1, 1, 1, 2, 4, 8, 16 };
+
+			mpdu = (1u << (13 + (hc->ht_ampdu & 3u))) - 1;  /* ath10k_peer_assoc_h_ht */
+			dens = dmap[(hc->ht_ampdu >> 2) & 7u];
+		}
+		rate_caps = 0x08;                               /* WMI_RC_HT_FLAG */
+		if (bw >= 40) {
+			a[5] |= 0x2000;                         /* WMI_PEER_40MHZ */
+			rate_caps |= 0x02;                      /* WMI_RC_CW40_FLAG */
+		}
+		if (a[8] & 1u) {
+			a[5] |= 0x10000;                        /* WMI_PEER_LDPC */
+		}
+		if (a[8] & 0x60u) {
+			rate_caps |= 0x04;                      /* WMI_RC_SGI_FLAG */
+		}
+		if (vhtp) {
+			unsigned vx = (pc->vht_cap >> 23) & 7u;
+			uint32_t vm = (1u << (13 + vx)) - 1;
+
+			if (vm > mpdu) {
+				mpdu = vm;                      /* the larger of the HT and VHT limits, as ath10k */
+			}
+			a[5] |= 0x02000000;                     /* WMI_PEER_VHT */
+			if (bw >= 80) {
+				a[5] |= 0x04000000;             /* WMI_PEER_80MHZ */
+			}
+			a[13] = pc->vht_cap;
+			vht[0] = pc->vht_rx_high;
+			vht[1] = pc->vht_rx_map;
+			vht[2] = pc->vht_tx_high;
+			vht[3] = pc->vht_tx_map;
+			n_vht = (pc->vht_rx_map & 3u) == 3 ? 0 : 8u + (pc->vht_rx_map & 3u);
+		}
+		a[9] = mpdu;
+		a[10] = dens;
+		a[11] |= rate_caps;
 		n_ht = 8;
+		for (unsigned i = 0; i < 8; i++) {
+			ht_rates[i] = (uint8_t)i;
+		}
+		if (hc->ht && (hc->ht_mcs[0] & 0xff) != 0) {
+			unsigned k = 0;
+
+			for (unsigned i = 0; i < 8; i++) {
+				if (hc->ht_mcs[0] & (1u << i)) {
+					ht_rates[k++] = (uint8_t)i;
+				}
+			}
+			n_ht = k;
+		}
 	}
 	a[6] = jn.ar.cap;
 	a[7] = 1;
 	a[12] = 1;                                              /* nss */
 	if (jn.ar.ht) {
-		a[14] = g5 ? 4 : 5;                             /* MODE_11NA_HT20 (4) / MODE_11NG_HT20 (5) */
+		a[14] = jn.plan.mode;                           /* MODE_11NA_HT20 (4) ... MODE_11AC_VHT80 (10): the same as the channel's */
 	} else {
 		{
 			unsigned r0 = nl ? (legacy[0] & 0x7fu) : 0;
@@ -4735,7 +4919,8 @@ jn_peer_assoc(void)
 		wp_tlv(c, &n, 17, NULL, 0);
 	}
 	wp_tlv(c, &n, 102, vht, 16);
-	ev("JOIN: peer assoc aid %u flags %#x caps %#x phy mode %u, %u legacy, %u HT rates", jn.aid, a[5], a[6], a[14], nl, n_ht);
+	ev("JOIN: peer assoc aid %u flags %#x caps %#x phy mode %u (%s), %u legacy, %u HT rates, %u VHT MCS (rx map %#x tx map %#x), max mpdu %u, max PHY rate %u Mbit/s",
+	    jn.aid, a[5], a[6], a[14], jn_mode_name(a[14]), nl, n_ht, n_vht, vht[1], vht[3], a[9], jn_phy_rate());
 	return wp_wmi("peer assoc", c, n);
 }
 
@@ -5071,6 +5256,25 @@ jn_join(void)
 		as.ap_ies_len = wp.bss[jn.bss].ie_len;
 		as.rsn_ie = rsn;
 		as.rsn_ie_len = rl;
+		if (jn.plan.bw >= 40) {
+			as.ht_cap_info = 0x012d | 0x0002 | 0x0040;      /* + 40 MHz channel width, short GI 40 */
+		}
+		if (jn.plan.vht) {
+			static uint8_t vie[14];
+			uint32_t vc = g_fw_vht_cap & (0x3u | 0x10u | 0x20u | 0x100u | (7u << 23));      /* the firmware's: MPDU length, LDPC, SGI80, rx STBC 1, A-MPDU exponent (one chain: no tx STBC, no beamforming) */
+
+			if (g_fw_vht_cap == 0) {
+				vc = 0x2u | 0x10u | 0x20u | 0x100u | (7u << 23);
+			}
+			vie[0] = 191; vie[1] = 12;
+			memcpy(vie + 2, &vc, 4);
+			vie[6] = 0xfe; vie[7] = 0xff;           /* rx MCS map: 1 stream MCS 0-9, the rest none */
+			vie[8] = 0xb1; vie[9] = 0x01;           /* rx highest 433 */
+			vie[10] = 0xfe; vie[11] = 0xff;         /* tx MCS map */
+			vie[12] = 0xb1; vie[13] = 0x01;
+			as.vht_ie = vie;
+			as.vht_ie_len = sizeof(vie);
+		}
 		n = swu_assoc_req(f, sizeof(f), &as);
 		if (n == 0) {
 			ev("JOIN: could not build the association request");
@@ -5139,7 +5343,7 @@ jn_join(void)
 
 
 /* ---- ew0: the network interface iOS sees (the Wi-Fi equivalent of ue0 in sweet_usb.c) ---- */
-#define EW_TXQ          32u
+#define EW_TXQ          128u
 #define EW_FRAME_MAX    1600u
 
 static struct {
@@ -5149,7 +5353,7 @@ static struct {
 	uint16_t txq_len[EW_TXQ];
 	unsigned head, n;
 	bool up;
-	uint64_t rx_frames, tx_frames, tx_drop, rx_drop;
+	uint64_t rx_frames, tx_frames, tx_drop, rx_drop, rx_bytes, tx_bytes;
 	char info[160];
 	bool have_ip;
 	uint8_t cur_ip[4];
@@ -5576,7 +5780,14 @@ ew_a80211(bool set, struct sweet_a80211req *rq)
 		break;
 	}
 	case 4: {                                               /* CHANNEL: {version, {version, channel, flags}} */
-		uint32_t out[4] = { 1, 1, up ? ew_a80211_channel(jn.mhz) : 0, up ? ew_a80211_chflags(jn.mhz) : 0 };
+		uint32_t cf = up ? ew_a80211_chflags(jn.mhz) : 0;
+
+		if (up && jn.plan.bw == 40) {
+			cf = (cf & ~0x2u) | 0x4u;               /* 40 MHz */
+		} else if (up && jn.plan.bw == 80) {
+			cf = (cf & ~0x2u) | 0x400u;             /* 80 MHz (itlwm's APPLE80211_C_FLAG_80MHZ) */
+		}
+		uint32_t out[4] = { 1, 1, up ? ew_a80211_channel(jn.mhz) : 0, cf };
 
 		if (!set) {
 			err = ew_a80211_out(rq, out, sizeof(out));
@@ -5608,7 +5819,8 @@ ew_a80211(bool set, struct sweet_a80211req *rq)
 		break;
 	}
 	case 14: {                                              /* PHY_MODE: {version, supported modes, active mode}: 11a 1, 11b 2, 11g 4, 11n 8 */
-		uint32_t out[3] = { 1, 0xf, up ? (jn.mhz > 5000 ? 0x9u : 0xcu) : 0 };
+		/* 11ac as the next bit (0x10): not checked against an iOS header */
+		uint32_t out[3] = { 1, 0x1f, up ? (jn.mhz > 5000 ? 0x9u : 0xcu) | (jn.plan.vht ? 0x10u : 0u) : 0 };
 
 		if (!set) {
 			err = ew_a80211_out(rq, out, sizeof(out));
@@ -5623,7 +5835,7 @@ ew_a80211(bool set, struct sweet_a80211req *rq)
 		break;
 	case 8:                                                 /* RATE: in req_val, Mbit/s */
 		if (!set) {
-			rq->req_val = up ? 54 : 0;
+			rq->req_val = up ? jn_phy_rate() : 0;           /* the negotiated mode's top rate (1 stream, short GI) */
 			err = 0;
 		}
 		break;
@@ -6026,6 +6238,7 @@ ew_rx(const uint8_t *eth, size_t len)
 		return;
 	}
 	ew.rx_frames++;
+	ew.rx_bytes += len;
 	hakios_net_input(eth, len);              /* copied there; this is the radio's service thread, not an interrupt */
 }
 
@@ -6653,6 +6866,7 @@ wlan_tx_pump(void)
 		lck_mtx_unlock(ew.lock);
 		if (e == 0) {
 			ew.tx_frames++;
+			ew.tx_bytes += ew.txq_len[k];
 		} else {
 			ew.tx_drop++;
 		}
@@ -6707,6 +6921,8 @@ wlan_station_loop(void)
 	for (;;) {
 		bool found = false;
 		uint64_t next_mon;
+		uint64_t st_t, st_busy, st_rx, st_tx, st_rxb, st_txb, st_ent, st_drop;
+		unsigned st_loops, st_active;
 
 		if (g_wlan_crashed || g_modem_crashed) {
 			return;
@@ -6728,6 +6944,10 @@ wlan_station_loop(void)
 			found = jn_read_conf() && jn_pick();
 		}
 		if (!found || !jn_join()) {
+			if (found && g_mode_demote < g_mode_max) {
+				g_mode_demote++;                /* the next try goes one step narrower (VHT80 -> VHT40 -> ... -> HT20) */
+				ev("EW: join failed at %s: the next try is limited to %s", jn_mode_name(jn.plan.mode), wlm_names[g_mode_max - g_mode_demote]);
+			}
 			ev("EW: no connection (found %u): trying again in 5 s", found);
 			if (g_ujoin_valid) {
 				/* the join Settings asked for failed: forget it (the next try is the stored network) and tell wifid */
@@ -6753,6 +6973,7 @@ wlan_station_loop(void)
 			}
 			continue;
 		}
+		g_mode_demote = 0;
 		wp_fault_check("join done");
 		/*
 		 * Station power save on once associated (boot-arg wifi_ps, default 1; 0: as before). The join turns it off
@@ -6779,7 +7000,14 @@ wlan_station_loop(void)
 		}
 		ev("EW: service running");
 		next_mon = nt_us() + 5000000;
+		st_t = nt_us();
+		st_busy = 0;
+		st_loops = st_active = 0;
+		st_rx = ew.rx_frames; st_tx = ew.tx_frames; st_rxb = ew.rx_bytes; st_txb = ew.tx_bytes; st_ent = g_rx_ent; st_drop = jn.rx_drop;
 		while (!g_wlan_crashed && !g_modem_crashed && !jn.kicked) {
+			uint64_t t_loop = nt_us();
+			uint64_t act0 = ew.rx_frames + ew.tx_frames;
+
 			if (g_ujoin_pending) {
 				/*
 				 * The network we are on, asked for again (same name and key): nothing to leave. Leaving it fed a loop
@@ -6834,7 +7062,15 @@ wlan_station_loop(void)
 				ev("EW: scan on request: %u networks", wp.nbss);
 				ew_a80211_event(10, NULL, 0);
 			}
-			sleep_ms(2);
+			st_loops++;
+			if (ew.rx_frames + ew.tx_frames != act0) {
+				st_active++;
+				st_busy += nt_us() - t_loop;
+				delay_for_interval(200, 1000);          /* traffic: look again in 200 us (was a flat 2 ms: 32 frames per pass at most) */
+			} else {
+				st_busy += nt_us() - t_loop;
+				sleep_ms(2);
+			}
 			if (nt_us() >= next_mon) {
 				uint8_t c[16];
 				uint32_t id = 0x1d001, v = ++wp.echo_sent, sg = g_smmu[0x48 / 4];
@@ -6853,6 +7089,19 @@ wlan_station_loop(void)
 					hist_done = true;
 					ev("EW: %u TX frames not completed (rx ring: msgs %u bufs %u reposted %u bad %u idx %u): message history follows", jn.tx_inflight, g_rx_msgs, g_rx_ent, g_rx_reposts, g_rx_bad, wp.rx_idx);
 					wp_hist_dump();
+				}
+				{
+					uint64_t now = nt_us(), dt = now - st_t ? now - st_t : 1;
+
+					if (ew.rx_frames + ew.tx_frames != st_rx + st_tx || lines % 6 == 0) {
+						ev("EW: stats %llu ms: rx %llu Mbit/s %llu pkt/s, tx %llu Mbit/s %llu pkt/s, drop rx %llu tx %llu, txq %u/%u inflight %u, rx bufs %llu, loop busy %llu%% (%u passes, %u with traffic), service thread on cpu %u, mode %s %u MHz",
+						    dt / 1000, (ew.rx_bytes - st_rxb) * 8 / dt, (ew.rx_frames - st_rx) * 1000000 / dt,
+						    (ew.tx_bytes - st_txb) * 8 / dt, (ew.tx_frames - st_tx) * 1000000 / dt,
+						    jn.rx_drop - st_drop, ew.tx_drop, ew.n, EW_TXQ, jn.tx_inflight, (uint64_t)g_rx_ent - st_ent,
+						    st_busy * 100 / dt, st_loops, st_active, cpu_number(), jn_mode_name(jn.plan.mode), jn.plan.bw);
+					}
+					st_t = now; st_busy = 0; st_loops = st_active = 0;
+					st_rx = ew.rx_frames; st_tx = ew.tx_frames; st_rxb = ew.rx_bytes; st_txb = ew.tx_bytes; st_ent = g_rx_ent; st_drop = jn.rx_drop;
 				}
 				if (lines % 6 == 0) {
 					ev("EW: %llu s: tx %llu rx %llu drop %llu/%llu echo %u/%u credits %u inflight %u rxring msgs %u bufs %u reposted %u bad %u idx %u", (nt_us() - started) / 1000000, ew.tx_frames, ew.rx_frames,
@@ -8210,6 +8459,25 @@ hakios_mpss_sm7150_start(void)
 	PE_parse_boot_argn("wlan_kdhcp", &g_kdhcp, sizeof(g_kdhcp));
 	PE_parse_boot_argn("mpss_dump", &g_ev_dump, sizeof(g_ev_dump));
 	PE_parse_boot_argn("wlannoht", &swu_no_ht, sizeof(swu_no_ht));
+	{
+		char mm[16] = "";
+
+		if (PE_parse_boot_argn("wlan_mode_max", mm, sizeof(mm))) {
+			for (unsigned k = 0; k < 5; k++) {
+				const char *nm = wlm_names[k];
+				unsigned i = 0;
+
+				while (nm[i] && mm[i] && (mm[i] | 0x20) == (nm[i] | 0x20)) {
+					i++;
+				}
+				if (nm[i] == 0 && mm[i] == 0) {
+					g_mode_max = k;
+					g_mode_explicit = true;
+				}
+			}
+			hakios_say("mpss: wlan_mode_max=%s -> %s\n", mm, wlm_names[g_mode_max]);
+		}
+	}
 	if (kernel_thread_start_priority(mpss_thread, NULL, SWEET_WLAN_PRI, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {

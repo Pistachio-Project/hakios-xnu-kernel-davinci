@@ -382,6 +382,44 @@ swu_build_rsn(uint8_t *out, uint8_t group_type)
 	return (size_t)(p - out);
 }
 
+/* HT capabilities (45), HT operation (61), VHT capabilities (191) and VHT operation (192) out of an element list */
+void
+swu_ap_parse(const uint8_t *ies, size_t len, struct swu_ap_caps *c)
+{
+	memset(c, 0, sizeof(*c));
+	for (size_t o = 0; o + 2 <= len;) {
+		uint8_t id = ies[o], l = ies[o + 1];
+		const uint8_t *d = ies + o + 2;
+
+		if (o + 2 + l > len) {
+			break;
+		}
+		if (id == 45 && l >= 26) {
+			c->ht = true;
+			c->ht_cap = (uint16_t)(d[0] | (d[1] << 8));
+			c->ht_ampdu = d[2];
+			memcpy(c->ht_mcs, d + 3, 16);
+		} else if (id == 61 && l >= 2) {
+			c->primary = d[0];
+			c->ht_sec = d[1] & 3;
+			c->ht_w40 = (d[1] & 4) != 0;
+		} else if (id == 191 && l >= 12) {
+			c->vht = true;
+			c->vht_cap = (uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
+			c->vht_rx_map = (uint16_t)(d[4] | (d[5] << 8));
+			c->vht_rx_high = (uint16_t)(d[6] | (d[7] << 8));
+			c->vht_tx_map = (uint16_t)(d[8] | (d[9] << 8));
+			c->vht_tx_high = (uint16_t)(d[10] | (d[11] << 8));
+		} else if (id == 192 && l >= 3) {
+			c->vht_op = true;
+			c->vht_width = d[0];
+			c->vht_seg0 = d[1];
+			c->vht_seg1 = d[2];
+		}
+		o += 2u + l;
+	}
+}
+
 int swu_no_ht;                          /* boot-arg wlannoht=1: do not advertise HT in the association request */
 
 /* association request: capabilities, listen interval, SSID, the AP's rates (up to 8 + extended), the RSN element if any, WMM if AP supports it, HT if AP supports it */
@@ -433,7 +471,15 @@ swu_assoc_req(uint8_t *f, size_t size, const struct swu_assoc *a)
 			0x00                    /* asel caps */
 		};
 		memcpy(p, ht_cap_ie, 28);
+		if (a->ht_cap_info) {
+			p[2] = (uint8_t)a->ht_cap_info;
+			p[3] = (uint8_t)(a->ht_cap_info >> 8);
+		}
 		p += 28;
+		if (a->vht_ie && a->vht_ie_len && size >= (size_t)(p - f) + a->vht_ie_len + 64) {
+			memcpy(p, a->vht_ie, a->vht_ie_len);
+			p += a->vht_ie_len;
+		}
 	}
 	if (a->rsn_ie) {
 		memcpy(p, a->rsn_ie, a->rsn_ie_len);
@@ -486,6 +532,7 @@ swu_assoc_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8
 		}
 		o += 2u + l;
 	}
+	swu_ap_parse(f + 30, len - 30, &r->caps);
 	return 0;
 }
 
