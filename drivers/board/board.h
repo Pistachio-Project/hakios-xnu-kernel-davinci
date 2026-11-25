@@ -240,6 +240,19 @@ struct hakios_board {
 		const char *name;               /* for the log: "the PMK8350's RTC" */
 	} rtc;
 
+	/*
+	 * What differs between phones that run a WCN3990 through an SM7150's modem (board: wcn3990 { }, feature wifi-wcn3990;
+	 * board/sm7150_mpss.c). 0 / NULL: the Pixel 4a's value, which the driver has as its default.
+	 */
+	struct {
+		uint32_t mpss_size;             /* the modem's reserved memory at 0x8b000000 (the Pixel's 0x9800000) */
+		uint64_t msa, rmtfs;            /* the Wi-Fi's MSA region and the RMTFS buffer: below 4 GiB, on a page */
+		uint32_t msa_size, rmtfs_size;
+		const char *bdf[3];             /* board data files of the Wi-Fi's directory, in order; a %02x takes the chip's board id */
+		const char *rails[8];           /* the chip's supplies (RPMh regulators of the command database), NULL after the last */
+		uint16_t rail_mv[8];            /* ... and the voltage of each */
+	} wcn3990;
+
 	/* the vibration motor's chip (board: haptic { }): which of the SoC's pins it is on, and this motor's calibration */
 	struct {
 		uint8_t sda, scl;               /* its I2C bus's two lines */
