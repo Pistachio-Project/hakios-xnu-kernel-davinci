@@ -119,12 +119,87 @@ cputop_thread(void *arg __unused, wait_result_t w __unused)
 	}
 }
 
+/*
+ * Boot-arg memtop=S (default 5; 0: off): every S seconds a line of where the memory is (hakios_memtop_line, in
+ * arch/arm64/kernel/loader_return.c) and the five processes with the biggest footprint, by the kernel's own count
+ * (resident and compressed, in MB; the compressed part in brackets).
+ */
+#define MEMTOP_SHOWN    5
+
+struct memtop_entry {
+	int             pid;
+	uint64_t        footprint, compressed;
+	char            name[24];
+};
+static struct memtop_entry memtop_best[MEMTOP_SHOWN];
+static uint32_t memtop_seconds;
+
+extern uint64_t get_task_phys_footprint(task_t);
+extern uint64_t get_task_compressed(task_t);
+extern void hakios_memtop_line(char *buf, size_t len);
+
+static int
+memtop_one(proc_t p, void *arg __unused)
+{
+	task_t task = proc_task(p);
+	struct memtop_entry e;
+	uint32_t at = MEMTOP_SHOWN;
+
+	if (task == TASK_NULL) {
+		return PROC_RETURNED;
+	}
+	e.pid = proc_pid(p);
+	e.footprint = get_task_phys_footprint(task);
+	e.compressed = get_task_compressed(task);
+	strlcpy(e.name, proc_best_name(p), sizeof(e.name));
+	while (at > 0 && e.footprint > memtop_best[at - 1].footprint) {
+		at--;
+	}
+	if (at < MEMTOP_SHOWN) {
+		for (uint32_t i = MEMTOP_SHOWN - 1; i > at; i--) {
+			memtop_best[i] = memtop_best[i - 1];
+		}
+		memtop_best[at] = e;
+	}
+	return PROC_RETURNED;
+}
+
+static void
+memtop_thread(void *arg __unused, wait_result_t w __unused)
+{
+	static char line[640];
+
+	for (;;) {
+		int at;
+
+		delay_for_interval(memtop_seconds * 1000, NSEC_PER_MSEC);
+		bzero(memtop_best, sizeof(memtop_best));
+		proc_iterate(PROC_ALLPROCLIST, memtop_one, NULL, NULL, NULL);
+		hakios_memtop_line(line, sizeof(line));
+		at = (int)strlen(line);
+		at += snprintf(line + at, sizeof(line) - (size_t)at, "; top by footprint:");
+		for (uint32_t i = 0; i < MEMTOP_SHOWN && memtop_best[i].footprint != 0 && at < (int)sizeof(line) - 1; i++) {
+			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s[%d] %llu (%llu)", memtop_best[i].name,
+			    memtop_best[i].pid, memtop_best[i].footprint >> 20, memtop_best[i].compressed >> 20);
+		}
+		hakios_tl("%s\n", line);
+	}
+}
+
 void hakios_cputop_start(void);
 void
 hakios_cputop_start(void)
 {
 	thread_t thread;
 
+	memtop_seconds = 5;
+	(void)PE_parse_boot_argn("memtop", &memtop_seconds, sizeof(memtop_seconds));
+	if (memtop_seconds != 0) {
+		memtop_seconds = memtop_seconds > CPUTOP_MAX_SECONDS ? CPUTOP_MAX_SECONDS : memtop_seconds;
+		if (kernel_thread_start(memtop_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+	}
 	if (!PE_parse_boot_argn("cputop", &cputop_seconds, sizeof(cputop_seconds)) || cputop_seconds == 0) {
 		return;
 	}

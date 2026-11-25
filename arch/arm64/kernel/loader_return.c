@@ -860,6 +860,40 @@ hakios_memory_line(char *buf, size_t len)
 }
 
 /*
+ * The 5 second line (boot-arg memtop=S, default 5, 0: none; bsd/dev/board/cputop.c says it and adds the processes):
+ * every state a page is in, and what the wired ones are -- the GPU's buffers, IOSurfaces, the files of /private/var
+ * (ramfs), page tables, the kernel's zones. "other" is what is left of the wired and not named.
+ */
+extern unsigned int inuse_user_ptepages_count, inuse_kernel_ptepages_count;
+extern size_t zone_pages_wired;
+extern int64_t hakios_gpu_buffer_bytes(void);
+void hakios_memtop_line(char *buf, size_t len);
+
+void
+hakios_memtop_line(char *buf, size_t len)
+{
+#define MB(pages)       ((unsigned int)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
+	uint32_t surfaces = 0;
+	uint64_t surface_bytes = 0;
+	uint64_t gpu = (uint64_t)hakios_gpu_buffer_bytes() >> 20, named;
+	unsigned int wired = MB(vm_page_wire_count);
+
+	MiniIOSurfaceUsage(&surfaces, &surface_bytes);
+	named = gpu + (surface_bytes >> 20) + MB(os_atomic_load(&ramfs_pages_in_use, relaxed)) +
+	    MB(inuse_user_ptepages_count + inuse_kernel_ptepages_count) + MB(zone_pages_wired);
+	snprintf(buf, len, "mem: free %u MB, active %u, inactive %u, speculative %u, wired %u MB (of which GPU %u, IOSurface %u, "
+	    "ramfs /private/var %u, page tables %u, zones %u, other %u), compressed %u MB (holding %u), purgeable %u, "
+	    "available %u (idle kills below %u)",
+	    MB(vm_page_free_count), MB(vm_page_active_count), MB(vm_page_inactive_count), MB(vm_page_speculative_count),
+	    wired, (unsigned int)gpu, (unsigned int)(surface_bytes >> 20), MB(os_atomic_load(&ramfs_pages_in_use, relaxed)),
+	    MB(inuse_user_ptepages_count + inuse_kernel_ptepages_count), MB(zone_pages_wired),
+	    named < wired ? wired - (unsigned int)named : 0,
+	    MB(VM_PAGE_COMPRESSOR_COUNT), MB(c_segment_pages_compressed), MB(counter_load(&vm_page_purgeable_count)),
+	    MB(memorystatus_available_pages), MB(memorystatus_get_idle_exit_page_shortage_threshold()));
+#undef MB
+}
+
+/*
  * The surfaces their makers marked volatile, which are kept wired all the same (MiniIOSurface.cpp says why they are only
  * counted): said with the memory line once there are any, so a session's log shows whether giving them back would matter
  * -- above all when memory is short, which is when it would.

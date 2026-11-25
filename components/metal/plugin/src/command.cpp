@@ -207,7 +207,7 @@ void CommandQueue::giveBuffer(std::shared_ptr<Buffer> b) {
     // the 32 MB this was, each fresh one a kernel call and first-touch page faults inside a draw call)
     static const uint64_t cap = [] {
         const char* e = getenv("HAKIOS_METAL_POOL_MB");
-        const long mb = e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : 128;
+        const long mb = e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : (windowServerProcess() ? 128 : 32);   // (a quarter for the processes that are not the window server)
         return uint64_t(mb < 0 ? 0 : mb) << 20;
     }();
     std::lock_guard<std::mutex> g(poolLock_);

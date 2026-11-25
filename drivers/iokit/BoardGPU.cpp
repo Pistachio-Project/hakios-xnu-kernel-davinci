@@ -49,6 +49,7 @@ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" unsigned int vm_page_free_count, vm_page_wire_count;
 /* every client's buffers together (the 5 s line "gpu memory"): what the GPU's clients hold in the kernel, wired and kept, against the pages left */
 static int64_t gAllBuffers, gAllBufferBytes, gAllKeptBytes;
+extern "C" int64_t hakios_gpu_buffer_bytes(void) { return gAllBufferBytes; }   /* (memtop: the GPU's wired buffers, all clients) */
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 

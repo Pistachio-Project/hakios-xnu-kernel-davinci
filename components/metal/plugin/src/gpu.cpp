@@ -134,6 +134,14 @@ void Gpu::release(Bo& bo) {
 
 std::atomic<uint64_t> gRecycleMissesTotal{0};
 
+bool windowServerProcess() {
+    static const bool ws = [] {
+        const char* n = getprogname();
+        return n != nullptr && strcmp(n, "backboardd") == 0;
+    }();
+    return ws;
+}
+
 bool memoryLow() {
 #if defined(__APPLE__)
     // (the run 224603: at 212 s, with a scripted workload on, IOSurface allocations began to fail and processes to crash, and the kernel panicked at
@@ -163,7 +171,7 @@ namespace {
 uint64_t poolBytes() {
     static const uint64_t v = [] {
         const char* e = getenv("HAKIOS_METAL_TEXPOOL_MB");
-        const long mb = e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : 256;
+        const long mb = e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : (windowServerProcess() ? 256 : 64);   // (the others' share: a quarter. Each process keeps its own cache, up to this)
         return uint64_t(mb < 0 ? 0 : mb) << 20;
     }();
     return v;

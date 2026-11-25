@@ -129,6 +129,8 @@ std::unique_ptr<Transport> openKernelGpu(std::string* why);
 
 // whether the machine is short of memory (checked once a second at most): the caches of memory the plug-in keeps for reuse then keep nothing
 bool memoryLow();
+// whether this process is the window server (backboardd), which draws every frame and keeps the full caches; the others (SpringBoard, iconservicesagent, apps) keep a quarter of them unless the HAKIOS_METAL_*_MB variables say otherwise
+bool windowServerProcess();
 class Gpu;
 extern std::atomic<uint64_t> gRecycleHits, gRecycleMisses, gRecycleTrimmed, gRecycleCached;
 

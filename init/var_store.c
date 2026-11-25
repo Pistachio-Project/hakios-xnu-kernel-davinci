@@ -84,6 +84,7 @@ static unsigned changed_under;          /* files that were another by the time t
 /* the directories whose contents are not kept (the directory itself is) */
 static const char *const SKIP[] = {
 	"tmp",                  /* its name says it */
+	"mobile/tmp",           /* the same, the mobile user's: 21 MB in a store (audiomxd 17, assetsd 4), wired in RAM from the restore on */
 	"run",                  /* runtime sockets and pid files: this boot's, not the last one's */
 	"vm",                   /* the compressor's swap */
 	"log", "logs",          /* what the last boot said */
@@ -126,6 +127,16 @@ static const char *const SKIP_DIAG[] = {
 	"mobile/Library/Caches/com.apple.CacheDelete",
 	"MobileAsset/Downloads", "mobile/Library/Caches/com.apple.mobileassetd",
 	"db/CoreDuet", "mobile/Library/Caches/com.apple.coreduetd",
+	NULL,
+};
+
+/*
+ * Boot-arg var_store_lean=1: left out as well, to take memory back (/private/var is wired RAM, the whole of it, from the
+ * restore on): what the system makes again when it is missing, though a first start of the program after it may be
+ * slower. About 60 MB of a 400 MB store (run 231808's sizes: Shortcuts 49 MB, StatusKit 5, Finance 5).
+ */
+static const char *const SKIP_LEAN[] = {
+	"mobile/Library/Shortcuts", "mobile/Library/StatusKit", "mobile/Library/Finance",
 	NULL,
 };
 
@@ -828,7 +839,7 @@ is_icon_cache(const char *relative)
 	for (int i = 0; names[i] != NULL; i++) {
 		const size_t n = strlen(names[i]);
 
-		if (strncmp(relative, names[i], n) == 0 && (relative[n] == '/' || relative[n] == 0)) {
+		if (strncmp(relative, names[i], n) == 0 && relative[n] == '/') {
 			return 1;
 		}
 	}
@@ -999,6 +1010,17 @@ diag_kept(void)
 	return diag_wanted;
 }
 
+static int lean_wanted = -1;
+
+static int
+lean_on(void)
+{
+	if (lean_wanted < 0) {
+		lean_wanted = boot_arg_is("var_store_lean", "1");
+	}
+	return lean_wanted;
+}
+
 static int
 is_skipped(const char *relative)
 {
@@ -1009,6 +1031,11 @@ is_skipped(const char *relative)
 	}
 	for (int i = 0; !diag_kept() && SKIP_DIAG[i] != NULL; i++) {
 		if (strcmp(relative, SKIP_DIAG[i]) == 0) {
+			return 1;
+		}
+	}
+	for (int i = 0; lean_on() && SKIP_LEAN[i] != NULL; i++) {
+		if (strcmp(relative, SKIP_LEAN[i]) == 0) {
 			return 1;
 		}
 	}
@@ -1822,6 +1849,14 @@ unpack_one(int make)
 			skipped_load++;
 		}
 	}
+	for (int i = 0; make && lean_on() && SKIP_LEAN[i] != NULL; i++) {
+		const size_t n = strlen(SKIP_LEAN[i]);
+
+		if (strncmp(relative, SKIP_LEAN[i], n) == 0 && relative[n] == '/') {
+			make = 0;
+			skipped_load++;
+		}
+	}
 	/* (nor the keychain an archive saved with var_store_keychain=1 holds, unless this boot asks for it too) */
 	if (make && strncmp(relative, KEYCHAIN "/", sizeof(KEYCHAIN)) == 0 && !keychain_kept()) {
 		make = 0;
@@ -1835,7 +1870,7 @@ unpack_one(int make)
 		const size_t n = strlen(not_made_dir);
 
 		/* (what is under it, and its own times and flags at the end of it) */
-		if (strncmp(relative, not_made_dir, n) == 0 && (relative[n] == '/' || relative[n] == 0)) {
+		if (strncmp(relative, not_made_dir, n) == 0 && relative[n] == '/') {
 			make = 0;
 			skipped_load++;
 		}
