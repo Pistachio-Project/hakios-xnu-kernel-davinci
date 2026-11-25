@@ -219,12 +219,20 @@ void refusedThere(hakios_metal_cb* cb, int r) {
 }
 }  // namespace
 
+namespace hakios::metal { extern std::atomic<uint64_t> gBuffersMadeTotal, gBytesMadeTotal, gRecycleMissesTotal; }
 namespace hakios::metal { extern std::atomic<uint32_t> gBuffersMade, gBuffersReused, gPoolGiven, gPoolShared, gPoolFull, gBigMade, gPrefilled, gRefilled; extern std::atomic<uint64_t> gBytesMade; }
 extern "C" {
 void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long long* bytes) {
     *made = hakios::metal::gBuffersMade.exchange(0);
     *reused = hakios::metal::gBuffersReused.exchange(0);
     *bytes = hakios::metal::gBytesMade.exchange(0);
+}
+
+void hakios_metal_activity(unsigned long long* buffers, unsigned long long* kb, unsigned long long* textureMisses, unsigned long long* stageMisses) {
+    *buffers = hakios::metal::gBuffersMadeTotal.load();
+    *kb = hakios::metal::gBytesMadeTotal.load() >> 10;
+    *textureMisses = hakios::metal::gRecycleMissesTotal.load();
+    *stageMisses = compileStats().misses.load();
 }
 
 void hakios_metal_texture_pool_counts(unsigned long long* hits, unsigned long long* misses, unsigned long long* trimmed, unsigned long long* cachedKb) {

@@ -76,6 +76,8 @@ uint64_t hakios_metal_gpu_id(hakios_metal_device *device);
 int hakios_metal_has_compiler(void);
 /* the stage cache's tally since the process began: stages read from the writable cache, from the seed, compiled (misses), the
  * milliseconds spent compiling and reading, and the stages compiled with no cache directory at all */
+/* monotonic totals since the process began (the frame hitch lines' before and after): buffers made, KB of them, textures given memory afresh, stages compiled */
+void hakios_metal_activity(unsigned long long *buffers, unsigned long long *kb, unsigned long long *texture_misses, unsigned long long *stage_misses);
 /* the texture memory cache's tally since the last call (Gpu::recycleBo): found again, made afresh, let go, and KB held now */
 void hakios_metal_texture_pool_counts(unsigned long long *hits, unsigned long long *misses, unsigned long long *trimmed, unsigned long long *cached_kb);
 /* the buffer pool's tally since the last call: given back, refused as still held, refused as the pool was full, and the 1 MB+ made */

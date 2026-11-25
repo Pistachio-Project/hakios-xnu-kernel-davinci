@@ -615,7 +615,6 @@ static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled ren
 static unsigned hm_dirty_groups(void);                /* metal_dirty_groups=MASK: the tracked register groups, a bit each */
 static BOOL hm_full_state(void);                      /* metal_full_state=1: every draw encodes all its register state (no dirty tracking) */
 static BOOL hm_binning_on(void);
-static unsigned hm_spec_used, hm_spec_fallback;   /* draws of uber pipelines with a specialised program / on the uber shader itself (the fps report) */
 static unsigned hm_pass_sync(void);                      /* metal_gmem_binning=1: the hardware's binning in GMEM passes */
 static unsigned hm_gmem_off(void);                    /* metal_gmem_off=N: GMEM's refinements off, by bit */
 - (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;
@@ -3543,6 +3542,9 @@ hm_frame_pacing(const char *what, const unsigned *bins, unsigned frames, double 
 	(void)seen;
 }
 
+static unsigned hm_pipelines_total;   /* pipelines built in this process (the hitch lines) */
+static unsigned hm_spec_used, hm_spec_fallback;   /* draws of uber pipelines with a specialised program / on the uber shader itself (the fps report) */
+
 /* the stage cache's misses, one line each as compiled (compiler.cpp: cacheNote): the stage's name, the first 12 hex digits of
  * its key (the same stage compiled again at the next boot has the same key if it is the same stage: a key that changes
  * between boots shows here), "nofile" or "FILE-NOT-BELIEVED" (a file under that key that the loader passed over) */
@@ -3569,6 +3571,7 @@ hm_pipeline_note(double ms)
 
 	hm_cache_notes();
 	pipelines++;
+	__atomic_fetch_add(&hm_pipelines_total, 1, __ATOMIC_RELAXED);
 	totalMs += ms;
 	sinceMs += ms;
 	if (ms > worstMs) worstMs = ms;
@@ -6465,6 +6468,14 @@ static struct {
 	unsigned frameBinsAll[500];     /* ...and of the whole run so far */
 	unsigned frames, framesAll;
 	double frameWorst, frameWorstAll;
+	unsigned runLen;                /* consecutive frames within 50 ms: three of them and the screen is moving */
+	BOOL moving;
+	unsigned idleFrames;            /* first frames after a pause, not counted in the pacing */
+	double sinceFrameLatencyMax;    /* the longest commit-to-completion since the last frame began */
+	double hitchSlowUs;             /* the slowest pass timed since the last frame began, and what it was */
+	char hitchSlow[360];
+	unsigned long long snapBuffers, snapKb, snapTexMiss, snapStageMiss, snapPipelines, snapCbs;
+	unsigned cbsSince;
 } hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}} };
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
@@ -6493,7 +6504,7 @@ hm_gmem_on(void)
  * 26 frames in 750 shown between two without the alert, each drawn anew); with every draw in every tile, none in 1057
  * (metal_gmem_cycle=0,8192,16,8208@12, logs/172853-run.log), at the same number of frames.
  */
-/* boot-arg metal_pass_sync=0|1|2 (default 0): what a pass's tail waits for. 0: the wait for idle, the colour (and depth) CCU flush
+/* boot-arg metal_pass_sync=0|1|2 (default 1): what a pass's tail waits for. 0: the wait for idle, the colour (and depth) CCU flush
  * with its wait, the cache flush with its wait, after every pass. 1: the cache flush only after a pass whose stages store to
  * buffers (the next pass invalidates the texture cache as it begins). 2: and no wait for idle ahead of the CCU flush, whose word
  * is waited for anyway. The fps report's "pass tails" line counts what was encoded either way, for the A/B. */
@@ -6507,10 +6518,10 @@ hm_pass_sync(void)
 		size_t size = sizeof(args) - 1;
 		const char *at;
 
-		level = 0;
+		level = 1;   /* (1 since the run 195552: 33.5 fps against 30.5, completion p90 24.6 ms against 30.5, 223 flush events against 336) */
 		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_pass_sync=")) != NULL) {
 			level = atoi(at + strlen("metal_pass_sync="));
-			if (level < 0 || level > 2) level = 0;
+			if (level < 0 || level > 2) level = 1;
 		}
 		hm_print("pass tails: metal_pass_sync=%d\n", level);
 	}
@@ -6700,6 +6711,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 		hm_fps.gpu += gpu;
 		hm_fps.latency += latency;
 		hm_fps.latencyMax = MAX(hm_fps.latencyMax, latency);
+		hm_fps.sinceFrameLatencyMax = MAX(hm_fps.sinceFrameLatencyMax, latency);
 		if (cb != NULL) {
 			unsigned passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0;
 
@@ -6931,6 +6943,10 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 						strlcpy(hm_fps.slowest[k].why, hakios_metal_cb_pass_sysmem_why(cb, i), sizeof(hm_fps.slowest[k].why));
 						hakios_metal_cb_pass_detail(cb, i, hm_fps.slowest[k].detail, sizeof(hm_fps.slowest[k].detail));
 						hm_fps.slowest[k].us = us;
+						if (us > hm_fps.hitchSlowUs) {
+							hm_fps.hitchSlowUs = us;
+							snprintf(hm_fps.hitchSlow, sizeof(hm_fps.hitchSlow), "%.1f ms: %s", us / 1e3, hm_fps.slowest[k].detail);
+						}
 						break;
 					}
 				}
@@ -7312,20 +7328,78 @@ hm_fps_commit(double seconds)
 			else if (gap <= 0.050) hm_fps.gapsLate++;
 			else hm_fps.gapsStall++;
 		}
+		hm_fps.cbsSince++;
 		if (hm_fps.lastCommit == 0 || gap >= 0.003) {
 			/* a new frame (a frame is the commits within 3 ms of each other: the window server commits one buffer a layer tree
-			 * and one more a pass of its own); the time since the last one's start, while something moves (under 250 ms) */
+			 * and one more a pass of its own); the time since the last one's start. Counted only while the screen is moving: the
+			 * first frame after a pause (a quarter of a second or more, or before three frames within 50 ms of each other) is the
+			 * pause's end, not a slow frame -- counted as one it made the 1% low a measure of how often the screen rests */
 			const double frame = now - hm_fps.lastFrame;
+			BOOL hitch = NO;
 
-			if (hm_fps.lastFrame != 0 && gap < 0.25 && frame < 0.25) {
-				const unsigned bin = (unsigned)(frame * 2000.0) < 499 ? (unsigned)(frame * 2000.0) : 499;
+			if (hm_fps.lastFrame != 0) {
+				if (frame >= 0.25) {
+					hm_fps.moving = NO;
+					hm_fps.runLen = 0;
+				} else if (hm_fps.moving) {
+					const unsigned bin = (unsigned)(frame * 2000.0) < 499 ? (unsigned)(frame * 2000.0) : 499;
 
-				hm_fps.frameBins[bin]++;
-				hm_fps.frameBinsAll[bin]++;
-				hm_fps.frames++;
-				hm_fps.framesAll++;
-				if (frame > hm_fps.frameWorst) hm_fps.frameWorst = frame;
-				if (frame > hm_fps.frameWorstAll) hm_fps.frameWorstAll = frame;
+					hm_fps.frameBins[bin]++;
+					hm_fps.frameBinsAll[bin]++;
+					hm_fps.frames++;
+					hm_fps.framesAll++;
+					if (frame > hm_fps.frameWorst) hm_fps.frameWorst = frame;
+					if (frame > hm_fps.frameWorstAll) hm_fps.frameWorstAll = frame;
+					hitch = frame > 0.1;
+				} else {
+					hm_fps.idleFrames++;
+				}
+				if (frame < 0.25) {
+					if (frame <= 0.05) {
+						if (++hm_fps.runLen >= 3) hm_fps.moving = YES;
+					} else if (!hm_fps.moving) {
+						hm_fps.runLen = 0;
+					}
+				}
+			}
+			if (hitch) {
+				/* a frame of more than 100 ms in the middle of movement: what the process did since the last frame began, to be put
+				 * beside the log's own lines at that time (uptime and the clock) */
+				unsigned long long buffers, kb, texMiss, stageMiss, hits, seed, misses, cms, lms, nc, sf, pf;
+				struct timespec up;
+				struct timeval tv;
+				struct tm tmv;
+				char clock_[16] = "";
+				const unsigned pipelines = __atomic_load_n(&hm_pipelines_total, __ATOMIC_RELAXED);
+
+				hakios_metal_activity(&buffers, &kb, &texMiss, &stageMiss);
+				hakios_metal_compile_stats(&hits, &seed, &misses, &cms, &lms, &nc, &sf, &pf);
+				clock_gettime(CLOCK_MONOTONIC, &up);
+				gettimeofday(&tv, NULL);
+				time_t secs = tv.tv_sec;
+				if (localtime_r(&secs, &tmv) != NULL) strftime(clock_, sizeof(clock_), "%H:%M:%S", &tmv);
+				char line[900];
+				snprintf(line, sizeof(line),
+					 "fps: ... HITCH: a frame of %.0f ms after %.0f ms of commits (at uptime %ld.%03d s, %s.%03d), %u command buffers since the last frame began, "
+					 "longest commit to completion %.0f ms; since then %llu buffers made (%llu KB), %llu textures given memory afresh, %llu stages compiled, "
+					 "%u pipelines built; slowest GPU pass %s",
+					 frame * 1e3, gap * 1e3, (long)up.tv_sec, (int)(up.tv_nsec / 1000000), clock_, (int)(tv.tv_usec / 1000), hm_fps.cbsSince,
+					 hm_fps.sinceFrameLatencyMax * 1e3, buffers - hm_fps.snapBuffers, kb - hm_fps.snapKb, texMiss - hm_fps.snapTexMiss,
+					 stageMiss - hm_fps.snapStageMiss, pipelines - (unsigned)hm_fps.snapPipelines,
+					 hm_fps.hitchSlowUs > 0 ? hm_fps.hitchSlow : "(none timed)");
+				pthread_mutex_unlock(&hm_fps.lock);
+				hm_print("%s\n", line);
+				pthread_mutex_lock(&hm_fps.lock);
+			}
+			{
+				unsigned long long buffers, kb, texMiss, stageMiss;
+
+				hakios_metal_activity(&buffers, &kb, &texMiss, &stageMiss);
+				hm_fps.snapBuffers = buffers, hm_fps.snapKb = kb, hm_fps.snapTexMiss = texMiss, hm_fps.snapStageMiss = stageMiss;
+				hm_fps.snapPipelines = __atomic_load_n(&hm_pipelines_total, __ATOMIC_RELAXED);
+				hm_fps.cbsSince = 0;
+				hm_fps.sinceFrameLatencyMax = 0;
+				hm_fps.hitchSlowUs = 0;
 			}
 			hm_fps.lastFrame = now;
 		}

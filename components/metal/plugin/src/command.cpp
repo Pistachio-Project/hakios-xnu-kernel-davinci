@@ -58,12 +58,15 @@ std::atomic<uint32_t> gBuffersMade{0}, gBuffersReused{0};
 std::atomic<uint64_t> gBytesMade{0};
 // the pool's tally for the plug-in's buffers line: buffers given back, refused as still held by another owner, refused
 // because the pool was full, and the made ones of 1 MB or more (a GMEM pass's bodies, the binning streams)
+std::atomic<uint64_t> gBuffersMadeTotal{0}, gBytesMadeTotal{0};   // (never reset: the hitch lines' before and after)
 std::atomic<uint32_t> gPrefilled{0}, gRefilled{0};
 std::atomic<uint32_t> gPoolGiven{0}, gPoolShared{0}, gPoolFull{0}, gBigMade{0};
 
 std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, bool recycle) {
     gBuffersMade++;
     gBytesMade += length;
+    gBuffersMadeTotal++;
+    gBytesMadeTotal += length;
     if (length >= (1u << 20)) gBigMade++;
     int error = 0;
     std::unique_ptr<Bo> bo = recycle ? gpu.newBoRecycled(length, kBoWriteCombined, &error) : gpu.newBo(length, kBoWriteCombined, &error);

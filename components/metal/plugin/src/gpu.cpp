@@ -127,6 +127,7 @@ void Gpu::release(Bo& bo) {
     t_->call(kGemClose, &c, sizeof(c));
 }
 
+std::atomic<uint64_t> gRecycleMissesTotal{0};
 std::atomic<uint64_t> gRecycleHits{0}, gRecycleMisses{0}, gRecycleTrimmed{0}, gRecycleCached{0};   // (c_api.cpp's tally, all Gpus)
 
 namespace {
@@ -193,6 +194,7 @@ std::unique_ptr<Bo> Gpu::newBoRecycled(uint64_t size, uint32_t flags, int* error
         }
         cacheMisses_++;
         gRecycleMisses++;
+        gRecycleMissesTotal++;
     }
     return newBo(size, flags, error);
 }
