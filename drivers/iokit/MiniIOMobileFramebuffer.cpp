@@ -2706,6 +2706,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
 {
 	IOReturn result;
+	HKAllocScope scope("IOMobileFB", selector);
 
 	/*
 	 * (closed: its program is gone, or let go of it. Whoever else has the connection still -- it was handed on -- is not

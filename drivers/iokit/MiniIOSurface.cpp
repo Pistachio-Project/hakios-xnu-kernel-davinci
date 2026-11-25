@@ -2210,6 +2210,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
 {
 	IOReturn ret;
+	HKAllocScope scope("IOSurface", selector);
 
 	(void) dispatch;
 	(void) target;

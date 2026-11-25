@@ -227,5 +227,22 @@ void            MiniIOSurfaceKernelUse(MiniIOSurface * surface, int delta);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
 mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);
 
+/*
+ * memtop: what the IOMalloc counter (debug_iomalloc_size, which IOBufferMemoryDescriptor of kernel memory, IOMallocAligned and
+ * IOMallocData all feed) went up by across each call into one of our user clients, kept by (client, selector): a call that makes
+ * memory and does not give it back shows as a net gain, and the 5 s iokit line names the biggest. (Other threads' allocations
+ * land in whichever call is running: noise that averages away, a leak of a few MB a call does not.)
+ */
+extern "C" void hakios_alloc_note(const char * who, uint32_t selector, int64_t delta);
+extern "C" size_t debug_iomalloc_size;
+class HKAllocScope
+{
+	const char * fWho;
+	uint32_t fSelector;
+	int64_t fBefore;
+public:
+	HKAllocScope(const char * who, uint32_t selector) : fWho(who), fSelector(selector), fBefore((int64_t) debug_iomalloc_size) {}
+	~HKAllocScope() { hakios_alloc_note(fWho, fSelector, (int64_t) debug_iomalloc_size - fBefore); }
+};
 
 #endif /* _IOKIT_MINIIOSURFACE_H */

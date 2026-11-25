@@ -54,6 +54,35 @@ static int64_t gLeakResult[4] = { -1000000, -1000000, -1000000, -1000000 };   /*
 extern "C" size_t debug_iomalloc_size, debug_iomallocpageable_size, debug_container_malloc_size;
 static int64_t gLeftBytes, gStuckBytes;
 static int64_t gGemMadeWire, gGemMade, gGemFreedWire, gGemFreed;   /* (memtop: wired pages gained making a buffer / lost freeing one, noisy: others wire too) */   /* (memtop: given back while the GPU was busy; kept for good because the GPU could not be shown to be done) */
+static struct hk_alloc_site {
+	uint64_t key;                   /* the client's name and the selector (0: free) */
+	const char * who;
+	uint32_t selector;
+	int64_t net;
+	uint64_t calls;
+} gAllocSites[64];
+
+extern "C" void
+hakios_alloc_note(const char * who, uint32_t selector, int64_t delta)
+{
+	const uint64_t key = (((uint64_t) (uintptr_t) who & 0xffffffffffffull) << 8 | (selector & 0xff)) | 1ull << 63;
+
+	for (unsigned i = 0; i < sizeof(gAllocSites) / sizeof(gAllocSites[0]); i++) {
+		uint64_t k = gAllocSites[i].key;
+
+		if (k == 0 && OSCompareAndSwap64(0, key, (volatile UInt64 *) &gAllocSites[i].key)) {
+			gAllocSites[i].who = who;
+			gAllocSites[i].selector = selector;
+			k = key;
+		}
+		if (k == key) {
+			OSAddAtomic64(delta, (volatile SInt64 *) &gAllocSites[i].net);
+			OSAddAtomic64(1, (volatile SInt64 *) &gAllocSites[i].calls);
+			return;
+		}
+	}
+}
+
 extern "C" void MiniIOSurfaceExtra(uint64_t * snapshots, uint64_t * held, uint64_t * kept);
 /* The 5 s `memtop` lines: how many of the IOKit objects that hold memory there are alive, and what of it our own drivers know of
  * (the IOKit tag's total is in the memtags line; what is neither here nor in the GPU and surface figures is somebody else's) */
@@ -76,6 +105,28 @@ hakios_iokit_line(char * buf, size_t len)
 	at += (size_t) snprintf(buf + at, len - at, " [IOMalloc %lu MB, IOMallocPageable %lu MB (IOBMD pageable and IOMallocPageable), containers %lu MB]",
 	    (unsigned long) (debug_iomalloc_size >> 20), (unsigned long) (debug_iomallocpageable_size >> 20),
 	    (unsigned long) (debug_container_malloc_size >> 20));
+	{
+		/* the 5 entry points of our user clients with the most IOMalloc bytes gained over their calls */
+		bool shown[64] = { false };
+
+		at += (size_t) snprintf(buf + at, len - at, " [IOMalloc net by call, KB (calls):");
+		for (int n = 0; n < 5 && at < len; n++) {
+			int best = -1;
+
+			for (unsigned i = 0; i < 64; i++) {
+				if (gAllocSites[i].key != 0 && !shown[i] && (best < 0 || gAllocSites[i].net > gAllocSites[best].net)) {
+					best = (int) i;
+				}
+			}
+			if (best < 0 || gAllocSites[best].net <= 0) {
+				break;
+			}
+			shown[best] = true;
+			at += (size_t) snprintf(buf + at, len - at, " %s/%u %lld (%llu)", gAllocSites[best].who, gAllocSites[best].selector,
+			    gAllocSites[best].net >> 10, gAllocSites[best].calls);
+		}
+		at += (size_t) snprintf(buf + at, len - at, "]");
+	}
 	if (gLeakResult[0] > -1000000) {
 		at += (size_t) snprintf(buf + at, len - at, " [leaktest, wired pages left over by 200 buffers: prepare %lld, +kernel map %lld, +flush %lld, prepare+complete %lld]",
 		    gLeakResult[0], gLeakResult[1], gLeakResult[2], gLeakResult[3]);
@@ -2266,6 +2317,7 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	struct gpu_buffer * b;
 	IOReturn ret = kIOReturnSuccess;
 	uint64_t zero = 0, patience, waitBegan;
+	HKAllocScope scope("GPU", selector);
 
 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
 		return kIOReturnBadArgument;
