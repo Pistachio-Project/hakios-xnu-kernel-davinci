@@ -1298,7 +1298,10 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         return false;
     }
     // each stage's pushed constant ranges out of its own [[buffer(n)]] table (Metal's setVertexBuffer / setFragmentBuffer)
-    std::vector<PushedRange> vsRanges, fsRanges;
+    // (each thread's own vectors, emptied here and kept: made anew, they were an allocation or two a draw)
+    thread_local std::vector<PushedRange> vsRanges, fsRanges;
+    vsRanges.clear();
+    fsRanges.clear();
     if (!pushedRanges(vs, vsBindings, &vsRanges, why) || !pushedRanges(fs, fsBindings, &fsRanges, why)) {
         return false;
     }
@@ -1433,7 +1436,9 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (!stageTextures(vs, vsBindings, pass, &vsTex, why, gmem) || !stageTextures(fs, fsBindings, pass, &fsTex, why, gmem)) {
         return false;
     }
-    std::vector<uint32_t> vsUbos, fsUbos;
+    thread_local std::vector<uint32_t> vsUbos, fsUbos;
+    vsUbos.clear();
+    fsUbos.clear();
     if (!uboDescriptors(vs, vsBindings, vsProgram, &vsUbos, why) || !uboDescriptors(fs, fsBindings, fsProgram, &fsUbos, why)) {
         return false;
     }

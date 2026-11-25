@@ -1478,9 +1478,11 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
         !bindArgumentBuffers(p->program->fs->resources, &fsb, &members, &whyMembers)) {
         failed(whyMembers);
         cb->cb->refuse(whyMembers);
+        members.clear();   // (this thread's: nothing is left holding a buffer's last reference past the draw)
         return -1;
     }
     for (auto& m : members) cb->cb->keepAlive(std::move(m));
+    members.clear();
     const RenderPass rp = passOf(pass);
     // what MTLRenderCommandEncoder's default viewport covers: the first attachment the pass has, colour before depth
     // (a depth-only pass's is the depth texture)

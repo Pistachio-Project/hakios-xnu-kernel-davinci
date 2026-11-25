@@ -93,6 +93,28 @@ int main() {
     render::Options o;
     o.gmem = strcmp(mode, "sys") != 0;
     o.gmemBinning = true;
+    // BENCH_OFF=rast,vfd,...: those Options groups off, to see what each costs a draw
+    if (const char* off = getenv("BENCH_OFF")) {
+        const std::string s = off;
+        auto has = [&](const char* k) { return s.find(k) != std::string::npos; };
+        if (has("rast")) o.rast = false;
+        if (has("blendZsa")) o.blendZsa = false;
+        if (has("vfd")) o.vfd = false;
+        if (has("programConfig")) o.programConfig = false;
+        if (has("programVs")) o.programVs = false;
+        if (has("programFs")) o.programFs = false;
+        if (has("fsTextures")) o.fsTextures = false;
+        if (has("vsTextures")) o.vsTextures = false;
+        if (has("viewportScissor")) o.viewportScissor = false;
+        if (has("zsNone")) o.zsNone = false;
+        if (has("mrt")) o.mrt = false;
+        if (has("msaaOff")) o.msaaOff = false;
+        if (has("renderCntl")) o.renderCntl = false;
+        if (has("lrzOff")) o.lrzOff = false;
+        if (has("vpc")) o.vpc = false;
+        if (has("fsInputs")) o.fsInputs = false;
+        if (has("fsOutputs")) o.fsOutputs = false;
+    }
     const int draws = 100;
     const char* env = getenv("HAKIOS_METAL_BENCH");
     const int rounds = env ? atoi(env) : 200;
