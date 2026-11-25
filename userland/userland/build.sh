@@ -324,6 +324,7 @@ if [ -d $DARWIN_FW/rootfs/usr/lib ]; then
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
 		# our library for inside stock Darwin programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /hakios/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc \
+			-F$DARWIN_SDK/System/Library/PrivateFrameworks -weak_framework libEDR \
 			-o obj/libhakios.dylib src/inject.c
 		$DYN -dynamiclib -install_name /hakios/lib/libhakios-sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libhakios-sb.dylib src/inject_sb.c

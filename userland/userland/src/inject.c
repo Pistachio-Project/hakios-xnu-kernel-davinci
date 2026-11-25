@@ -1665,6 +1665,56 @@ ds_sampler(void *unused)
 	return NULL;
 }
 
+/*
+ * Boot-arg edrstub=1: libEDR's client calls answer "no EDR" (-1) at once. The sampler above found the window
+ * server's dyld time (15-25 % of its samples, logs/192544-run.log) in libEDR's client: with no server for
+ * com.apple.libEDR.Notification (root26-darwin.sh removes it) initialize_client_context fails its bootstrap_look_up and
+ * retries at once, and each pass of the retry loop logs five lines through os_log, each of which makes the shared
+ * cache's dyld search its images for the address of the caller's log string. The calls are interposed (QuartzCore's
+ * and IOMobileFramebuffer's go through them); without the boot-arg each one forwards to libEDR with its eight argument
+ * registers. libEDR is linked weakly (build.sh), so on a system without it the stub is never reached.
+ */
+extern uintptr_t EDRCreateClientForDisplay(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+    uintptr_t) __attribute__((weak_import));
+extern uintptr_t EDRCreateClientForDisplayWithTimeoutAndCallback(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+    uintptr_t, uintptr_t, uintptr_t) __attribute__((weak_import));
+extern uintptr_t EDRCreateClientWithTimeoutAndCallback(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+    uintptr_t, uintptr_t) __attribute__((weak_import));
+extern uintptr_t EDRRegisterCallbackBlock(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+    uintptr_t) __attribute__((weak_import));
+extern uintptr_t EDRRegisterCallbackBlockOnQueue(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+    uintptr_t, uintptr_t) __attribute__((weak_import));
+static volatile int edr_stub_on;
+static unsigned edr_stub_calls;
+
+#define EDR_STUB(name)                                                                                                \
+	static uintptr_t edr_##name(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e, uintptr_t f,         \
+	    uintptr_t g, uintptr_t h)                                                                                     \
+	{                                                                                                               \
+		if (edr_stub_on) {                                                                                      \
+			if (__atomic_fetch_add(&edr_stub_calls, 1, __ATOMIC_RELAXED) < 8) {                                    \
+				say("hakios: edrstub: " #name " answered -1\n");                                              \
+			}                                                                                                   \
+			return (uintptr_t)-1;                                                                               \
+		}                                                                                                       \
+		return name(a, b, c, d, e, f, g, h);                                                                    \
+	}                                                                                                               \
+	DC_INTERPOSE(edr_##name, name)
+EDR_STUB(EDRCreateClientForDisplay);
+EDR_STUB(EDRCreateClientForDisplayWithTimeoutAndCallback);
+EDR_STUB(EDRCreateClientWithTimeoutAndCallback);
+EDR_STUB(EDRRegisterCallbackBlock);
+EDR_STUB(EDRRegisterCallbackBlockOnQueue);
+
+static void
+edr_stub_start(const char *arguments)
+{
+	if (strstr(arguments, "edrstub=1") != NULL) {
+		edr_stub_on = 1;
+		say("hakios: edrstub=1: libEDR's client calls answer -1 (no EDR) at once\n");
+	}
+}
+
 static void
 dyld_count_start(const char *arguments)
 {
@@ -2169,6 +2219,7 @@ hakios_init(void)
 			setenv("CA_FORCE_TIMER", "1", 1);
 			say("hakios: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
 		}
+		edr_stub_start(arguments);
 		dyld_count_start(arguments);
 		wait_stack_start(arguments);
 		/*
