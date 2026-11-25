@@ -1057,6 +1057,12 @@ void hakios_metal_cb_gmem_counts(hakios_metal_cb* cb, unsigned* passes, unsigned
 const char* hakios_metal_cb_gmem_refusal(hakios_metal_cb* cb) {
     syncOne(cb); return cb->cb->gmemRefusal().c_str(); }
 
+double hakios_metal_cb_pass_gap(hakios_metal_cb* cb, unsigned i) {
+    syncOne(cb);
+    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    return i < t.size() ? t[i].gapUs : 0.0;
+}
+
 void hakios_metal_cb_pass_detail(hakios_metal_cb* cb, unsigned i, char* buf, size_t size) {
     syncOne(cb);
     if (size == 0) return;

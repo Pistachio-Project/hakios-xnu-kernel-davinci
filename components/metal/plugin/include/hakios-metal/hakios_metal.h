@@ -561,6 +561,8 @@ const char *hakios_metal_cb_gmem_refusal(hakios_metal_cb *cb);
  * valid while CB lives */
 const char *hakios_metal_cb_pass_sysmem_why(hakios_metal_cb *cb, unsigned i);
 /* what pass I is: its target, loads and stores, draw programs and texture reads, as one line (metal_fps's slowest passes) */
+/* microseconds on the GPU from the end of pass I-1 to the start of pass I (0 for the first) */
+double hakios_metal_cb_pass_gap(hakios_metal_cb *cb, unsigned i);
 void hakios_metal_cb_pass_detail(hakios_metal_cb *cb, unsigned i, char *buf, size_t size);
 int hakios_metal_cb_refuse(hakios_metal_cb *cb, const char *why);
 unsigned hakios_metal_cb_skipped(hakios_metal_cb *cb, const char **last);

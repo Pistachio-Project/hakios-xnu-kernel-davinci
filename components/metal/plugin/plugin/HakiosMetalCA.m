@@ -6883,11 +6883,27 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			NSMutableString *all = listAll ? [NSMutableString string] : nil;
 
 			heavyListed += listAll ? 1 : 0;
+			double cbPassUs = 0, cbGapUs = 0;
+			unsigned cbPasses = 0;
 			for (unsigned i = 0;; i++) {
 				unsigned kind, width, height, draws;
 				double us;
 
 				if (hakios_metal_cb_pass_time(cb, i, &kind, &width, &height, &draws, &us) <= (int)i) {
+					/* a buffer that took 50 ms or more from commit to completion: how much of that its passes account for. The rest -- before
+					 * the first pass began, between passes, after the last -- is the GPU doing something else (another process's
+					 * submission ahead of it in the one ring), the kernel's wait, or the commit's own delay: the number that tells a
+					 * heavy buffer from one that waited */
+					if (latency > 0.05 && cbPasses != 0) {
+						static unsigned slowTold;
+
+						if (slowTold++ < 400) {
+							hm_print("fps: ... SLOW CB at uptime %.3f s: commit to completion %.0f ms; its %u timed passes took %.1f ms on the GPU and %.1f ms "
+								 "lay between them; %.0f ms of the rest is before its first pass or after its last (queued behind other work, or the commit's "
+								 "and the wake-up's own delay)\n", hm_now(), latency * 1e3, cbPasses, cbPassUs / 1e3, cbGapUs / 1e3,
+								 latency * 1e3 - cbPassUs / 1e3 - cbGapUs / 1e3);
+						}
+					}
 					/* (in pieces of 8 passes: the console cuts a line at 1023 bytes, and a buffer of CoreAnimation's
 					 * has 37 passes) */
 					if (all != nil) {
@@ -6932,6 +6948,9 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 							  us / 1e3];
 				}
 				hm_fps.passUs += us;
+				cbPassUs += us;
+				cbGapUs += hakios_metal_cb_pass_gap(cb, i);
+				cbPasses++;
 				for (int k = 0; k < 4; k++) {
 					if (us > hm_fps.slowest[k].us) {
 						memmove(&hm_fps.slowest[k + 1], &hm_fps.slowest[k], (size_t)(3 - k) * sizeof(hm_fps.slowest[0]));
