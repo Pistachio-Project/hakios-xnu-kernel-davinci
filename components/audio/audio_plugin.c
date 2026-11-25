@@ -58,6 +58,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <sys/ioctl.h>
+#include <sys/sysctl.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -1141,6 +1142,20 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
 static int haptic = -1;          /* the motor driver; -2: not there (the kernel runs without haptic=5) */
 static unsigned haptic_played;   /* I/O cycles with something to feel in them, since the actuator started */
 static int haptic_peak;
+static int haptic_trace = -1;    /* haptic_trace=1 in the boot-args: the hops' times, in microseconds of mach time as the kernel's now_us() */
+static uint64_t haptic_started;  /* mach time: when the actuator's I/O started, and when the last sound was heard */
+static uint64_t haptic_heard;
+
+static uint64_t
+mach_us(uint64_t t)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return t * tb.numer / tb.denom / 1000;
+}
 
 /* (when the actuator starts, not on the I/O thread: an open() there could keep it past its deadline) */
 static void
@@ -1153,6 +1168,16 @@ haptic_open(void)
 	}
 	haptic_played = 0;
 	haptic_peak = 0;
+	haptic_started = mach_absolute_time();
+	if (haptic_trace < 0) {
+		char args[700] = "";
+		size_t size = sizeof(args) - 1;
+
+		haptic_trace = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "haptic_trace=1") != NULL;
+	}
+	if (haptic_trace > 0) {
+		say("hakios: audio: trace: actuator I/O started at %llu us\n", mach_us(haptic_started));
+	}
 }
 
 static void
@@ -1163,7 +1188,7 @@ haptic_stopped(void)
 }
 
 static void
-actuator_write(const int16_t *samples, UInt32 frames)
+actuator_write(const int16_t *samples, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle)
 {
 	static bool said;
 	int peak = 0, fd = __atomic_load_n(&haptic, __ATOMIC_ACQUIRE);
@@ -1175,6 +1200,19 @@ actuator_write(const int16_t *samples, UInt32 frames)
 	}
 	if (fd >= 0) {
 		(void)write(fd, samples, (size_t)frames * 2);
+	}
+	if (haptic_trace > 0 && peak > 256) {
+		uint64_t now = mach_absolute_time();
+
+		/* (the first sound after 30 ms of none: when it came, how long after the I/O began, how far ahead of its output time the cycle ran) */
+		if (haptic_heard == 0 || mach_us(now - haptic_heard) > 30000) {
+			int64_t ahead = (int64_t)cycle->mOutputTime.mHostTime - (int64_t)now;
+
+			say("hakios: audio: trace: sound at %llu us, %llu us after the I/O began, cycle of %u frames, its output time %lld us ahead of "
+			    "the write (write %s)\n", mach_us(now), mach_us(now - haptic_started), (unsigned)frames,
+			    (long long)(ahead < 0 ? -(int64_t)mach_us((uint64_t)-ahead) : (int64_t)mach_us((uint64_t)ahead)), fd >= 0 ? "made" : "not made");
+		}
+		haptic_heard = now;
 	}
 	if (peak > 0) {
 		haptic_played++;
@@ -1190,7 +1228,7 @@ actuator_write(const int16_t *samples, UInt32 frames)
 
 static OSStatus
 do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
-    __unused UInt32 client, UInt32 operation, UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
+    __unused UInt32 client, UInt32 operation, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
     __unused void *secondary)
 {
 	const struct device *d = device_of(stream);
@@ -1204,7 +1242,7 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		/* the speaker's and Hawking's inputs: silence */
 		memset(buffer, 0, (size_t)frames * 2 * d->input_channels);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
-		actuator_write(buffer, frames);
+		actuator_write(buffer, frames, cycle);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
 		/* the kernel takes it all or leaves it: this thread must not wait */
 		if (sink < 0 || write(sink, buffer, (size_t)frames * HAKIOS_AUDIO_FRAME) < 0) {

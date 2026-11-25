@@ -56,6 +56,7 @@
  * Register layout of the arbiter: board/spmi.h.
  */
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -83,6 +84,18 @@ static bool broken, leaving;
  * `running' not yet set) and the thread starts no writes after it.
  */
 static bool writing;
+
+/*
+ * haptic_fast=1 (the default; 0 gives the old behaviour): a write that begins a waveform wakes the motor's thread at once
+ * (it looked every 5 ms before, and a sleep of 5 ms may be longer), and the voltage is written the first time only
+ * (it is the same every time and the LDO is off while it is written: 4 transfers fewer before the motor is on).
+ * haptic_trace=1: per vibration, the times of the hops, in microseconds of now_us(): the touch screen's last finger down
+ * (hakios_touch_down_us), the first audible write, the thread awake, the enable written, the LDO ready.
+ */
+extern volatile uint64_t hakios_touch_down_us;
+static uint32_t fast = 1, trace;
+static int wake_event;
+static bool vset_done;
 
 HAKIOS_DEFINE_SAY(!leaving && ml_get_interrupts_enabled())
 
@@ -271,16 +284,25 @@ vset_mv(uint32_t uv)
  * The enable counts as written from the first write that may switch it on: one that lands and then does not read
  * back leaves it on all the same, and whatever ends this switches it off only if `running' is set.
  */
+static uint64_t t_enable_us;
+
 static bool
 motor_on(void)
 {
 	uint32_t mv = vset_mv(volt_uv);
 	uint8_t status = 0;
 
-	if (!ldo.writable || !put_bits(LDO_VSET_LB, 0xff, (uint8_t)(mv & 0xff)) || !put_bits(LDO_VSET_HB, 0xff, (uint8_t)(mv >> 8))) {
+	if (!ldo.writable) {
 		return false;
 	}
+	if (!(fast && vset_done)) {
+		if (!put_bits(LDO_VSET_LB, 0xff, (uint8_t)(mv & 0xff)) || !put_bits(LDO_VSET_HB, 0xff, (uint8_t)(mv >> 8))) {
+			return false;
+		}
+		vset_done = true;
+	}
 	running = true;
+	t_enable_us = now_us();
 	if (!put_bits(LDO_EN_CTL, EN_CTL_EN, EN_CTL_EN)) {
 		return false;
 	}
@@ -434,6 +456,9 @@ haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 
 			if (heard_us == 0 || quiet_us > heard_us || now - heard_us >= ACTIVE_US) {
 				onset_us = now;
+				if (fast) {
+					thread_wakeup((event_t)&wake_event);
+				}
 			}
 			heard_us = now;
 		} else {
@@ -481,8 +506,19 @@ serve(void)
 		case IDLE:
 			/* a waveform of Darwin's that has begun and not been run yet (after a pause: a tap of a series is a tap of its own) */
 			if (active && onset_us != handled) {
+				uint64_t awake = now_us(), touch = hakios_touch_down_us;
+
 				handled = onset_us;
 				if (motor_on()) {
+					if (trace) {
+						uint64_t on = now_us();
+
+						say("haptic_ldo: trace: touch->first write %lld us, write->thread awake %llu us, awake->enable %llu us, "
+						    "enable->ready %llu us; touch->motor on %lld us; fast=%u\n",
+						    touch != 0 && onset_us >= touch && onset_us - touch < 3000000 ? (long long)(onset_us - touch) : -1ll,
+						    awake - handled, t_enable_us - awake, on - t_enable_us,
+						    touch != 0 && on >= touch && on - touch < 3000000 ? (long long)(on - touch) : -1ll, fast);
+					}
 					since = now;
 					state = ON;
 					vibrations++;
@@ -524,7 +560,17 @@ serve(void)
 			break;
 		}
 		__atomic_store_n(&writing, false, __ATOMIC_SEQ_CST);
-		wait_ms(5);
+		if (fast && state == IDLE && !leaving) {
+			/* asleep until a waveform begins (or 5 ms: the run's end and trouble are looked at as before) */
+			assert_wait_timeout((event_t)&wake_event, THREAD_UNINT, 5, NSEC_PER_MSEC);
+			if (onset_us != handled) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+				continue;
+			}
+			thread_block(THREAD_CONTINUE_NULL);
+		} else {
+			wait_ms(fast ? 1 : 5);
+		}
 	}
 	if (running && !__atomic_load_n(&leaving, __ATOMIC_SEQ_CST)) {
 		(void)motor_off();
@@ -624,6 +670,8 @@ hakios_haptic_ldo_init(void)
 		}
 	}
 	PE_parse_boot_argn("haptic_ldo_max_ms", &max_ms, sizeof(max_ms));
+	PE_parse_boot_argn("haptic_fast", &fast, sizeof(fast));
+	PE_parse_boot_argn("haptic_trace", &trace, sizeof(trace));
 	max_ms = max_ms < LDO_MIN_PLAY_MS ? LDO_MIN_PLAY_MS : max_ms > LDO_MAX_PLAY_MS ? LDO_MAX_PLAY_MS : max_ms;
 	level = level > 3 ? 3 : level;
 	if (kernel_thread_start(haptic_ldo_thread, NULL, &thread) == KERN_SUCCESS) {

@@ -558,6 +558,7 @@ reg_write(uint16_t reg, uint8_t value)
 }
 
 static struct { bool down; uint32_t x, y; } contact[GT9889_CONTACTS];
+volatile uint64_t hakios_touch_down_us;         /* when the last finger came down, now_us() */
 static unsigned contacts = GT9889_CONTACTS;     /* how many fingers the board's chip reports */
 
 static unsigned
@@ -683,6 +684,7 @@ report(const struct gt9889_frame *frame)
 			if (trace && seen.positions < 40) {
 				say("gt9889: finger %u down at %u, %u (of %u x %u)\n", id, frame->x[id], frame->y[id], panel_x, panel_y);
 			}
+			hakios_touch_down_us = now_us();        /* (haptic_trace=1: board/haptic_ldo.c reports how long after it the motor came) */
 			hakios_touch_post(HAKIOS_TOUCH_DOWN, id, x, y);
 		} else if (contact[id].x != x || contact[id].y != y) {
 			hakios_touch_post(HAKIOS_TOUCH_MOVE, id, x, y);
