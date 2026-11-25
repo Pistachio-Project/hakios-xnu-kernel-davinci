@@ -107,18 +107,17 @@ static const char *const SKIP[] = {
  * from run to run (322 MB at generation 4, 627 MB at 13), and with it the time of the save, which grows with the
  * bytes. Paths are relative to /private/var, a directory's contents are left out, the directory is kept.
  */
+/* (kept, not in this list: db/dyld and Caches/com.apple.dyld -- the apps' launch closures, slow launches without
+ * them -- and SplashBoard/Snapshots -- the launch screens: without them an app opened on a white screen, run 210530) */
 static const char *const SKIP_DIAG[] = {
 	"Logs", "root/Library/Logs",
 	"mobile/Library/Logs",                  /* CrashReporter, analytics, DiagnosticMessages, MobileInstallation, ... */
 	"db/analyticsd", "db/powerlog", "db/PowerLog", "db/ReportCrash",
-	"db/dyld",                              /* the launch closures and dyld caches: made again at launch */
 	"db/Spotlight", "mobile/Library/Spotlight", "mobile/Library/Metadata/CoreSpotlight",
 	"db/biome", "mobile/Library/Biome",     /* the event streams: personalisation only */
 	"mobile/Library/CoreDuet", "mobile/Library/DuetExpertCenter", "mobile/Library/IntelligencePlatform",
 	"mobile/Library/PowerLog", "mobile/Library/com.apple.aggregated",
 	"mobile/Media/MediaAnalysis",           /* mediaanalysisd's scene and face results */
-	"mobile/Library/SplashBoard/Snapshots", /* the app switcher's pictures */
-	"mobile/Library/Caches/com.apple.dyld",
 	"mobile/Library/Caches/com.apple.nsurlsessiond/Downloads",
 	"mobile/Library/Caches/com.apple.CacheDelete",
 	"MobileAsset/Downloads", "mobile/Library/Caches/com.apple.mobileassetd",
