@@ -3040,6 +3040,104 @@ a618_gpu_to_memory(void *start, uint64_t size)
 	to_memory((vm_offset_t)start, (vm_size_t)size);
 }
 
+/*
+ * The 3D core's interrupt (dt: kgsl_3d0_irq, SPI 300, level high: the GIC's number is 32 more). The core raises it when a
+ * submission's CACHE_FLUSH_TS event, written with its bit 31, is through (RBBM_INT_0 bit 20, as Linux's a6xx_irq takes
+ * it as "retire"); the handler clears that bit and wakes whoever waits for a fence (hakios_gpu_irq_wake). Only that one
+ * bit is ever unmasked. Boot-arg gpu_irq=0 leaves it all off. The mask is written with every submission: the core loses
+ * it when its power is collapsed and reset.
+ */
+#define GPU_IRQ_SPI             300u
+#define RBBM_INT_CLEAR_CMD      GPU_WORD(0x0037)
+#define RBBM_INT_0_MASK         GPU_WORD(0x0038)
+#define RBBM_INT_FENCE          (1u << 20)      /* CP_CACHE_FLUSH_TS */
+#define CP_ALWAYS_ON_COUNTER    GPU_WORD(0x0980) /* the same register for the core's own CP_REG_TO_MEM: word number 0x0980 */
+#define CP_REG_TO_MEM           0x3e
+#define GPU_TIMES_AT            0x400           /* in the scratch page: when the core was through with each of its last 64 submissions */
+#define GPU_TIMES               64
+
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void hakios_gpu_irq_wake(void);
+
+static bool gpu_irq_on;                         /* attached, and not given up */
+static uint64_t gpu_irqs, gpu_irq_spurious;
+static struct {
+	uint64_t host_ns, ticks;                /* this processor's clock (ns) and the core's always-on counter at the submission */
+	uint32_t fence;
+} gpu_sub[GPU_TIMES];
+/* what the last seconds' waits that had to wait have been: noticed this long after the core was through (ns) */
+static struct {
+	uint64_t count, sum_ns, max_ns, unknown;
+} gpu_noticed_stat;
+
+static void
+gpu_irq_handler(__unused void *context, uint32_t intid)
+{
+	uint32_t status = rd(gpu.base + RBBM_INT_0_STATUS);
+
+	if (status & RBBM_INT_FENCE) {
+		wr(gpu.base + RBBM_INT_CLEAR_CMD, RBBM_INT_FENCE);
+		gpu_irqs++;
+		hakios_gpu_irq_wake();
+	} else {
+		/* not ours (the line is level: left alone it would be taken again at once): given up, the waits poll */
+		gpu_irq_spurious++;
+		gpu_irq_on = false;
+		gic_v3_spi_mask(intid);
+	}
+}
+
+bool
+a618_gpu_irq_on(void)
+{
+	return gpu_irq_on;
+}
+
+static void
+gpu_irq_start(void)
+{
+	uint32_t want = 1;
+
+	PE_parse_boot_argn("gpu_irq", &want, sizeof(want));
+	if (want != 1) {
+		return;
+	}
+	gpu_irq_on = true;
+	kern_return_t kr = gic_v3_spi_attach(GPU_IRQ_SPI + 32, false, gpu_irq_handler, NULL);
+
+	if (kr != KERN_SUCCESS) {
+		gpu_irq_on = false;
+	}
+	hakios_say("adreno: gpu_irq: the 3D core's interrupt (SPI %u) %s (%d)\n", GPU_IRQ_SPI,
+	    gpu_irq_on ? "is ours: fences wake their waiters" : "could not be taken: the waits look", (int)kr);
+}
+
+/* A wait that had to wait has seen submission `fence` done: how long after the core was through with it. */
+void
+a618_gpu_noticed(uint32_t fence)
+{
+	uint32_t slot = fence % GPU_TIMES;
+	uint64_t ticks, now_ns, retired_ns, late;
+
+	if (gpu_sub[slot].fence != fence) {
+		gpu_noticed_stat.unknown++;
+		return;
+	}
+	to_memory(core_scratch.memory + GPU_TIMES_AT + 8 * slot, 8);
+	ticks = *(volatile uint64_t *)(core_scratch.memory + GPU_TIMES_AT + 8 * slot);
+	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+	if (ticks <= gpu_sub[slot].ticks || ticks - gpu_sub[slot].ticks > 60ull * 19200000) {
+		gpu_noticed_stat.unknown++;     /* (not written yet, or the one of 64 submissions ago) */
+		return;
+	}
+	retired_ns = gpu_sub[slot].host_ns + (ticks - gpu_sub[slot].ticks) * 10000 / 192;
+	late = now_ns > retired_ns ? now_ns - retired_ns : 0;
+	gpu_noticed_stat.count++;
+	gpu_noticed_stat.sum_ns += late;
+	gpu_noticed_stat.max_ns = MAX(gpu_noticed_stat.max_ns, late);
+}
+
 /* How far the 3D core has got. */
 bool
 a618_gpu_done(uint32_t fence)
@@ -3081,6 +3179,16 @@ a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 	}
 	gpu_submissions++;
 	gpu_submitted_at = mach_absolute_time();
+	{
+		uint32_t slot = gpu_fence % GPU_TIMES;
+
+		absolutetime_to_nanoseconds(gpu_submitted_at, &gpu_sub[slot].host_ns);
+		gpu_sub[slot].ticks = rd(gpu.base + CP_ALWAYS_ON_COUNTER) | (uint64_t)rd(gpu.base + CP_ALWAYS_ON_COUNTER + 4) << 32;
+		gpu_sub[slot].fence = gpu_fence;
+	}
+	if (gpu_irq_on) {
+		wr(gpu.base + RBBM_INT_0_MASK, RBBM_INT_FENCE);
+	}
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
@@ -3092,8 +3200,12 @@ a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 		ring(words[i]);
 	}
 	ring_register(CP_SCRATCH_REG2, gpu_fence);
+	ring_command(CP_REG_TO_MEM, 3);         /* when the core got here, for what the waits notice late (a618_gpu_noticed) */
+	ring((CP_ALWAYS_ON_COUNTER >> 2) | 2u << 18 | 1u << 30);
+	ring(CORE_SCRATCH_ADDRESS + GPU_TIMES_AT + 8 * (gpu_fence % GPU_TIMES));
+	ring(0);
 	ring_command(CP_EVENT_WRITE, 4);
-	ring(EVENT_CACHE_FLUSH_TS);
+	ring(EVENT_CACHE_FLUSH_TS | (gpu_irq_on ? 1u << 31 : 0));
 	ring(CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
 	ring(0);
 	ring(gpu_fence);
@@ -3178,6 +3290,18 @@ gpu_clock_thread(__unused void *arg, __unused wait_result_t result)
 		    submissions - last_submissions, gx_off ? "OFF some of the time" : "on", rd(gmu.base + GMU_RPMH_POWER_STATE), vote,
 		    cap);
 		last_submissions = submissions;
+		{
+			static uint64_t last_count, last_sum, last_irqs;
+			uint64_t n = gpu_noticed_stat.count - last_count, sum = gpu_noticed_stat.sum_ns - last_sum;
+
+			hakios_say("gpu fences: %llu completions, noticed after %llu us avg (%llu max) [%s]; %llu interrupts, %llu "
+			    "spurious, %llu untimed\n", n, n ? sum / n / 1000 : 0, gpu_noticed_stat.max_ns / 1000,
+			    gpu_irq_on ? "irq" : "poll", gpu_irqs - last_irqs, gpu_irq_spurious, gpu_noticed_stat.unknown);
+			last_count = gpu_noticed_stat.count;
+			last_sum = gpu_noticed_stat.sum_ns;
+			last_irqs = gpu_irqs;
+			gpu_noticed_stat.max_ns = 0;
+		}
 	}
 }
 
@@ -3199,6 +3323,7 @@ gpu_keep(void)
 	gpu_kept = true;
 	hakios_say("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
 	HakiosGPUStart();
+	gpu_irq_start();
 	{
 		uint32_t clock_log = 1;
 		thread_t thread;

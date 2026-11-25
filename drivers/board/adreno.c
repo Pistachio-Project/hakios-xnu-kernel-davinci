@@ -132,6 +132,8 @@ void a618_gpu_mapped(void);
 void a618_gpu_unmap(uint64_t address, uint64_t size);
 void a618_gpu_to_memory(void *start, uint64_t size);
 bool a618_gpu_done(uint32_t fence);
+bool a618_gpu_irq_on(void);
+void a618_gpu_noticed(uint32_t fence);
 uint32_t a618_gpu_last(void);
 void a618_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
 uint32_t a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
@@ -3708,6 +3710,22 @@ hakios_gpu_done(uint32_t fence)
 
 	to_memory((vm_offset_t)word, 4);
 	return (int32_t)(*word - fence) >= 0;
+}
+
+/* Whether the core's own interrupt wakes the waits (and not only their timers). */
+bool
+hakios_gpu_irq_on(void)
+{
+	return gpu_is_a618() && a618_gpu_irq_on();
+}
+
+/* A wait that had to wait has seen `fence` done (for the 5 s line "gpu fences"). */
+void
+hakios_gpu_noticed(uint32_t fence)
+{
+	if (gpu_is_a618()) {
+		a618_gpu_noticed(fence);
+	}
 }
 
 uint32_t

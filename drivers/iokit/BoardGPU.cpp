@@ -66,6 +66,9 @@ void hakios_gpu_to_memory(void * start, uint64_t size);
 uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
+bool hakios_gpu_irq_on(void);
+void hakios_gpu_noticed(uint32_t fence);
+extern "C" void hakios_gpu_irq_wake(void);
 uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
@@ -244,6 +247,7 @@ gpuRefusalSaid(void)
                                                  * "drawn" mark only, not to be pushed out of the cache here (the plugin does) */
 #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
 #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+#define GPU_IRQ_BACKSTOP_US     2000            /* with the core's interrupt: a look anyway this often, should one be lost */
 #define GPU_PUSH_AGAIN_MS       16              /* a surface is pushed out of the cache again for a submission this long after the last (4 ms was 8 MB a submission, 2.4 GB/s on the home screen; 100 ms left a writer that does not say so stale for a tenth of a second, black or old blocks that flicker: one frame) */
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
@@ -271,6 +275,20 @@ static struct {
 	uint32_t shownWaits;                    /* submissions that waited for the display's copy of a surface they draw into */
 } gGPUStat;
 
+/*
+ * Boot-arg gpu_wait=N: how a wait for the core spends its time between two looks. 0: spinning 200 us (as before: a thread that
+ * spins uses up its share and, with the processors busy, is not run again for a long while -- fences noticed a second late);
+ * 1 (default): asleep until the core's interrupt wakes it (or, with no interrupt, 200 us); 2: asleep 200 us.
+ */
+static TUNABLE(uint32_t, gGPUWaitMode, "gpu_wait", 1);
+static int gGPUFenceEvent;                      /* the event a wait sleeps on; the core's interrupt wakes it */
+
+extern "C" void
+hakios_gpu_irq_wake(void)
+{
+	thread_wakeup((event_t) &gGPUFenceEvent);
+}
+
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
 gpuWait(uint32_t fence, uint64_t milliseconds)
@@ -283,6 +301,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 			if (waited) {
 				gGPUStat.waits++;
 				gGPUStat.waiting += mach_absolute_time() - began;
+				hakios_gpu_noticed(fence);
 			}
 			return true;
 		}
@@ -290,7 +309,18 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 			break;                  /* (a GPU that has stopped answering is not waited for again) */
 		}
 		IOLockUnlock(gGPULock);
-		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+		if (gGPUWaitMode == 0) {
+			delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+		} else {
+			/* asleep: the wait is put down first and the core looked at again, so that an interrupt in between is not lost */
+			assert_wait_timeout((event_t) &gGPUFenceEvent, THREAD_UNINT, (gGPUWaitMode == 1 && hakios_gpu_irq_on()) ?
+			    GPU_IRQ_BACKSTOP_US : GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+			if (hakios_gpu_done(fence)) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				thread_block(THREAD_CONTINUE_NULL);
+			}
+		}
 		IOLockLock(gGPULock);
 	}
 	/*
