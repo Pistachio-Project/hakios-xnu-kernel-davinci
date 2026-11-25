@@ -115,6 +115,11 @@ bool CommandBuffer::piece(uint64_t bytes, Piece* out, std::string* why, bool zer
     return true;
 }
 
+bool envFullState() {
+    static const bool on = [] { const char* e = getenv("HAKIOS_METAL_FULL_STATE"); return e != nullptr && e[0] != '0' && e[0] != 0; }();
+    return on;
+}
+
 uint64_t CommandBuffer::programAddress(const Kernel& k, std::string* why) {
     const uint32_t n = std::max<uint32_t>(k.numWords, 1);
     auto same = [&](const Uploaded& u) {

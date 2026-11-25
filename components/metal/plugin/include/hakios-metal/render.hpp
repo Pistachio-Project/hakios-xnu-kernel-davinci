@@ -585,6 +585,56 @@ bool encode(pm4::Stream& stream, const Program& program, const RenderPass& pass,
             const Bindings& vsBindings, const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram,
             uint64_t table, uint8_t* tableCpu, std::string* why, const Options& options = Options{});
 
+// The register state of a draw that its inputs decide in groups (the dirty-state tracking of a pass, CommandBuffer::draw):
+// a group's words are a function of a key encodeInPass builds from the group's inputs, so a draw whose key is the last
+// draw's in the pass writes none of it, one whose key an earlier draw of the pass had writes only the registers whose
+// values differ from the last draw's (a delta made once per pair of keys, kept), and a key never seen is encoded, kept,
+// and written whole or as a delta. What a group writes is written by no one else in the pass (render_test checks the
+// register sets are disjoint), so the state of a group is the key it last wrote, not a shadow of its registers.
+// Only register writes: the loads, the draw and the rest of the draw stay in the draw's own stream.
+enum Group : uint32_t { kGroupStatic, kGroupProgram, kGroupVfd, kGroupRast, kGroupViewport, kGroupBlend, kGroupCount };
+class GroupCache {
+public:
+    // a draw begins: nothing pending
+    void begin();
+    // PROGRAM_KEY: what the program and the pass's options decide, which a group's key may start with (the caller sets it once a draw)
+    void setProgramKey(const void* key, size_t n);
+    // whether group G must be encoded into out[G] for a draw with this key (EXTRA after the program key if WITH_PROGRAM);
+    // false: the cache knows its words
+    bool need(uint32_t g, bool withProgram, const void* extra, size_t n);
+    pm4::Stream out[kGroupCount];
+    // the words the draw needs, written to TO (before the draw's own stream), and what the cache holds noted for the next draw
+    void emit(pm4::Stream& to);
+    // the registers hold something else than the last emit left (a packet that may have changed them behind the stream's back):
+    // the next draw writes every group whole
+    void forget();
+    // a new pass: nothing known
+    void reset();
+    void swap(GroupCache& o);
+    size_t entries(uint32_t g) const { return g_[g].entries.size(); }
+private:
+    struct Delta { int from; std::vector<uint32_t> words; };   // [reg, count, values...]*
+    struct Entry {
+        uint64_t hash;
+        std::vector<uint8_t> key;
+        std::vector<uint32_t> words;   // the group's writes in order, [reg, count, values...]*
+        std::vector<Delta> deltas;
+    };
+    struct G {
+        std::vector<Entry> entries;
+        int last = -1;
+    };
+    static constexpr int kSame = -1, kNew = -2;
+    static constexpr size_t kMaxEntries = 96;
+    G g_[kGroupCount];
+    int pending_[kGroupCount] = {-1, -1, -1, -1, -1, -1};
+    uint64_t newHash_[kGroupCount] = {};
+    std::vector<uint8_t> newKey_[kGroupCount];
+    std::vector<uint8_t> programKey_, scratch_;
+    uint64_t programHash_ = 0;
+    const std::vector<uint32_t>& delta(G& grp, int from, int to);
+};
+
 // The same draw in three parts, for a pass of several (CommandBuffer::draw joins a draw to the open pass into the same
 // attachments): encodeBegin the batch start, the pass begin and the clears; encodeInPass one draw's state and the draw,
 // TABLE then the draw's own (its descriptors), the border colours and the timestamps being the pass's; encodeEnd the
@@ -598,7 +648,7 @@ bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
 bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw,
                   const Bindings& vsBindings, const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram,
                   uint64_t table, uint8_t* tableCpu, std::string* why, const Options& options = Options{}, const GmemPlan* gmem = nullptr,
-                  bool afterFetch = false);
+                  bool afterFetch = false, GroupCache* groups = nullptr);
 void encodeEnd(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& options = Options{});
 
 // A pass with no draw: the batch start, the pass begin, the Clear's fill, the tail. What -[MTLRenderCommandEncoder

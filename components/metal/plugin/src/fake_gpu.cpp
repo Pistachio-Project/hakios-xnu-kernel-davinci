@@ -1363,8 +1363,20 @@ bool FakeGpu::eventBlit() {
 // CP_DRAW_INDX_OFFSET: the draw itself. As with CP_EXEC_CS, everything the registers and the loads say about it must hold
 // together (fake_gpu.hpp's file comment lists what); what the GPU does with state that does not is hang or write
 // nothing, and a fault here stands for either. Nothing is rasterized.
+void FakeGpu::recordDrawRegisters(bool on) {
+    std::lock_guard<std::mutex> g(lock_);
+    recordRegs_ = on;
+    drawRegs_.clear();
+}
+
+std::vector<std::map<uint32_t, uint32_t>> FakeGpu::drawRegisters() {
+    std::lock_guard<std::mutex> g(lock_);
+    return drawRegs_;
+}
+
 bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
     using namespace a6xx;
+    if (recordRegs_) drawRegs_.push_back(regs_);
     if (count != 3 && count != 7) {
         fault(text("CP_DRAW_INDX_OFFSET of %llu words: the 3-word auto-indexed form and the 7-word indexed one are what this GPU model runs", count));
         return false;

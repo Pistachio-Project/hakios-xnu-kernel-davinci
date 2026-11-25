@@ -32,6 +32,9 @@
 
 namespace hakios::metal {
 
+// HAKIOS_METAL_FULL_STATE=1 in the environment: CommandBuffer::setFullState from the start (read once)
+bool envFullState();
+
 class CommandQueue;
 class Texture;
 
@@ -204,6 +207,10 @@ public:
     // every fragment texture the null texture (1x1, always in the texture cache): wrong pictures, but a draw's time then
     // says what its shader costs without its texture reads -- a measurement switch, as setGmemOff is a bisect's
     void setNullFsTextures(bool on) { nullFsTextures_ = on; }
+    // every draw encodes all of its register state and leaves out what the registers already hold, as before the dirty-state
+    // tracking of render::GroupCache (the debug switch: boot-arg metal_full_state=1, or HAKIOS_METAL_FULL_STATE=1 on a host);
+    // the two make the same state at every draw
+    void setFullState(bool on) { fullState_ = on; }
     // why the last pass that could not be drawn in GMEM was not (gmemPlan's or gmemDrawOk's reason), empty when none was refused
     const std::string& gmemRefusal() const { return gmemWhy_; }
     // the words recorded so far (what the command processor will read)
@@ -234,6 +241,7 @@ private:
     uint32_t gmemMinDraws_ = 0;
     bool gmemBinning_ = false;
     bool nullFsTextures_ = false;
+    bool fullState_ = envFullState();
     uint32_t gmemClears_ = 0, gmemClearWords_[kMaxColorOutputs][4] = {};   // (draw's, for the pass it opens)
     std::string gmemWhy_;
     std::unordered_map<uint64_t, uint32_t> ordinals_;   // passes opened so far into each kind of target
@@ -330,7 +338,7 @@ private:
         render::Options options;
         uint64_t table;   // the GPU address of the pass's table: a piece (below), kept by the command buffer
         RegShadow regs;   // what each register written in the pass holds (render.cpp: appendDeduped)
-        std::vector<uint8_t> staticKey;   // what decided the last draw's program-and-pass state (render.cpp: draw)
+        render::GroupCache groups;   // the register groups' state in what REGS covers (render.hpp GroupCache; render.cpp: draw)
         // A pass drawn in GMEM (gmemPlan and every draw gmemDrawOk) is recorded rather than streamed: its draws gather
         // in BODIES, deduplicated among themselves from nothing (BODY_REGS) since each tile replays them after the
         // tile's own register writes, and closePass puts them in the tiles.
@@ -338,6 +346,7 @@ private:
         render::GmemPlan plan;
         pm4::Stream bodies;
         RegShadow bodyRegs;
+        render::GroupCache bodyGroups;   // ...in what BODY_REGS covers
         // what the draws touch: the render area (X0 Y0 X1 Y1, the union of render::drawArea's) and the attachments they
         // write and read (a framebuffer fetch), as masks -- what closePass tiles, loads and stores
         uint32_t area[4] = {~0u, ~0u, 0, 0};
@@ -410,7 +419,8 @@ private:
     // every draw, each grew from nothing a word at a time -- nine allocations for a draw's 350 words, and the phone's
     // allocator hands large frees back to the system (madvise), which the samples of a draw call showed beside them
     pm4::Stream drawBody_, drawBodySys_;
-    std::vector<uint8_t> drawKey_;   // render.cpp: draw's static key, built here so that its memory is kept
+    std::vector<uint8_t> drawKey_;   // render.cpp: draw's program key, built here so that its memory is kept
+    render::GroupCache newBody_, newSys_;   // a pass's first draw's groups, until the pass's record is taken
     std::vector<BoUse> uses_;
     BoUse usesRecent_[8] = {};
     const void* keptRecent_[8] = {};

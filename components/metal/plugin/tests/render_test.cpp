@@ -6258,3 +6258,216 @@ TEST(each_profiled_pass_says_why_it_was_drawn_in_sysmem) {
     }
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
+
+// --- dirty-state tracking (render::GroupCache): the same registers at every draw as encoding all of them ----------------------
+
+namespace {
+using RegFile = std::map<uint32_t, uint32_t>;
+
+struct Lcg {
+    uint32_t s;
+    uint32_t next(uint32_t n) {
+        s = s * 1664525u + 1013904223u;
+        return (s >> 8) % n;
+    }
+};
+
+// a pseudo-random run of draws in several passes, as a command buffer set to FULL (every draw encodes all its state) or not
+// writes it, and the registers the fake sees at each draw. MODE: 0 sysmem, 1 GMEM, 2 GMEM binned, 3 both ways (dual), 4 sysmem with
+// depth and occlusion queries.
+std::vector<RegFile> stateSequence(bool full, int mode, uint32_t seed, size_t* words = nullptr, bool* ok = nullptr) {
+    Rig r;
+    r.fake->recordDrawRegisters(true);
+    std::string why;
+    auto t = target(r, 256, 256), u = target(r, 256, 256);
+    auto depth = mode == 4 ? depthTarget(r, 256, 256) : nullptr;
+    std::vector<std::shared_ptr<Texture>> src;
+    for (uint32_t i = 0; i < 3; i++) src.push_back(target(r, 32 + 16 * i, 32, kTextureUsageRead));
+    Sampler smp, smp2;
+    SamplerDesc nearest;
+    CHECK(makeSampler(SamplerDesc{}, &smp, &why));
+    CHECK(makeSampler(nearest, &smp2, &why));
+    auto vb = newBuffer(*r.gpu, 1 << 14, &why), ub = newBuffer(*r.gpu, 1 << 14, &why), ib = newBuffer(*r.gpu, 1 << 12, &why), vis = newBuffer(*r.gpu, 64, &why);
+    CHECK(vb && ub && ib && vis);
+    if (!(vb && ub && ib && vis)) return {};
+    Program flat = flatProgram(), color = colorProgram(), tex = texProgram(), attr = attrProgram(), texBlend = texProgram();
+    texBlend.blend = ColorBlend{true, 0, 0, 1, 7, 1, 7, 0xf};
+    Program* progs[5] = {&flat, &color, &tex, &attr, &texBlend};
+    render::Options o;
+    o.gmem = mode >= 1 && mode <= 3;
+    o.gmemBinning = mode == 2;
+    auto cb = r.queue->commandBuffer();
+    cb->setFullState(full);
+    cb->setGmem(o.gmem);
+    cb->setGmemBinning(mode == 2);
+    cb->setGmemTuned(true);
+    cb->setGmemMinDraws(mode == 3 ? 56 : 0);
+    Lcg rng{seed};
+    const Viewport views[4] = {{0, 0, 256, 256, 0, 1}, {10.5, 20, 100, 120, 0.1, 0.9}, {-20, 0, 300, 256, 0, 1}, {0, 0, 256, 256, 0, 0.5}};
+    const Scissor scissors[4] = {{0, 0, 0, 0}, {5, 7, 100, 90, }, {0, 0, 256, 256}, {30, 30, 20, 40}};
+    const int draws = mode == 4 ? 70 : 90;
+    bool good = true;
+    for (int i = 0; i < draws; i++) {
+        RenderPass pass;
+        pass.color0 = (i / 30) % 2 == 0 ? t.get() : u.get();
+        pass.load = LoadAction::kLoad;
+        if (mode == 4) {
+            pass.depth = depth.get();
+            pass.depthLoad = (i % 30) == 0 ? LoadAction::kClear : LoadAction::kLoad;
+            pass.clearDepth = 1.0;
+        }
+        Program& p = *progs[rng.next(5)];
+        Draw d;
+        d.vertexCount = 6;
+        d.cullMode = rng.next(3);
+        d.winding = rng.next(2);
+        d.viewport = views[rng.next(4)];
+        d.scissor = scissors[rng.next(4)];
+        for (int c = 0; c < 4; c++) d.blendColor[c] = float(rng.next(3)) * 0.5f;
+        if (mode == 4) {
+            d.depth = DepthState{rng.next(8), rng.next(2) != 0};
+            if (i % 17 == 16) {
+                d.visibility = vis.get();
+                d.visibilityMode = 1 + rng.next(2);
+                d.visibilityReset = rng.next(2) != 0;
+            }
+        }
+        if (rng.next(5) == 0) {
+            d.indexBuffer = ib.get();
+            d.indexType = rng.next(2);
+            d.indexOffset = 4 * rng.next(8);
+            d.baseVertex = int32_t(rng.next(4));
+        } else {
+            d.vertexStart = rng.next(3);
+        }
+        d.baseInstance = rng.next(2);
+        Bindings vsb, fsb;
+        const uint64_t off = 256 * rng.next(8);
+        if (&p == &attr) vsb.buffers = {Binding{vb.get(), off}};
+        else vsb.buffers = {Binding{ub.get(), off}, Binding{ub.get(), 4096}};
+        fsb.buffers = {Binding{ub.get(), 256 * rng.next(8)}};
+        if (&p == &tex || &p == &texBlend) {
+            fsb.textures = {src[rng.next(3)].get()};
+            fsb.samplers = {rng.next(2) ? &smp : &smp2};
+        }
+        if (!cb->draw(p, pass, d, vsb, fsb, o)) {
+            std::printf("       draw %d: %s\n", i, cb->error().c_str());
+            good = false;
+            break;
+        }
+    }
+    if (words != nullptr) *words = cb->streamWords();   // (a sysmem pass's draws are on the stream as they come)
+    cb->commit();
+    cb->waitUntilCompleted();
+    good = good && cb->status() == CommandBuffer::kCompleted;
+    if (!good) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    if (ok != nullptr) *ok = good;
+    return r.fake->drawRegisters();
+}
+}  // namespace
+
+TEST(dirty_state_tracking_leaves_the_registers_of_every_draw_as_encoding_all_of_them) {
+    static const char* const kModes[] = {"sysmem", "GMEM", "GMEM binned", "dual", "sysmem with depth and occlusion"};
+    for (int mode = 0; mode < 5; mode++) {
+        for (uint32_t seed : {1u, 77u, 12345u}) {
+            size_t wordsFull = 0, wordsTracked = 0;
+            bool okFull = false, okTracked = false;
+            const auto full = stateSequence(true, mode, seed, &wordsFull, &okFull);
+            const auto tracked = stateSequence(false, mode, seed, &wordsTracked, &okTracked);
+            CHECK(okFull && okTracked);
+            CHECK(!full.empty());
+            CHECK_EQ(full.size(), tracked.size());
+            size_t bad = 0;
+            for (size_t i = 0; i < full.size() && i < tracked.size() && bad < 3; i++) {
+                if (full[i] == tracked[i]) continue;
+                bad++;
+                for (const auto& [reg, v] : full[i]) {
+                    auto it = tracked[i].find(reg);
+                    if (it == tracked[i].end() || it->second != v) {
+                        std::printf("       %s seed %u draw %zu: register %#x holds %#x, tracked %#x\n", kModes[mode], seed, i, reg, v,
+                                    it == tracked[i].end() ? 0u : it->second);
+                        break;
+                    }
+                }
+                CHECK(false);
+            }
+            if (mode == 0 || mode == 4) {   // (the other modes' draws are gathered off the stream until the pass ends)
+                if (seed == 1) std::printf("       %s: the stream's %zu words with every draw's state deduplicated, %zu tracked (%zu draws)\n", kModes[mode], wordsFull, wordsTracked, full.size());
+                CHECK(wordsTracked <= wordsFull + wordsFull / 20);   // (about as many words: each draw saves compute, not a stream)
+            }
+        }
+    }
+}
+
+// What a group writes is written by nothing else of the draw: its registers are its own, so that the state of a group is the key it last wrote.
+TEST(the_registers_of_a_state_group_are_written_by_no_other_group_or_the_draw) {
+    Rig r;
+    std::string why;
+    auto t = target(r, 256, 256);
+    auto depth = depthTarget(r, 256, 256);
+    auto src = target(r, 32, 32, kTextureUsageRead);
+    Sampler smp;
+    CHECK(makeSampler(SamplerDesc{}, &smp, &why));
+    auto vb = newBuffer(*r.gpu, 1 << 14, &why), ub = newBuffer(*r.gpu, 1 << 14, &why), ib = newBuffer(*r.gpu, 1 << 12, &why);
+    CHECK(vb && ub && ib);
+    if (!(vb && ub && ib)) return;
+    Program flat = flatProgram(), color = colorProgram(), tex = texProgram(), attr = attrProgram();
+    for (int withDepth = 0; withDepth < 2; withDepth++) {
+        for (Program* p : {&flat, &color, &tex, &attr}) {
+            RenderPass pass;
+            pass.color0 = t.get();
+            if (withDepth) pass.depth = depth.get();
+            Draw d = wholeDraw(6, 256, 256);
+            d.depth = withDepth != 0 ? DepthState{1, true} : DepthState{};
+            d.stencil.enabled = false;
+            if (withDepth == 1) d.indexBuffer = ib.get();
+            Bindings vsb, fsb;
+            if (p == &attr) vsb.buffers = {Binding{vb.get(), 0}};
+            else vsb.buffers = {Binding{ub.get(), 0}, Binding{ub.get(), 4096}};
+            fsb.buffers = {Binding{ub.get(), 0}};
+            if (p == &tex) {
+                fsb.textures = {src.get()};
+                fsb.samplers = {&smp};
+            }
+            auto vsAddr = newBuffer(*r.gpu, 4ull * p->vs.k.numWords, &why), fsAddr = newBuffer(*r.gpu, 4ull * p->fs.k.numWords, &why),
+                 table = newBuffer(*r.gpu, render::kTableBytes, &why);
+            CHECK(vsAddr && fsAddr && table);
+            if (!(vsAddr && fsAddr && table)) return;
+            memset(table->contents(), 0, render::kTableBytes);
+            render::GroupCache gc;
+            gc.begin();
+            gc.setProgramKey("k", 1);
+            pm4::Stream rest;
+            const bool ok = render::encodeInPass(rest, *p, pass, d, vsb, fsb, vsAddr->gpuAddress(), fsAddr->gpuAddress(), table->gpuAddress(),
+                                                 static_cast<uint8_t*>(table->contents()), &why, render::Options{}, nullptr, false, &gc);
+            CHECK(ok);
+            if (!ok) {
+                std::printf("       %s\n", why.c_str());
+                continue;
+            }
+            std::map<uint32_t, int> owner;   // register -> -1 the draw's own stream, else the group
+            auto take = [&](const pm4::Stream& s, int who) {
+                const auto& w = s.words();
+                for (size_t i = 0; i < w.size();) {
+                    const pm4::Header h = pm4::decodeOwn(w[i]);
+                    CHECK(h.kind == pm4::Header::kRegisters || who < 0);   // a group writes registers only
+                    if (h.kind == pm4::Header::kRegisters) {
+                        for (uint32_t k = 0; k < h.count; k++) {
+                            auto [it, fresh] = owner.emplace(h.reg + k, who);
+                            if (!fresh && it->second != who) {
+                                std::printf("       %s: register %#x written by %d and %d\n", p->name, h.reg + k, it->second, who);
+                                CHECK(false);
+                            }
+                        }
+                    }
+                    i += 1 + h.count;
+                }
+            };
+            take(rest, -1);
+            for (uint32_t g = 0; g < render::kGroupCount; g++) {
+                take(gc.out[g], int(g));
+                CHECK(gc.out[g].size() > 0);
+            }
+        }
+    }
+}

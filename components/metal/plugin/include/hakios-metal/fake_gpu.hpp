@@ -188,6 +188,10 @@ public:
     int64_t nowNs() override;
 
     Stats stats();
+    // the register file at each CP_DRAW_INDX_OFFSET / CP_DRAW_INDIRECT_MULTI the model reaches (every register written, as the
+    // draw sees it), kept while RECORD is on: the tests compare two ways of writing the same state draw by draw
+    void recordDrawRegisters(bool on);
+    std::vector<std::map<uint32_t, uint32_t>> drawRegisters();
     uint32_t liveBuffers();
     // An IOSurface the kernel would know by ID: its pixels at OFFSET, ROW_BYTES apart, in a buffer of whole pages, which
     // kHakiosSurface hands out (the same handle while it is open, as the kernel does) and which outlives the buffer
@@ -295,6 +299,8 @@ private:
     bool wedged_ = false;                       // (RECOVERS false) after a hang: every wait fails at once
     std::deque<Job> jobs_;
     std::map<uint32_t, uint32_t> regs_;         // every register written, as written (type-4 packets)
+    bool recordRegs_ = false;
+    std::vector<std::map<uint32_t, uint32_t>> drawRegs_;   // regs_ at each draw, while recordRegs_
     std::set<uint32_t> written_;                // ...of which those written in the submission running now
     CsState cs_;
     StageLoads vs_, fs_;
