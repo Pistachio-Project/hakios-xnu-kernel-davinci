@@ -272,6 +272,7 @@ struct Translation {
     air_shader_info info{};
     ir3_shader* shader = nullptr;         // the hand-built shader; its variant hangs off it
     ir3_shader_variant* v = nullptr;
+    std::string irNote;                   // what ir3's code is made of (half and full writes), told with the cache notes
     uint32_t* bin = nullptr;              // the assembled binary (ralloc'd under the variant)
     uint8_t fbTargets[kMaxTextureSlots] = {};   // lowerFbRead's slots: n + 1 where colour attachment n is read
     Translation() = default;
@@ -931,6 +932,20 @@ bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     if (nir->info.stage == MESA_SHADER_FRAGMENT && needsQuadHelpers(nir)) nir->info.fs.needs_quad_helper_invocations = true;
     if (ir3_compile_shader_nir(compiler, t.shader, v) != 0) return refuse(why, std::string("ir3 refused ") + t.name());
     phase("ir3_compile_shader_nir");
+    if (v->ir != nullptr && nir->info.stage == MESA_SHADER_FRAGMENT) {
+        // The register file is merged on this chip (SP_xS_CTRL_REG0.MERGEDREGS): ir3 counts a half register into max_reg and leaves max_half_reg
+        // at -1 (ir3.c: collect_reg_info), so the "0 half registers" of every ir3 line said nothing about the code. What the code does is here: its
+        // instructions by the width they write.
+        unsigned half = 0, full = 0;
+        foreach_block (block, &v->ir->block_list) {
+            foreach_instr (instr, &block->instr_list) {
+                if (instr->opc == OPC_NOP || instr->dsts_count == 0 || (instr->dsts[0]->flags & (IR3_REG_PREDICATE | IR3_REG_SHARED)) != 0) continue;
+                if (instr->dsts[0]->flags & IR3_REG_HALF) half++;
+                else full++;
+            }
+        }
+        t.irNote = std::string("ir3 ") + t.name() + ": " + std::to_string(full) + " instructions writing full registers, " + std::to_string(half) + " writing half (merged register file: the footprint is one count)";
+    }
     {
         std::string name = t.name();
         if (!fixPrefetchSamplers(nir, v, &name, why)) return false;
@@ -1890,6 +1905,7 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
     }
     phase("walks before lowering");
     if (!compileVariant(t, PassOrder::kGraphics, why)) return nullptr;
+    if (!t.irNote.empty()) cacheNote(t.irNote);
     phase("compileVariant (NIR, ir3)");
     KernelHome home{out->stage.k, out->words, out->immediates, out->resources, out->name, out->listing};
     if (!fillKernel(t, home, highestSampler, why)) return nullptr;
