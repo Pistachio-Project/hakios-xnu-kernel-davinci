@@ -37,7 +37,7 @@ esac
 [ -z "$SB_SNAPSHOT_FORMAT" ] || sed_inplace -e "s/0x1f1c91480UL/${SB_SNAPSHOT_FORMAT}UL/" "$O/src/inject_sb.c"
 [ -z "$SB_LONG_PRESS" ] || sed_inplace -e "s/0x1c4f6ab44UL/${SB_LONG_PRESS}UL/" "$O/src/inject_sb.c"
 [ -z "$SB_POSTER" ] || sed_inplace -e "s/0x1c507e0fcUL/${SB_POSTER}UL/" -e 's/"SBMainDisplayPolicyAggregator"/"SBPolicyAggregator"/' "$O/src/inject_sb.c"
-$DYN -dynamiclib -install_name /hakios/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc -o "$O/libhakios.dylib" "$O/src/inject.c"
+$DYN -dynamiclib -install_name /hakios/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc -F"$DARWIN_SDK/System/Library/PrivateFrameworks" -weak_framework libEDR -o "$O/libhakios.dylib" "$O/src/inject.c"
 # the status bar's clock past the hole punch: components/statusbar/inject_statusbar.c (16.5's statusbar.c checks 16.5's addresses)
 # (what it knows of each board, user_boards.h, is made from the device packages that are there now)
 "$RN/../tools/boards.py" gen --out "$O/boards" > /dev/null
