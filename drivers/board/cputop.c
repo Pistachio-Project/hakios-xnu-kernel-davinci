@@ -242,17 +242,18 @@ memtop_tags(void)
 static void
 memtop_thread(void *arg __unused, wait_result_t w __unused)
 {
-	static char line[1024];
+	static char line[1536];
 
 	uint32_t leaktest = 1;      /* (gpu_leaktest=0: not) */
 	bool tested = false;
+	uint32_t ticks = 0;
 
 	(void)PE_parse_boot_argn("gpu_leaktest", &leaktest, sizeof(leaktest));
 	for (;;) {
 		int at;
 
 		delay_for_interval(memtop_seconds * 1000, NSEC_PER_MSEC);
-		if (leaktest != 0 && !tested && mach_absolute_time() > 30 * NSEC_PER_SEC * 24 / 1000) {
+		if (leaktest != 0 && !tested && ++ticks >= 6) {
 			tested = true;
 			hakios_gpu_leaktest();
 		}

@@ -50,6 +50,8 @@ extern "C" unsigned int vm_page_free_count, vm_page_wire_count;
 /* every client's buffers together (the 5 s line "gpu memory"): what the GPU's clients hold in the kernel, wired and kept, against the pages left */
 static int64_t gAllBuffers, gAllBufferBytes, gAllKeptBytes;
 static TUNABLE(uint32_t, gGPUUnwire, "gpu_unwire", 1);   /* gpu_unwire=0: a freed buffer's pages are left to the descriptor's own free (as before) */
+static int64_t gLeakResult[4] = { -1000000, -1000000, -1000000, -1000000 };   /* (leaktest: wired pages left over, kept for the 5 s line: the log's start is lost to its ring) */
+extern "C" size_t debug_iomalloc_size, debug_iomallocpageable_size, debug_container_malloc_size;
 static int64_t gLeftBytes, gStuckBytes;
 static int64_t gGemMadeWire, gGemMade, gGemFreedWire, gGemFreed;   /* (memtop: wired pages gained making a buffer / lost freeing one, noisy: others wire too) */   /* (memtop: given back while the GPU was busy; kept for good because the GPU could not be shown to be done) */
 extern "C" void MiniIOSurfaceExtra(uint64_t * snapshots, uint64_t * held, uint64_t * kept);
@@ -71,6 +73,13 @@ hakios_iokit_line(char * buf, size_t len)
 	at += (size_t) snprintf(buf + at, len - at, " [gem made %lld: %lld KB wired each; freed %lld: %lld KB each]", gGemMade,
 	    gGemMade ? gGemMadeWire * (int64_t) PAGE_SIZE / 1024 / gGemMade : 0, gGemFreed,
 	    gGemFreed ? gGemFreedWire * (int64_t) PAGE_SIZE / 1024 / gGemFreed : 0);
+	at += (size_t) snprintf(buf + at, len - at, " [IOMalloc %lu MB, IOMallocPageable %lu MB (IOBMD pageable and IOMallocPageable), containers %lu MB]",
+	    (unsigned long) (debug_iomalloc_size >> 20), (unsigned long) (debug_iomallocpageable_size >> 20),
+	    (unsigned long) (debug_container_malloc_size >> 20));
+	if (gLeakResult[0] > -1000000) {
+		at += (size_t) snprintf(buf + at, len - at, " [leaktest, wired pages left over by 200 buffers: prepare %lld, +kernel map %lld, +flush %lld, prepare+complete %lld]",
+		    gLeakResult[0], gLeakResult[1], gLeakResult[2], gLeakResult[3]);
+	}
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]) && at < len; i++) {
 		const OSSymbol * name = OSSymbol::withCString(names[i]);
 		const OSMetaClass * mc = name != NULL ? OSMetaClass::getMetaClassWithName(name) : NULL;
@@ -116,6 +125,7 @@ hakios_gpu_leaktest(void)
 			}
 			m->release();
 		}
+		gLeakResult[variant] = (int64_t) vm_page_wire_count - before;
 		printf("HakiosGPU: leaktest variant %d (%s): 200 buffers of 64 KB made and let go, wired pages left over: %lld (%lld KB)\n",
 		    variant, variant == 0 ? "prepare" : variant == 1 ? "prepare, kernel map" : variant == 2 ? "prepare, kernel map, cache flush" : "prepare, complete",
 		    (int64_t) vm_page_wire_count - before, ((int64_t) vm_page_wire_count - before) * (int64_t) PAGE_SIZE / 1024);
