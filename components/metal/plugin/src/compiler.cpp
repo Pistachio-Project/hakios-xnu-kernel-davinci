@@ -8,6 +8,7 @@
 #include <cstring>
 #include <condition_variable>
 #include <mutex>
+#include <vector>
 #include <set>
 #include <thread>
 #include <sys/stat.h>
@@ -65,6 +66,7 @@ bool knownBufferControlBytes(const void*, size_t, const FunctionConstants&, uint
 }
 
 std::string stageCacheFileName(const void*, size_t, const FunctionConstants&, uint32_t, const KnownBuffer*) { return {}; }
+bool takeCacheNote(std::string*) { return false; }
 
 #else
 
@@ -1337,16 +1339,28 @@ struct CacheReader {
     }
 };
 constexpr uint32_t kCacheMagic = 0x53434d48;   // "HMCS"
-// What the compiler is, for the cache's key: the Makefile's hash of this file, the driver's headers and the Mesa
-// archives linked in (HAKIOS_METAL_CACHE_BUILD), so that a stage compiled before stays good across a rebuild of the
-// library that changed nothing of the compiler -- with __DATE__ and __TIME__ every rebuild of the plug-in (any file
-// of the core recompiles them all) emptied a cache that var_store had kept across boots, and the window server paid
-// its 66 to 103 first compiles again. Without the define, the old key: a build is its own.
+// What the compiler is, for the cache's key: an explicit version of what it generates, and the Mesa archives linked in
+// (HAKIOS_METAL_CACHE_BUILD, the Makefile's hash of the archives alone). The version is NOT a hash of this source or the
+// driver's headers: a stats line or a log message added here emptied the phone's cache (var_store keeps it across boots) and
+// the window server paid its hundreds of compiles again. BUMP kCompilerVersion whenever the code a stage compiles to can
+// change: the AIR front end or ir3 options in this file, the stage/kernel layouts the cache file holds (their sizes are in
+// the key already), the encoding of a resource, the key's own inputs. Without the Mesa hash define: a build is its own.
+constexpr const char* kCompilerVersion = "v2";
 #ifdef HAKIOS_METAL_CACHE_BUILD
-const char* const kCacheBuild = HAKIOS_METAL_CACHE_BUILD;
+const char* const kCacheBuild = kCompilerVersion " " HAKIOS_METAL_CACHE_BUILD;
 #else
-const char* const kCacheBuild = __DATE__ " " __TIME__;
+const char* const kCacheBuild = kCompilerVersion " " __DATE__ " " __TIME__;
 #endif
+
+// What a cache miss looked like, for the plug-in's log (cacheNotes): said by the caller on its own thread, since the
+// compiler's stderr is not in the log. At most 600 in a boot, one line each: which stage, why it was compiled, how long.
+std::mutex gNotesLock;
+std::vector<std::string> gNotes;
+unsigned gNotesMade = 0;
+void cacheNote(const std::string& s) {
+    std::lock_guard<std::mutex> g(gNotesLock);
+    if (gNotesMade++ < 600) gNotes.push_back(s);
+}
 
 // The file name of a stage in the cache (no directory), "" when no cache is configured: the writable directory
 // HAKIOS_METAL_CACHE, and the read-only ones HAKIOS_METAL_CACHE_SEED (':' between them) -- stages compiled on an
@@ -1524,6 +1538,14 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path, bool trus
 }
 }  // namespace
 
+bool takeCacheNote(std::string* out) {
+    std::lock_guard<std::mutex> g(gNotesLock);
+    if (gNotes.empty()) return false;
+    *out = gNotes.front();
+    gNotes.erase(gNotes.begin());
+    return true;
+}
+
 std::string stageCacheFileName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known) {
     return stageCacheName(bitcode, size, constants, iboBase, known);
 }
@@ -1633,6 +1655,9 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         }
     }
     const auto t1 = std::chrono::steady_clock::now();
+    // (why it is compiled: no file under this key, or one that was there and was not believed -- the owner, the mode, the
+    // format -- which would be a cache that is written and never read)
+    const bool fileThere = !cached.empty() && access(cached.c_str(), F_OK) == 0;
     std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
     std::unique_ptr<CompiledStage> chosen;
     if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
@@ -1647,6 +1672,8 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     stats.misses++;
     if (chosen != nullptr && !cached.empty()) stageCacheSave(cached, *chosen);
     stats.compileUs += since(t1);
+    cacheNote("miss " + (name.empty() ? std::string("nocache") : name.substr(1, 12)) + " " + (chosen ? chosen->name : std::string("failed")) +
+              (known != nullptr ? " known" : "") + (fileThere ? " FILE-NOT-BELIEVED" : " nofile") + " " + std::to_string(since(t1) / 1000) + " ms");
     return chosen;
 }
 

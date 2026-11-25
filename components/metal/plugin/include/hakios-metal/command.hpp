@@ -519,6 +519,11 @@ public:
 private:
     friend class CommandBuffer;
     CommandQueue(Gpu& gpu, uint32_t id) : hold_(gpu), gpu_(gpu), id_(id) {}
+    // The pool kept stocked with 256 KB slabs by a thread of its own (HAKIOS_METAL_PREFILL=0 turns it off): a slab made in a draw
+    // call was a kernel allocation and first-touch faults of write-combined memory inside the window server's frame; made here
+    // they are touched before anyone needs them. Asked to add WANT more when the pool runs low.
+    void warmer();
+    void wantSlabs(unsigned n);
     void submit(std::shared_ptr<CommandBuffer> cb);
     void waiter(const std::shared_ptr<bool>& orphaned);
     std::unique_ptr<Bo> takeCommandBo(size_t bytes, int* error);
@@ -530,6 +535,11 @@ private:
     // (under poolLock_, a lock of its own: a command buffer gives its stamps back as it is destroyed, which can be under
     // lock_ -- the queue letting go of the last one in flight -- and lock_ there was the window server hung at boot)
     std::mutex poolLock_;
+    std::thread warm_;
+    std::mutex warmLock_;
+    std::condition_variable warmCv_;
+    unsigned warmWant_ = 0;
+    bool warmQuit_ = false;
     std::unordered_map<uint64_t, std::vector<std::shared_ptr<Buffer>>> freeBuffers_;   // by size: giveSlabs', giveBuffer's
     uint64_t freeBytes_ = 0;
     struct Resident { std::vector<uint32_t> words; std::shared_ptr<Buffer> buffer; };

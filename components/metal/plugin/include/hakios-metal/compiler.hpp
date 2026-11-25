@@ -110,6 +110,8 @@ bool hasCompiler();
 struct CompileStats {
     std::atomic<uint64_t> hitsCache{0}, hitsSeed{0}, misses{0}, compileUs{0}, loadUs{0}, saveFailed{0}, noCache{0};
 };
+// the oldest cache miss not yet told (compileStage's note), false when none
+bool takeCacheNote(std::string* out);
 inline CompileStats& compileStats() {
     static CompileStats s;
     return s;

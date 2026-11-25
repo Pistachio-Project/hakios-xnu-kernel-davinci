@@ -77,7 +77,10 @@ int hakios_metal_has_compiler(void);
 /* the stage cache's tally since the process began: stages read from the writable cache, from the seed, compiled (misses), the
  * milliseconds spent compiling and reading, and the stages compiled with no cache directory at all */
 /* the buffer pool's tally since the last call: given back, refused as still held, refused as the pool was full, and the 1 MB+ made */
-void hakios_metal_pool_counts(unsigned *given, unsigned *shared, unsigned *full, unsigned *big);
+/* ...and the slabs the pool's own thread made ahead (HAKIOS_METAL_PREFILL, MB in HAKIOS_METAL_PREFILL_MB, 16) and the ones it was asked for */
+void hakios_metal_pool_counts(unsigned *given, unsigned *shared, unsigned *full, unsigned *big, unsigned *prefilled, unsigned *refills);
+/* the oldest stage-cache miss not yet told, into BUF (1 when there was one, 0 when none) */
+int hakios_metal_cache_note(char *buf, size_t size);
 void hakios_metal_compile_stats(unsigned long long *hits, unsigned long long *seed_hits, unsigned long long *misses,
 				unsigned long long *compile_ms, unsigned long long *load_ms, unsigned long long *no_cache,
 				unsigned long long *save_failed);

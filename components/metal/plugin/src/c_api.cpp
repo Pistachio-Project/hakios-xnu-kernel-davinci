@@ -219,7 +219,7 @@ void refusedThere(hakios_metal_cb* cb, int r) {
 }
 }  // namespace
 
-namespace hakios::metal { extern std::atomic<uint32_t> gBuffersMade, gBuffersReused, gPoolGiven, gPoolShared, gPoolFull, gBigMade; extern std::atomic<uint64_t> gBytesMade; }
+namespace hakios::metal { extern std::atomic<uint32_t> gBuffersMade, gBuffersReused, gPoolGiven, gPoolShared, gPoolFull, gBigMade, gPrefilled, gRefilled; extern std::atomic<uint64_t> gBytesMade; }
 extern "C" {
 void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long long* bytes) {
     *made = hakios::metal::gBuffersMade.exchange(0);
@@ -227,7 +227,9 @@ void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long 
     *bytes = hakios::metal::gBytesMade.exchange(0);
 }
 
-void hakios_metal_pool_counts(unsigned* given, unsigned* shared, unsigned* full, unsigned* big) {
+void hakios_metal_pool_counts(unsigned* given, unsigned* shared, unsigned* full, unsigned* big, unsigned* prefilled, unsigned* refills) {
+    *prefilled = hakios::metal::gPrefilled.exchange(0);
+    *refills = hakios::metal::gRefilled.exchange(0);
     *given = hakios::metal::gPoolGiven.exchange(0);
     *shared = hakios::metal::gPoolShared.exchange(0);
     *full = hakios::metal::gPoolFull.exchange(0);
@@ -279,6 +281,13 @@ void hakios_metal_close(hakios_metal_device* d) { delete d; }
 uint64_t hakios_metal_gpu_id(hakios_metal_device* d) { return d->gpu->chipId(); }
 
 int hakios_metal_has_compiler(void) { return hasCompiler() ? 1 : 0; }
+
+int hakios_metal_cache_note(char* buf, size_t size) {
+    std::string n;
+    if (size == 0 || !takeCacheNote(&n)) return 0;
+    snprintf(buf, size, "%s", n.c_str());
+    return 1;
+}
 
 void hakios_metal_compile_stats(unsigned long long* hits, unsigned long long* seedHits, unsigned long long* misses, unsigned long long* compileMs,
                                 unsigned long long* loadMs, unsigned long long* noCache, unsigned long long* saveFailed) {

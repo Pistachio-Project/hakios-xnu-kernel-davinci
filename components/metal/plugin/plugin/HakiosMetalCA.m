@@ -88,6 +88,7 @@
 #import <Foundation/Foundation.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
@@ -2543,6 +2544,7 @@ hm_own_cache_dir(const char *dir)
 		}
 	}
 	setenv("HAKIOS_METAL_LISTING", "0", 0);
+	setenv("HAKIOS_METAL_PREFILL", hm_boot_arg_set("metal_pool_prefill=0") ? "0" : "1", 1);
 	hm_ensure_spi([self class]);
 	hm_functions_encode_from_metadata();
 	self = [super init];
@@ -3504,6 +3506,19 @@ hm_async_pipelines(void)
 	return on != 0;
 }
 
+/* the stage cache's misses, one line each as compiled (compiler.cpp: cacheNote): the stage's name, the first 12 hex digits of
+ * its key (the same stage compiled again at the next boot has the same key if it is the same stage: a key that changes
+ * between boots shows here), "nofile" or "FILE-NOT-BELIEVED" (a file under that key that the loader passed over) */
+static void
+hm_cache_notes(void)
+{
+	char note[256];
+
+	while (hakios_metal_cache_note(note, sizeof(note))) {
+		hm_print("shader cache: %s\n", note);
+	}
+}
+
 static void
 hm_pipeline_note(double ms)
 {
@@ -3515,6 +3530,7 @@ hm_pipeline_note(double ms)
 	unsigned long long hits, seed, misses, compileMs, loadMs, noCache, saveFailed;
 	double at;
 
+	hm_cache_notes();
 	pipelines++;
 	totalMs += ms;
 	sinceMs += ms;
@@ -6905,12 +6921,19 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 "%u given up and kept, %u freed\n", made, bytes >> 10, reused, hm_memoryless_stat.made, hm_memoryless_stat.again,
 				 hm_memoryless_stat.kept, hm_memoryless_stat.freed);
 			memset(&hm_memoryless_stat, 0, sizeof(hm_memoryless_stat));
+			hm_cache_notes();
 			{
-				unsigned given, shared, full, big;
+				unsigned given, shared, full, big, prefilled, refills;
+				static long faults;
+				struct rusage ru;
+				long now = getrusage(RUSAGE_SELF, &ru) == 0 ? ru.ru_minflt : 0;
 
-				hakios_metal_pool_counts(&given, &shared, &full, &big);
+				hakios_metal_pool_counts(&given, &shared, &full, &big, &prefilled, &refills);
 				hm_print("fps: ... buffer pool: %u given back, %u kept by another owner (not pooled), %u refused as the pool was full "
-					 "(HAKIOS_METAL_POOL_MB, 128), %u of the made 1 MB or more\n", given, shared, full, big);
+					 "(HAKIOS_METAL_POOL_MB, 128), %u of the made 1 MB or more; prefill (metal_pool_prefill=0 turns it off): %u slabs made ahead "
+					 "by the pool's thread, %u asked for; page faults of the process in this window: %ld\n", given, shared, full, big,
+					 prefilled, refills, now - faults);
+				faults = now;
 			}
 			if (hm_paths_stat.cut + hm_paths_stat.left + hm_paths_stat.asIs + hm_paths_stat.fills != 0) {
 				hm_print("fps: ... paths: %u path_blit/path_clear cut to %u rectangles, %u left out, %u as they came; the whole mask marked "
@@ -8640,7 +8663,10 @@ hm_spec_off(void)
 	if (bytes == NULL || at > length || length - at < _specLength) return _program;
 	dispatch_once(&once, ^{
 		for (unsigned i = 0; i < HM_SPEC_QUEUES; i++) {
-			compiling[i] = dispatch_queue_create("hakios.metal.specialise", DISPATCH_QUEUE_SERIAL);
+			/* (utility: three threads compiling for tens of seconds at the window server's own priority took the cores its
+			 * frames are encoded on -- 45 s of compile in a boot, run C, with frames of 90 to 190 us a draw) */
+			compiling[i] = dispatch_queue_create("hakios.metal.specialise", dispatch_queue_attr_make_with_qos_class(
+				DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
 		}
 	});
 	/* the bytes that choose the path, found once (a translation of the uber shader: on a queue of the compiles, the frame

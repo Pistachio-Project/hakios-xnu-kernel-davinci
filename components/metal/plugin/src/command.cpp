@@ -58,6 +58,7 @@ std::atomic<uint32_t> gBuffersMade{0}, gBuffersReused{0};
 std::atomic<uint64_t> gBytesMade{0};
 // the pool's tally for the plug-in's buffers line: buffers given back, refused as still held by another owner, refused
 // because the pool was full, and the made ones of 1 MB or more (a GMEM pass's bodies, the binning streams)
+std::atomic<uint32_t> gPrefilled{0}, gRefilled{0};
 std::atomic<uint32_t> gPoolGiven{0}, gPoolShared{0}, gPoolFull{0}, gBigMade{0};
 
 std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why) {
@@ -165,6 +166,7 @@ uint64_t sizeClass(uint64_t bytes) {
 std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* why, bool zero, bool* fresh) {
     const uint64_t size = sizeClass(bytes);
     std::shared_ptr<Buffer> b;
+    bool low = false;
     {
         std::lock_guard<std::mutex> g(poolLock_);
         auto it = freeBuffers_.find(size);
@@ -172,7 +174,12 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
             b = std::move(it->second.back());
             it->second.pop_back();
             freeBytes_ -= size;
+            low = size == kSlabBytes && it->second.size() < 16;
         }
+    }
+    if (low) {
+        gRefilled += 16;
+        wantSlabs(16);
     }
     if (fresh != nullptr) *fresh = b == nullptr;
     if (b == nullptr) return newBuffer(gpu_, size, why);
@@ -686,10 +693,66 @@ std::shared_ptr<CommandQueue> CommandQueue::make(Gpu& gpu, std::string* why) {
     }
     std::shared_ptr<CommandQueue> q(new CommandQueue(gpu, id));
     q->thread_ = std::thread([p = q.get(), orphaned = q->orphaned_] { p->waiter(orphaned); });
+    const char* pre = getenv("HAKIOS_METAL_PREFILL");
+    // (on only when asked for -- the plug-in asks, unless boot-arg metal_pool_prefill=0: the host tests compare draws by the
+    // addresses of their memory, which a thread making slabs of its own would change from run to run)
+    if (pre != nullptr && pre[0] != '0' && pre[0] != 0) {
+        const char* mb = getenv("HAKIOS_METAL_PREFILL_MB");
+        const long want = mb != nullptr && mb[0] != 0 ? strtol(mb, nullptr, 0) : 16;
+        q->warm_ = std::thread([p = q.get()] { p->warmer(); });
+        q->wantSlabs(unsigned(want <= 0 ? 0 : want * 4));   // (256 KB slabs: 4 to the MB)
+    }
     return q;
 }
 
+void CommandQueue::wantSlabs(unsigned n) {
+    if (!warm_.joinable() || n == 0) return;
+    {
+        std::lock_guard<std::mutex> g(warmLock_);
+        warmWant_ += n;
+    }
+    warmCv_.notify_one();
+}
+
+void CommandQueue::warmer() {
+    for (;;) {
+        unsigned n;
+        {
+            std::unique_lock<std::mutex> g(warmLock_);
+            warmCv_.wait(g, [this] { return warmQuit_ || warmWant_ != 0; });
+            if (warmQuit_) return;
+            n = warmWant_;
+            warmWant_ = 0;
+        }
+        for (unsigned i = 0; i < n; i++) {
+            {
+                std::lock_guard<std::mutex> g(warmLock_);
+                if (warmQuit_) return;
+            }
+            {
+                std::lock_guard<std::mutex> g(poolLock_);
+                if (freeBytes_ + kSlabBytes > (32ull << 20) * 4) break;   // (the pool's own cap is giveBuffer's)
+            }
+            int error = 0;
+            std::unique_ptr<Bo> bo = gpu_.newBo(kSlabBytes, kBoWriteCombined, &error);
+            if (bo == nullptr) break;
+            std::memset(bo->cpu(), 0, kSlabBytes);   // (the first touch, here: a page fault each 4 KB, off the frame)
+            std::shared_ptr<Buffer> b = addressed(new Buffer(std::move(bo), kSlabBytes));
+            std::lock_guard<std::mutex> g(poolLock_);
+            freeBuffers_[kSlabBytes].push_back(std::move(b));
+            freeBytes_ += kSlabBytes;
+            gPrefilled++;
+        }
+    }
+}
+
 CommandQueue::~CommandQueue() {
+    {
+        std::lock_guard<std::mutex> g(warmLock_);
+        warmQuit_ = true;
+    }
+    warmCv_.notify_all();
+    if (warm_.joinable()) warm_.join();
     {
         std::lock_guard<std::mutex> g(lock_);
         quit_ = true;
