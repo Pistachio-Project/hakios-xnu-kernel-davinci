@@ -74,6 +74,12 @@ void hakios_metal_close(hakios_metal_device *device);
 uint64_t hakios_metal_gpu_id(hakios_metal_device *device);
 /* whether kernels can be compiled in this build (MESA=1); without it hakios_metal_kernel_compile* refuse by name */
 int hakios_metal_has_compiler(void);
+/* the stage cache's tally since the process began: stages read from the writable cache, from the seed, compiled (misses), the
+ * milliseconds spent compiling and reading, and the stages compiled with no cache directory at all */
+/* the buffer pool's tally since the last call: given back, refused as still held, refused as the pool was full, and the 1 MB+ made */
+void hakios_metal_pool_counts(unsigned *given, unsigned *shared, unsigned *full, unsigned *big);
+void hakios_metal_compile_stats(unsigned long long *hits, unsigned long long *seed_hits, unsigned long long *misses,
+				unsigned long long *compile_ms, unsigned long long *load_ms, unsigned long long *no_cache);
 
 hakios_metal_buffer *hakios_metal_buffer_new(hakios_metal_device *device, uint64_t length);
 void hakios_metal_buffer_free(hakios_metal_buffer *buffer);

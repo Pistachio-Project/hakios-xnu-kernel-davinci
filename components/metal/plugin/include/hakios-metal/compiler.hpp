@@ -21,6 +21,8 @@
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/texture.hpp"
 
+#include <atomic>
+#include <cstdint>
 namespace hakios::metal {
 
 // what a kernel binds, as the front end read it off the function's metadata: the runtime's half of the match
@@ -101,6 +103,17 @@ struct CompiledProgram {
 
 // whether a compiler is in this build
 bool hasCompiler();
+
+// What compileStage did since the process began (the plug-in's 5 s line): stages served from the writable cache, from
+// the read-only seed, compiled (a miss: NIR, ir3, and a write to the cache), and the microseconds those compiles took
+// and the loads took. Atomics: the window server compiles on more than one thread.
+struct CompileStats {
+    std::atomic<uint64_t> hitsCache{0}, hitsSeed{0}, misses{0}, compileUs{0}, loadUs{0}, saveFailed{0}, noCache{0};
+};
+inline CompileStats& compileStats() {
+    static CompileStats s;
+    return s;
+}
 
 // A function constant's value as the pipeline supplies it (MTLFunctionConstantValues): INDEX is the module's
 // [[function_constant(n)]], BITS the value as the bits of its type -- a bool 0 or 1, an integer or a float its own bits

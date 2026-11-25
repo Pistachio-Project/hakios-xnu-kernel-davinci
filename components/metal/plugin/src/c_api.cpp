@@ -219,7 +219,7 @@ void refusedThere(hakios_metal_cb* cb, int r) {
 }
 }  // namespace
 
-namespace hakios::metal { extern std::atomic<uint32_t> gBuffersMade, gBuffersReused; extern std::atomic<uint64_t> gBytesMade; }
+namespace hakios::metal { extern std::atomic<uint32_t> gBuffersMade, gBuffersReused, gPoolGiven, gPoolShared, gPoolFull, gBigMade; extern std::atomic<uint64_t> gBytesMade; }
 extern "C" {
 void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long long* bytes) {
     *made = hakios::metal::gBuffersMade.exchange(0);
@@ -227,6 +227,12 @@ void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long 
     *bytes = hakios::metal::gBytesMade.exchange(0);
 }
 
+void hakios_metal_pool_counts(unsigned* given, unsigned* shared, unsigned* full, unsigned* big) {
+    *given = hakios::metal::gPoolGiven.exchange(0);
+    *shared = hakios::metal::gPoolShared.exchange(0);
+    *full = hakios::metal::gPoolFull.exchange(0);
+    *big = hakios::metal::gBigMade.exchange(0);
+}
 
 const char* hakios_metal_error(void) { return lastError.c_str(); }
 
@@ -273,6 +279,17 @@ void hakios_metal_close(hakios_metal_device* d) { delete d; }
 uint64_t hakios_metal_gpu_id(hakios_metal_device* d) { return d->gpu->chipId(); }
 
 int hakios_metal_has_compiler(void) { return hasCompiler() ? 1 : 0; }
+
+void hakios_metal_compile_stats(unsigned long long* hits, unsigned long long* seedHits, unsigned long long* misses, unsigned long long* compileMs,
+                                unsigned long long* loadMs, unsigned long long* noCache) {
+    CompileStats& s = compileStats();
+    *hits = s.hitsCache.load();
+    *seedHits = s.hitsSeed.load();
+    *misses = s.misses.load();
+    *compileMs = s.compileUs.load() / 1000;
+    *loadMs = s.loadUs.load() / 1000;
+    *noCache = s.noCache.load();
+}
 
 hakios_metal_library* hakios_metal_library_open(const void* data, size_t size) {
     auto* l = new hakios_metal_library;

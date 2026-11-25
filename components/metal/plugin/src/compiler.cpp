@@ -1589,10 +1589,20 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         refuse(why, "ir3 has no compiler for chip 0x06030500");
         return nullptr;
     }
+    CompileStats& stats = compileStats();
+    const auto t0 = std::chrono::steady_clock::now();
+    auto since = [](std::chrono::steady_clock::time_point t) {
+        return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count());
+    };
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
     const std::string cached = stageCacheWritable(name);
+    if (name.empty()) stats.noCache++;
     if (!cached.empty()) {
-        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached, false)) return s;
+        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached, false)) {
+            stats.hitsCache++;
+            stats.loadUs += since(t0);
+            return s;
+        }
     }
     if (!name.empty()) {
         const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
@@ -1601,9 +1611,14 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
             const std::string dir(p, colon != nullptr ? size_t(colon - p) : strlen(p));
             p = colon != nullptr ? colon + 1 : nullptr;
             if (dir.empty()) continue;
-            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name, true)) return s;
+            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name, true)) {
+                stats.hitsSeed++;
+                stats.loadUs += since(t0);
+                return s;
+            }
         }
     }
+    const auto t1 = std::chrono::steady_clock::now();
     std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
     std::unique_ptr<CompiledStage> chosen;
     if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
@@ -1615,7 +1630,9 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         theCompiler()->has_preamble = true;
         chosen = without != nullptr && preferWithoutPreamble(with->stage.k, without->stage.k) ? std::move(without) : std::move(with);
     }
+    stats.misses++;
     if (chosen != nullptr && !cached.empty()) stageCacheSave(cached, *chosen);
+    stats.compileUs += since(t1);
     return chosen;
 }
 

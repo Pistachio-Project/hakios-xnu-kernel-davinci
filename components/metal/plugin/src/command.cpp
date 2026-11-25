@@ -56,10 +56,14 @@ std::shared_ptr<Buffer> bufferAt(uint64_t address, uint64_t* offset) {
 
 std::atomic<uint32_t> gBuffersMade{0}, gBuffersReused{0};
 std::atomic<uint64_t> gBytesMade{0};
+// the pool's tally for the plug-in's buffers line: buffers given back, refused as still held by another owner, refused
+// because the pool was full, and the made ones of 1 MB or more (a GMEM pass's bodies, the binning streams)
+std::atomic<uint32_t> gPoolGiven{0}, gPoolShared{0}, gPoolFull{0}, gBigMade{0};
 
 std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why) {
     gBuffersMade++;
     gBytesMade += length;
+    if (length >= (1u << 20)) gBigMade++;
     int error = 0;
     std::unique_ptr<Bo> bo = gpu.newBo(length, kBoWriteCombined, &error);
     if (bo == nullptr) {
@@ -179,9 +183,24 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
 
 void CommandQueue::giveBuffer(std::shared_ptr<Buffer> b) {
     // (only one no one else holds, of a size takeBuffer makes: a piece's buffer kept elsewhere is still someone's)
-    if (b == nullptr || b.use_count() != 1 || b->contents() == nullptr || b->length() != sizeClass(b->length())) return;
+    if (b == nullptr || b->contents() == nullptr || b->length() != sizeClass(b->length())) return;
+    if (b.use_count() != 1) {
+        gPoolShared++;
+        return;
+    }
+    // (the pool's size, HAKIOS_METAL_POOL_MB, 128 when not given: a heavy scene made 191 buffers, 116 MB, in 2 s against
+    // the 32 MB this was, each fresh one a kernel call and first-touch page faults inside a draw call)
+    static const uint64_t cap = [] {
+        const char* e = getenv("HAKIOS_METAL_POOL_MB");
+        const long mb = e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : 128;
+        return uint64_t(mb < 0 ? 0 : mb) << 20;
+    }();
     std::lock_guard<std::mutex> g(poolLock_);
-    if (freeBytes_ + b->length() > (32ull << 20)) return;
+    if (freeBytes_ + b->length() > cap) {
+        gPoolFull++;
+        return;
+    }
+    gPoolGiven++;
     freeBytes_ += b->length();
     freeBuffers_[b->length()].push_back(std::move(b));
 }

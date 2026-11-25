@@ -3485,7 +3485,60 @@ hm_linked_of(MTLRenderPipelineDescriptor *d, NSString *label, hakios_metal_linke
 	return n;
 }
 
+/* the stage cache's line, every 5 s while pipelines are being built (and at the first one after a quiet spell): how many
+ * pipelines, how long they took to build all told, and what the cache did -- stages read back from /var/db (a hit, a load of
+ * microseconds) against stages compiled (a miss: AIR to NIR to ir3, ms each). A cache that is kept across boots shows
+ * misses near 0 on the second boot. */
+static void
+hm_pipeline_note(double ms)
+{
+	static unsigned pipelines;
+	static double totalMs, worstMs, sinceMs, lastCompileMs;
+	static struct timespec last;
+	static unsigned long long lastMiss, lastHit;
+	struct timespec now;
+	unsigned long long hits, seed, misses, compileMs, loadMs, noCache;
+	double at;
+
+	pipelines++;
+	totalMs += ms;
+	sinceMs += ms;
+	if (ms > worstMs) worstMs = ms;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	at = (double)(now.tv_sec - last.tv_sec) + (double)(now.tv_nsec - last.tv_nsec) / 1e9;
+	if (last.tv_sec != 0 && at < 5.0) {
+		return;
+	}
+	last = now;
+	hakios_metal_compile_stats(&hits, &seed, &misses, &compileMs, &loadMs, &noCache);
+	hm_print("shader cache: %u pipelines built so far (%.0f ms in all, %.1f ms the slowest); stages: %llu from the cache dir, %llu from the "
+		 "seed, %llu compiled (%llu ms), %llu loads took %llu ms, %llu with no cache dir; since the last line: %llu hits, %llu compiles, "
+		 "%.0f ms in pipelines\n", pipelines, totalMs, worstMs, hits, seed, misses, compileMs, hits + seed, loadMs, noCache,
+		 hits + seed - lastHit, misses - lastMiss, sinceMs);
+	lastHit = hits + seed;
+	lastMiss = misses;
+	sinceMs = 0;
+	(void)lastCompileMs;
+}
+
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error
+{
+	struct timespec began;
+
+	clock_gettime(CLOCK_MONOTONIC, &began);
+	id made = [self hakiosRenderPipelineTimed:descriptor error:error];
+	{
+		struct timespec done;
+
+		clock_gettime(CLOCK_MONOTONIC, &done);
+		if (made != nil) {
+			hm_pipeline_note((double)(done.tv_sec - began.tv_sec) * 1e3 + (double)(done.tv_nsec - began.tv_nsec) / 1e6);
+		}
+	}
+	return made;
+}
+
+- (id)hakiosRenderPipelineTimed:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error
 {
 	SEL bitcode = sel_getUid("bitcodeData");
 	NSString *why = [self hakiosRenderPipelineWhy:descriptor];
@@ -5776,6 +5829,9 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_skip_refused(_cb, !hm_strict());
 		hakios_metal_cb_set_profile(_cb, hm_fps_on());
 		hakios_metal_cb_set_gmem(_cb, hm_gmem_on() || hm_gmem_draws() != 0);
+		HM_ONCE("gmem: tiled passes %s; metal_gmem_draws=%u (a pass lighter than half that goes to sysmem); hardware binning (VSC, tiles skip draws "
+			"they miss) %s (metal_gmem_binning=1 turns it on)\n", (hm_gmem_on() || hm_gmem_draws() != 0) ? "on" : "off", hm_gmem_draws(),
+			hm_binning_on() ? "on" : "off");
 		hakios_metal_cb_set_gmem_min_draws(_cb, hm_gmem_draws());
 		hakios_metal_cb_set_gmem_binning(_cb, hm_binning_on());
 		hakios_metal_cb_set_full_state(_cb, hm_full_state());
@@ -6795,6 +6851,13 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 "%u given up and kept, %u freed\n", made, bytes >> 10, reused, hm_memoryless_stat.made, hm_memoryless_stat.again,
 				 hm_memoryless_stat.kept, hm_memoryless_stat.freed);
 			memset(&hm_memoryless_stat, 0, sizeof(hm_memoryless_stat));
+			{
+				unsigned given, shared, full, big;
+
+				hakios_metal_pool_counts(&given, &shared, &full, &big);
+				hm_print("fps: ... buffer pool: %u given back, %u kept by another owner (not pooled), %u refused as the pool was full "
+					 "(HAKIOS_METAL_POOL_MB, 128), %u of the made 1 MB or more\n", given, shared, full, big);
+			}
 			if (hm_paths_stat.cut + hm_paths_stat.left + hm_paths_stat.asIs + hm_paths_stat.fills != 0) {
 				hm_print("fps: ... paths: %u path_blit/path_clear cut to %u rectangles, %u left out, %u as they came; the whole mask marked "
 					 "%u times (the last by %s)\n", hm_paths_stat.cut, hm_paths_stat.rects, hm_paths_stat.left, hm_paths_stat.asIs,
