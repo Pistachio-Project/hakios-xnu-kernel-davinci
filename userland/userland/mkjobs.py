@@ -263,8 +263,14 @@ DENY += ('fileindexerd', 'spotlightknowledged.updater', 'icloudmailagent')
 # CarPlay) 0.2 s. All are on-demand jobs here, so nothing waits for them. ALLOW="sharingd" etc. puts one back.
 # With no modem (CommCenter is denied above) visual voicemail, the radios' coexistence manager and the wireless
 # diagnostics have nothing to do: vmd 0.24 s, WirelessRadioManagerd 0.42 s in a run (logs/140130-run.log).
+# mediaanalysisd (and its .service job: photo and video analysis, a heavy model load at the first Photos or
+# Spotlight client; it started at 150.8 s in logs/150829-run.log right as the thermal governor held a core back at
+# 70.3 C, no photo library to analyse). SafariBookmarksSyncAgent (iCloud bookmarks, no account): 15 processes
+# killed by a signal in one run, 44 "ends by signal" lines, 18 crash reports, logs/183649-run.log.
+# photoanalysisd and CommCenter are in DENY already; callservicesd (SpringBoard's call UI) stays.
 DENY_DAVINCI = ('com.apple.sharingd', 'searchpartyd', 'findmydeviced', 'findmylocated', 'nearbyd', 'audioaccessoryd', 'carkitd',
-                'com.apple.voicemail.vmd', 'WirelessRadioManager', 'wirelessinsightsd')
+                'com.apple.voicemail.vmd', 'WirelessRadioManager', 'wirelessinsightsd',
+                'com.apple.mediaanalysisd', 'com.apple.SafariBookmarksSyncAgent')
 if os.environ.get('BOARD') == 'davinci':
     DENY += DENY_DAVINCI
 
