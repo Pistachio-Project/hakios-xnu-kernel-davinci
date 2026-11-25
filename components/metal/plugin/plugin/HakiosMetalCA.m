@@ -3558,7 +3558,7 @@ hm_pipeline_note(double ms)
 	static struct timespec last;
 	static unsigned long long lastMiss, lastHit;
 	struct timespec now;
-	unsigned long long hits, seed, misses, compileMs, loadMs, noCache, saveFailed;
+	unsigned long long hits, seed, misses, compileMs, loadMs, noCache, saveFailed, prefetched;
 	double at;
 
 	hm_cache_notes();
@@ -3572,10 +3572,10 @@ hm_pipeline_note(double ms)
 		return;
 	}
 	last = now;
-	hakios_metal_compile_stats(&hits, &seed, &misses, &compileMs, &loadMs, &noCache, &saveFailed);
+	hakios_metal_compile_stats(&hits, &seed, &misses, &compileMs, &loadMs, &noCache, &saveFailed, &prefetched);
 	hm_print("shader cache: %u pipelines built so far (%.0f ms in all, %.1f ms the slowest); stages: %llu from the cache dir, %llu from the "
-		 "seed, %llu compiled (%llu ms), %llu loads took %llu ms, %llu with no cache dir, %llu cache writes failed; since the last line: %llu hits, %llu compiles, "
-		 "%.0f ms in pipelines\n", pipelines, totalMs, worstMs, hits, seed, misses, compileMs, hits + seed, loadMs, noCache, saveFailed,
+		 "seed, %llu compiled (%llu ms), %llu loads took %llu ms, %llu with no cache dir, %llu cache writes failed; %llu of the loads from the read-ahead (not the flash); since the last line: %llu hits, %llu compiles, "
+		 "%.0f ms in pipelines\n", pipelines, totalMs, worstMs, hits, seed, misses, compileMs, hits + seed, loadMs, noCache, saveFailed, prefetched,
 		 hits + seed - lastHit, misses - lastMiss, sinceMs);
 	lastHit = hits + seed;
 	lastMiss = misses;

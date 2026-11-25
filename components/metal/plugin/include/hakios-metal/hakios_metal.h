@@ -83,7 +83,7 @@ void hakios_metal_pool_counts(unsigned *given, unsigned *shared, unsigned *full,
 int hakios_metal_cache_note(char *buf, size_t size);
 void hakios_metal_compile_stats(unsigned long long *hits, unsigned long long *seed_hits, unsigned long long *misses,
 				unsigned long long *compile_ms, unsigned long long *load_ms, unsigned long long *no_cache,
-				unsigned long long *save_failed);
+				unsigned long long *save_failed, unsigned long long *prefetched);
 
 hakios_metal_buffer *hakios_metal_buffer_new(hakios_metal_device *device, uint64_t length);
 void hakios_metal_buffer_free(hakios_metal_buffer *buffer);

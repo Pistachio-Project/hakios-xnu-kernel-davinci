@@ -290,7 +290,8 @@ int hakios_metal_cache_note(char* buf, size_t size) {
 }
 
 void hakios_metal_compile_stats(unsigned long long* hits, unsigned long long* seedHits, unsigned long long* misses, unsigned long long* compileMs,
-                                unsigned long long* loadMs, unsigned long long* noCache, unsigned long long* saveFailed) {
+                                unsigned long long* loadMs, unsigned long long* noCache, unsigned long long* saveFailed, unsigned long long* prefetched) {
+    *prefetched = compileStats().prefetched.load();
     *saveFailed = compileStats().saveFailed.load();
     CompileStats& s = compileStats();
     *hits = s.hitsCache.load();

@@ -8,10 +8,16 @@
 #include <cstring>
 #include <condition_variable>
 #include <mutex>
+#include <pthread.h>
+#include <unordered_map>
+#include <atomic>
 #include <vector>
 #include <set>
 #include <thread>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #include <unistd.h>
 
 #ifdef HAKIOS_METAL_MESA
@@ -1482,19 +1488,23 @@ bool stageWithinLimits(const CompiledStage& c) {
 
 // TRUSTED: a read-only seed of the system image's. A file of the writable cache is taken only when it is this user's or
 // root's and no one else may write it: the directory is the process's own, but one made by an older build was open to all.
-std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path, bool trusted) {
+bool stageCacheRead(const std::string& path, bool trusted, std::string* out) {
     FILE* f = fopen(path.c_str(), "rb");
-    if (f == nullptr) return nullptr;
+    if (f == nullptr) return false;
     struct stat st;
     if (!trusted && (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode) || (st.st_uid != geteuid() && st.st_uid != 0) ||
                      (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)) {
         fclose(f);
-        return nullptr;
+        return false;
     }
-    std::string data;
     char chunk[65536];
-    for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;) data.append(chunk, n);
+    for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;) out->append(chunk, n);
     fclose(f);
+    return true;
+}
+
+std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path, bool trusted);
+std::unique_ptr<CompiledStage> stageCacheParse(const std::string& data) {
     CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
     auto s = std::make_unique<CompiledStage>();
     if (r.u32() != kCacheMagic || !r.raw(&s->stage, sizeof(s->stage))) return nullptr;
@@ -1535,6 +1545,127 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path, bool trus
     s->stage.k.source = "";
     if (!stageWithinLimits(*s)) return nullptr;
     return s;
+}
+
+std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path, bool trusted) {
+    std::string data;
+    if (!stageCacheRead(path, trusted, &data)) return nullptr;
+    return stageCacheParse(data);
+}
+
+// The files this process will want, read ahead on a thread of its own (utility priority): a stage read from the phone's flash
+// was 7 ms (run D: 630 loads, 4.4 s) in the middle of a pipeline's creation. Which files: the manifest the last run of this
+// program left in the cache directory (the names it used), written here again as stages are used. A name taken from the
+// prefetched map is read no more; one not there is read as before.
+struct Prefetch {
+    std::mutex lock;
+    std::unordered_map<std::string, std::string> data;   // by file name ("/HEX.stage")
+    uint64_t bytes = 0;
+    std::vector<std::string> used;                       // names used this run, in order of first use
+    std::set<std::string> usedSet;
+    std::vector<std::string> previous;                   // the manifest as it was read
+    bool started = false, dirty = false;
+    std::chrono::steady_clock::time_point lastWrite = std::chrono::steady_clock::now();
+    std::string manifest;
+    std::atomic<uint64_t> served{0}, wasted{0};
+};
+Prefetch& prefetch() {
+    static Prefetch* p = new Prefetch;   // (never destroyed: the thread below may outlive main's exit)
+    return *p;
+}
+
+void prefetchStart() {
+    Prefetch& pf = prefetch();
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    const char* off = getenv("HAKIOS_METAL_PREFETCH");
+    {
+        std::lock_guard<std::mutex> g(pf.lock);
+        if (pf.started) return;
+        pf.started = true;
+    }
+    if (dir == nullptr || dir[0] == 0) return;
+#if defined(__APPLE__)
+    const char* prog = getprogname();
+#else
+    const char* prog = "host";
+#endif
+    pf.manifest = std::string(dir) + "/manifest-" + (prog != nullptr ? prog : "process") + ".txt";
+    std::string text;
+    if (!stageCacheRead(pf.manifest, false, &text)) return;
+    for (size_t at = 0; at < text.size();) {
+        size_t nl = text.find('\n', at);
+        if (nl == std::string::npos) nl = text.size();
+        std::string line = text.substr(at, nl - at);
+        at = nl + 1;
+        if (line.size() == 39 && line[0] == '/' && line.compare(33, 6, ".stage") == 0) pf.previous.push_back(line);
+    }
+    if (off != nullptr && off[0] == '0') return;
+    std::vector<std::string> names = pf.previous;
+    const std::string base = dir;
+    std::thread([names, base] {
+#if defined(__APPLE__)
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+        Prefetch& p = prefetch();
+        for (const std::string& n : names) {
+            {
+                std::lock_guard<std::mutex> g(p.lock);
+                if (p.bytes > (96u << 20) || p.data.count(n) != 0) continue;
+            }
+            std::string d;
+            if (!stageCacheRead(base + n, false, &d)) continue;
+            std::lock_guard<std::mutex> g(p.lock);
+            p.bytes += d.size();
+            p.data.emplace(n, std::move(d));
+        }
+    }).detach();
+}
+
+bool prefetchTake(const std::string& name, std::string* out) {
+    Prefetch& pf = prefetch();
+    std::lock_guard<std::mutex> g(pf.lock);
+    auto it = pf.data.find(name);
+    if (it == pf.data.end()) return false;
+    *out = std::move(it->second);
+    pf.bytes -= out->size();
+    pf.data.erase(it);
+    return true;
+}
+
+// NAME was used (loaded or compiled): into the manifest, which is written when it has changed and 5 s have passed
+void prefetchUsed(const std::string& name) {
+    Prefetch& pf = prefetch();
+    std::string text;
+    std::string path;
+    {
+        std::lock_guard<std::mutex> g(pf.lock);
+        if (pf.manifest.empty()) return;
+        if (pf.usedSet.insert(name).second) {
+            pf.used.push_back(name);
+            pf.dirty = true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!pf.dirty || now - pf.lastWrite < std::chrono::seconds(5)) return;
+        pf.lastWrite = now;
+        pf.dirty = false;
+        std::set<std::string> have(pf.used.begin(), pf.used.end());
+        for (const std::string& n : pf.used) text += n + "\n";
+        size_t kept = pf.used.size();
+        for (const std::string& n : pf.previous) {
+            if (kept >= 3000) break;
+            if (have.insert(n).second) {
+                text += n + "\n";
+                kept++;
+            }
+        }
+        path = pf.manifest;
+    }
+    const std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (f == nullptr) return;
+    const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+    const bool closed = fclose(f) == 0;
+    if (!ok || !closed || rename(tmp.c_str(), path.c_str()) != 0) remove(tmp.c_str());
 }
 }  // namespace
 
@@ -1634,9 +1765,18 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     const std::string cached = stageCacheWritable(name);
     if (name.empty()) stats.noCache++;
     if (!cached.empty()) {
-        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached, false)) {
+        prefetchStart();
+        std::string ahead;
+        std::unique_ptr<CompiledStage> s;
+        if (prefetchTake(name, &ahead)) {
+            s = stageCacheParse(ahead);
+            if (s != nullptr) stats.prefetched++;
+        }
+        if (s == nullptr) s = stageCacheLoad(cached, false);
+        if (s != nullptr) {
             stats.hitsCache++;
             stats.loadUs += since(t0);
+            prefetchUsed(name);
             return s;
         }
     }
@@ -1670,7 +1810,10 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         chosen = without != nullptr && preferWithoutPreamble(with->stage.k, without->stage.k) ? std::move(without) : std::move(with);
     }
     stats.misses++;
-    if (chosen != nullptr && !cached.empty()) stageCacheSave(cached, *chosen);
+    if (chosen != nullptr && !cached.empty()) {
+        stageCacheSave(cached, *chosen);
+        prefetchUsed(name);
+    }
     stats.compileUs += since(t1);
     cacheNote("miss " + (name.empty() ? std::string("nocache") : name.substr(1, 12)) + " " + (chosen ? chosen->name : std::string("failed")) +
               (known != nullptr ? " known" : "") + (fileThere ? " FILE-NOT-BELIEVED" : " nofile") + " " + std::to_string(since(t1) / 1000) + " ms");

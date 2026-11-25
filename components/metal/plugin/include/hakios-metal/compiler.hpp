@@ -108,7 +108,7 @@ bool hasCompiler();
 // the read-only seed, compiled (a miss: NIR, ir3, and a write to the cache), and the microseconds those compiles took
 // and the loads took. Atomics: the window server compiles on more than one thread.
 struct CompileStats {
-    std::atomic<uint64_t> hitsCache{0}, hitsSeed{0}, misses{0}, compileUs{0}, loadUs{0}, saveFailed{0}, noCache{0};
+    std::atomic<uint64_t> hitsCache{0}, hitsSeed{0}, misses{0}, compileUs{0}, loadUs{0}, saveFailed{0}, noCache{0}, prefetched{0};
 };
 // the oldest cache miss not yet told (compileStage's note), false when none
 bool takeCacheNote(std::string* out);
