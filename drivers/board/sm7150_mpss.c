@@ -78,9 +78,22 @@ extern kern_return_t thread_terminate(thread_t);
 void hakios_mpss_sm7150_start(void);
 static void ew_if_create(void);
 
+/*
+ * The places that differ from phone to phone: the Pixel 4a's values (sm7150-google-sunfish.dts) unless the board's
+ * wcn3990 { } says otherwise (wcn3990_board_setup). rmtfs: with no address of its own, from the loader's low DMA memory
+ * (boot-arg lowdma=, 4 MiB on: RAM below 4 GiB that the kernel does not manage) when the board names a size.
+ */
+static uint32_t g_mpss_size = 0x9800000u;
+static uint64_t g_msa_addr = 0x98d00000ull;
+static uint32_t g_msa_size = 0x200000u;
+static uint64_t g_rmtfs_phys = 0xfde01000ull;
+static uint64_t g_rmtfs_size = 0x600000ull;
+static const char *g_bdf_names[3] = { "bdwlan-sunfish.bin", NULL, NULL };
+static char g_bdf_override[48];
+
 /* sm7150-google-sunfish.dts: mpss_mem */
 #define MPSS_MEMORY             0x8b000000ull
-#define MPSS_MEMORY_SIZE        0x9800000u
+#define MPSS_MEMORY_SIZE        g_mpss_size
 #define PAS_MODEM               4
 #define WIMG_WCOMB              0x6u    /* VM_WIMG_WCOMB: not cacheable | coherent (osfmk/arm/memory_types.h) */
 #define FW_DIRECTORY            "/hakios/fw/modem/"
@@ -333,8 +346,8 @@ loadable(const struct elf32_phdr *segment)
  * error) unless it is shared with the modem's VMID. As Linux does (rmtfs_mem.c: qcom,vmid =
  * MSS_MSA; qcom_scm.c qcom_scm_assign_mem()): owned by HLOS only -> HLOS and MSS_MSA, read/write.
  */
-#define RMTFS_ASSIGN_PHYS       0xfde01000ull
-#define RMTFS_ASSIGN_SIZE       0x600000ull
+#define RMTFS_ASSIGN_PHYS       g_rmtfs_phys
+#define RMTFS_ASSIGN_SIZE       g_rmtfs_size
 
 static bool
 mpss_assign_rmtfs(void)
@@ -1068,8 +1081,8 @@ sweet_glink_send_data(struct sweet_glink_state *gl, struct sweet_glink_channel *
 #define RMTFS_QMI_ALLOC_BUFF    4
 #define RMTFS_QMI_GET_DEV_ERROR 5
 
-#define RMTFS_BUFF_PHYS         0xfde01000ull
-#define RMTFS_BUFF_SIZE         0x600000ull
+#define RMTFS_BUFF_PHYS         g_rmtfs_phys
+#define RMTFS_BUFF_SIZE         g_rmtfs_size
 
 struct qmi_hdr {
 	uint8_t type;
@@ -2342,10 +2355,10 @@ sweet_servreg_loc_handle(struct sweet_glink_channel *ch, const struct qrtr_hdr_v
  */
 #define WLFW_SERVICE            69
 #define WLFW_CLIENT_PORT        100
-#define WLFW_MSA_ADDR           0x98d00000ull
-#define WLFW_MSA_SIZE           0x200000u
+#define WLFW_MSA_ADDR           g_msa_addr
+#define WLFW_MSA_SIZE           g_msa_size
 #define WLFW_CLIENT_ID          0x4b4e454cu
-#define WLFW_BDF_PATH           "/hakios/fw/wlan/bdwlan-sunfish.bin"
+#define WLFW_BDF_DIR            "/hakios/fw/wlan/"
 #define WLFW_BDF_MAX            32768u
 #define WLFW_CHUNK              6144u
 #define WLFW_OUT_MAX            6400u
@@ -2370,7 +2383,7 @@ enum { WL_IDLE, WL_IND_REG, WL_HOST_CAP, WL_MSA_INFO, WL_MSA_READY, WL_CAP, WL_B
 static struct {
 	int state;
 	bool known, msa_ind, cap_done, pending, fw_ready;
-	uint32_t node, port, out_len, bdf_len, bdf_sent, bdf_seg;
+	uint32_t node, port, out_len, bdf_len, bdf_sent, bdf_seg, board_id;
 	uint16_t txn;
 	uint8_t out[WLFW_OUT_MAX];
 } g_wlfw;
@@ -6486,9 +6499,10 @@ wp_wait(bool *flag, unsigned ms, const char *what)
 }
 
 /* the WCN3990's supplies as the Pixel's icnss node lists them: vdd-cx-mx (l9a, 640 mV), xo, rfa, ch0, ch1 */
-static const struct { const char *res; unsigned mv; } g_wlan_rails[] = {
+static struct { const char *res; unsigned mv; } g_wlan_rails[8] = {
 	{ "ldoa9", 640 }, { "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc10", 3312 }, { "ldoc11", 3312 },
 };
+static unsigned g_wlan_nrails = 5;
 
 static void
 wlan_rails_on(void)
@@ -6496,7 +6510,7 @@ wlan_rails_on(void)
 	char log[96];
 	unsigned lp = 0;
 
-	for (unsigned k = 0; k < sizeof(g_wlan_rails) / sizeof(g_wlan_rails[0]); k++) {
+	for (unsigned k = 0; k < g_wlan_nrails; k++) {
 		int err = hakios_rpmh_vreg_set(g_wlan_rails[k].res, g_wlan_rails[k].mv);
 
 		lp += (unsigned)snprintf(log + lp, sizeof(log) - lp, " %s=%d", g_wlan_rails[k].res, err);
@@ -6511,7 +6525,7 @@ wlan_rails_on(void)
 static void
 wlan_rails_cycle(void)
 {
-	for (int k = (int)(sizeof(g_wlan_rails) / sizeof(g_wlan_rails[0])) - 1; k >= 0; k--) {
+	for (int k = (int)g_wlan_nrails - 1; k >= 0; k--) {
 		(void)hakios_rpmh_vreg_off(g_wlan_rails[k].res);
 		sleep_ms(2);
 	}
@@ -7054,16 +7068,34 @@ wlfw_next_after_cap(void)
 {
 	/* Both the capability response and the MSA ready indication are in: download the board data. */
 	uint64_t size = 0;
-	int error = tftp_file(WLFW_BDF_PATH, 0, NULL, 0, &size);
+	int error = ENOENT;
+	char path[96];
+	const char *names[4] = { g_bdf_override[0] ? g_bdf_override : NULL, g_bdf_names[0], g_bdf_names[1], g_bdf_names[2] };
 
-	if (error == 0 && size > 0 && size <= WLFW_BDF_MAX) {
-		error = tftp_file(WLFW_BDF_PATH, 0, g_wlfw_bdf, (int)size, NULL);
-	} else {
-		error = error ? error : EFBIG;
+	/* boot-arg wlan_bdf=NAME first; then the board's list, a %02x or %03x taking the chip's board id (bdwlan.b04, bdwlan.102) */
+	for (unsigned i = 0; i < 4; i++) {
+		char name[48];
+
+		if (names[i] == NULL) {
+			continue;
+		}
+		snprintf(name, sizeof(name), names[i], g_wlfw.board_id);
+		snprintf(path, sizeof(path), WLFW_BDF_DIR "%s", name);
+		size = 0;
+		error = tftp_file(path, 0, NULL, 0, &size);
+		if (error == 0 && size > 0 && size <= WLFW_BDF_MAX) {
+			error = tftp_file(path, 0, g_wlfw_bdf, (int)size, NULL);
+		} else {
+			error = error ? error : EFBIG;
+		}
+		if (error == 0) {
+			hakios_say("SWEET WLFW: board data %s (%llu bytes)\n", path, size);
+			break;
+		}
+		hakios_say("SWEET WLFW: no board data %s (error %d)\n", path, error);
 	}
 	if (error != 0) {
-		hakios_say("SWEET WLFW: no board data " WLFW_BDF_PATH " (error %d)\n", error);
-		ev("WLFW no board data %s (error %d)", WLFW_BDF_PATH, error);
+		ev("WLFW no board data (error %d)", error);
 		g_wlfw.state = WL_FAILED;
 		return;
 	}
@@ -7214,6 +7246,8 @@ wlfw_handle_response(uint16_t msg, const uint8_t *p, uint32_t len, unsigned resu
 				ev("WLFW chip id %#x family %#x", (uint32_t)(p[at + 3] | p[at + 4] << 8 | p[at + 5] << 16 | (uint32_t)p[at + 6] << 24),
 				    (uint32_t)(p[at + 7] | p[at + 8] << 8 | p[at + 9] << 16 | (uint32_t)p[at + 10] << 24));
 			} else if (type == 0x11 && tlen >= 4) {
+				g_wlfw.board_id = (uint32_t)(p[at + 3] | p[at + 4] << 8 | p[at + 5] << 16 | (uint32_t)p[at + 6] << 24);
+				hakios_say("SWEET WLFW: the chip's board id is %#x\n", g_wlfw.board_id);
 				ev("WLFW board id %#x", (uint32_t)(p[at + 3] | p[at + 4] << 8 | p[at + 5] << 16 | (uint32_t)p[at + 6] << 24));
 			} else if (type == 0x12 && tlen >= 4) {
 				ev("WLFW soc id %#x", (uint32_t)(p[at + 3] | p[at + 4] << 8 | p[at + 5] << 16 | (uint32_t)p[at + 6] << 24));
@@ -8088,6 +8122,55 @@ hakios_mpss_sm7150_start(void)
 	}
 }
 
+/* The board's own values over the Pixel 4a's defaults (board.dts wcn3990 { }); rmtfs from the loader's low memory if it has none. */
+static void
+wcn3990_board_setup(void)
+{
+	const struct hakios_board *b = hakios_board();
+	uint64_t lowdma = 0;
+	uint32_t low_mb = 0;
+
+	if (b->wcn3990.mpss_size) {
+		g_mpss_size = b->wcn3990.mpss_size;
+	}
+	if (b->wcn3990.msa) {
+		g_msa_addr = b->wcn3990.msa;
+	}
+	if (b->wcn3990.msa_size) {
+		g_msa_size = b->wcn3990.msa_size;
+	}
+	if (b->wcn3990.bdf[0]) {
+		for (unsigned i = 0; i < 3; i++) {
+			g_bdf_names[i] = b->wcn3990.bdf[i];
+		}
+	}
+	if (b->wcn3990.rails[0] != NULL) {
+		g_wlan_nrails = 0;
+		for (unsigned i = 0; i < 8 && b->wcn3990.rails[i] != NULL; i++) {
+			g_wlan_rails[i].res = b->wcn3990.rails[i];
+			g_wlan_rails[i].mv = b->wcn3990.rail_mv[i];
+			g_wlan_nrails = i + 1;
+		}
+	}
+	if (b->wcn3990.rmtfs_size) {
+		g_rmtfs_size = b->wcn3990.rmtfs_size;
+	}
+	if (b->wcn3990.rmtfs) {
+		g_rmtfs_phys = b->wcn3990.rmtfs;
+	} else if (b->wcn3990.rmtfs_size) {
+		PE_parse_boot_argn("lowdma", &lowdma, sizeof(lowdma));
+		PE_parse_boot_argn("lowdma_mb", &low_mb, sizeof(low_mb));
+		if (lowdma != 0 && (uint64_t)low_mb * 0x100000 >= 0x400000 + g_rmtfs_size && lowdma + 0x400000 + g_rmtfs_size <= 0x100000000ull) {
+			g_rmtfs_phys = (lowdma + 0x400000 + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+		} else {
+			hakios_say("mpss: no low DMA memory for the RMTFS buffer (lowdma=%#llx lowdma_mb=%u)\n", lowdma, low_mb);
+		}
+	}
+	PE_parse_boot_argn("wlan_bdf", g_bdf_override, sizeof(g_bdf_override));
+	hakios_say("mpss: modem memory %#llx +%#x, MSA %#llx +%#x, RMTFS %#llx +%#llx, %u rails\n", MPSS_MEMORY, g_mpss_size,
+	    g_msa_addr, g_msa_size, g_rmtfs_phys, g_rmtfs_size, g_wlan_nrails);
+}
+
 /* (a thread cannot be started this early in the kernel's start: from a thread call, a little later) */
 static thread_call_t hakios_mpss_call;
 
@@ -8103,6 +8186,7 @@ hakios_mpss_sm7150_go(__unused thread_call_param_t p0, __unused thread_call_para
 	 * long and the driver gave up with "WMI: no contiguous pool". wp_rings() keeps a pool that is there already.
 	 */
 	if (PE_parse_boot_argn("mpss", &enable, sizeof(enable)) && enable != 0 && hakios_board_has(HAKIOS_HAS_WIFI_WCN3990)) {
+		wcn3990_board_setup();
 		if (kmem_alloc_contig(kernel_map, &mem, WP_POOL, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
 		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
 			wp.pool = (uint8_t *)mem;

@@ -163,6 +163,10 @@ BOARD_SCHEMA = {
                 'sound_pins': ([int], True), 'sound_function': (int, True), 'tdm': (int, False)},
     'buttons': {'pon': (int, True), 'volume_up': (int, True), 'pon_name': (str, False), 'volume_up_name': (str, False)},
     'rtc': {'peripheral': (int, True), 'name': (str, False)},
+    # what differs between phones that run a WCN3990 through an SM7150's modem (board/sm7150_mpss.c, feature wifi-wcn3990);
+    # every key is optional and the Pixel 4a's value is the default
+    'wcn3990': {'mpss_size': (int, False), 'msa': (int, False), 'msa_size': (int, False), 'rmtfs': (int, False),
+                'rmtfs_size': (int, False), 'bdf': ([str], False), 'rails': ([str], False), 'rail_mv': ([int], False)},
     'adsp': {'firmware': (str, True), 'memory': (int, True), 'memory_size': (int, True),
              'charge_counter_divisor': (int, False)},
     'gpu': {'model': (str, True), 'chip_id': (int, True), 'firmware': (str, True), 'gmem_kb': (int, True),
@@ -856,6 +860,21 @@ def load(problems=None):
         if clock is not None and (not 0 < clock['peripheral'] <= 0xfff or clock['peripheral'] & 0xff == 0):
             problems.add(f'{rel} [rtc]', f'peripheral = {clock["peripheral"]:#x}: SPMI slave << 8 | the high byte of the '
                                          "RTC's registers (0x061: slave 0, registers 0x6100)")
+        wcn = data.get('wcn3990')
+        if wcn is not None:
+            where = f'{rel} [wcn3990]'
+            for key in ('mpss_size', 'msa_size', 'rmtfs_size'):
+                if key in wcn and (wcn[key] == 0 or wcn[key] & 0xfff or wcn[key] > 0x20000000):
+                    problems.add(where, f'{key}: whole pages, not 0, at most 512 MB')
+            for key in ('msa', 'rmtfs'):
+                if key in wcn and (wcn[key] & 0xfff or not 0x80000000 <= wcn[key] < 0x100000000):
+                    problems.add(where, f'{key}: a page of DRAM below 4 GiB (the modem takes 32-bit addresses)')
+            rails = wcn.get('rails', [])
+            if len(rails) != len(wcn.get('rail_mv', [])) or len(rails) > 8 or any(not re.fullmatch(r'[a-z0-9]{3,8}', n) for n in rails) \
+                    or any(not 300 <= n <= 3600 for n in wcn.get('rail_mv', [])):
+                problems.add(where, 'rails: up to eight RPMh regulators by their command database names, rail_mv one voltage (300 to 3600 mV) each')
+            if len(wcn.get('bdf', [])) > 3 or any(not re.fullmatch(r'[A-Za-z0-9._%-]{1,48}', n) for n in wcn.get('bdf', [])):
+                problems.add(where, 'bdf: up to three board data file names (a %02x or %03x takes the chip\'s board id)')
         adsp = data.get('adsp')
         if adsp is not None:
             if adsp['memory_size'] == 0 or adsp['memory_size'] & 0xfff:
@@ -1150,6 +1169,15 @@ def table_text(socs, boards):
         if clock:
             name = f', .name = {c_string(clock["name"])}' if 'name' in clock else ''
             out.append(f'\t\t.rtc = {{ .peripheral = {clock["peripheral"]:#05x}{name} }},')
+        wcn = board.get('wcn3990')
+        if wcn:
+            parts = [f'.{key} = {wcn[key]:#x}' for key in ('mpss_size', 'msa', 'msa_size', 'rmtfs', 'rmtfs_size') if key in wcn]
+            if wcn.get('bdf'):
+                parts.append('.bdf = { ' + ', '.join(c_string(n) for n in wcn['bdf']) + ' }')
+            if wcn.get('rails'):
+                parts.append('.rails = { ' + ', '.join(c_string(n) for n in wcn['rails']) + ' }')
+                parts.append('.rail_mv = { ' + ', '.join(str(n) for n in wcn['rail_mv']) + ' }')
+            out.append('\t\t.wcn3990 = { ' + ', '.join(parts) + ' },')
         motor = board.get('haptic')
         if motor:
             out.append(f'\t\t.haptic = {{ .sda = {motor["sda"]}, .scl = {motor["scl"]}, .reset = {motor["reset"]}, '
