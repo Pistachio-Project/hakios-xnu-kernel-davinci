@@ -1695,6 +1695,7 @@ scanoutRelease(void)
 
 	gScanoutHeld = NULL;
 	if (held != NULL) {
+		MiniIOSurfaceKernelUse(held, -1);
 		MiniIOSurfaceDrop(held);
 	}
 }
@@ -1792,7 +1793,12 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 	/* held until the next surface is on the pipe (taken before the old one is let go: the same surface twice is fine) */
 	MiniIOSurface * previous = gScanoutHeld;
 	gScanoutHeld = MiniIOSurfaceCopy(s->sid);
+	/* in use to the window server while the display fetches it, until the next surface has latched (this is that: show() returned) */
+	if (gScanoutHeld != NULL) {
+		MiniIOSurfaceKernelUse(gScanoutHeld, 1);
+	}
 	if (previous != NULL) {
+		MiniIOSurfaceKernelUse(previous, -1);
 		MiniIOSurfaceDrop(previous);
 	}
 	gScanoutFrames++;

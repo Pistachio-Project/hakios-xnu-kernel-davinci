@@ -222,6 +222,8 @@ void            MiniIOSurfaceClearKept(void);
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
+/* Count (delta +1) or uncount (-1) the kernel's use of the surface's pixels, as IOSurfaceIsInUse shows it to clients (fb_scanout). */
+void            MiniIOSurfaceKernelUse(MiniIOSurface * surface, int delta);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
 mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);
 

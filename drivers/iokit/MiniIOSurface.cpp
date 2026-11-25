@@ -1003,6 +1003,22 @@ surfaceUnhold(MiniIOSurface * s)
 	s->release();
 }
 
+/*
+ * The kernel's own use of a surface's pixels, in use count category 0 where the clients read it (the shared page: IOSurfaceIsInUse): what the
+ * display's driver does for the surface the panel is fetching (fb_scanout), as Apple's does for the one it scans, so that the window server does
+ * not draw into it. The caller balances its own increments.
+ */
+void
+MiniIOSurfaceKernelUse(MiniIOSurface * s, int delta)
+{
+	IOLockLock(gSurfaceLock);
+	if (delta > 0 || s->useCount[0] != 0) {
+		s->useCount[0] += delta;
+		s->shared()->useCount = (uint64_t) s->useCount[1] << 32 | s->useCount[0];
+	}
+	IOLockUnlock(gSurfaceLock);
+}
+
 MiniIOSurface *
 MiniIOSurfaceCopy(uint32_t sid)
 {
