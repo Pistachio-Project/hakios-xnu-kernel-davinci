@@ -535,6 +535,8 @@ void hakios_metal_cb_set_gmem_binning(hakios_metal_cb *cb, int on);
 /* the tail of each pass: 0 the full flush and wait for idle (default), 1 the cache flush only for stages that store to buffers,
  * 2 also no wait for idle ahead of the flush events (boot-arg metal_pass_sync) */
 void hakios_metal_cb_set_pass_sync(hakios_metal_cb *cb, int level);
+/* attachments a GMEM pass only clears are left out of the tiles and cleared by the 2D engine (boot-arg metal_gmem_clear2d=1) */
+void hakios_metal_cb_set_gmem_clear2d(hakios_metal_cb *cb, int on);
 /* what the pass tails encoded since the last call: waits for idle, flush events, waits for a flush's word */
 void hakios_metal_tail_counts(unsigned *idles, unsigned *flushes, unsigned *waits);
 /* Every draw encodes all of its register state and leaves out what the registers already hold, as before the per-pass dirty-state

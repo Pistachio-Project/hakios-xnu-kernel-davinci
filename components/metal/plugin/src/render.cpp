@@ -3329,7 +3329,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
                 const Texture* t = i == 0 ? pass.color0 : pass.more[i - 1].texture;
                 if (t == nullptr) continue;
                 attached |= 1u << i;
-                if ((i == 0 ? pass.load : pass.more[i - 1].load) == LoadAction::kClear) likely |= 1u << i;
+                if (!gmemClear2d_ && (i == 0 ? pass.load : pass.more[i - 1].load) == LoadAction::kClear) likely |= 1u << i;
             }
             likely |= needs;
             render::GmemPlan narrow;
@@ -3352,6 +3352,9 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
                 const Texture* t = i == 0 ? pass.color0 : pass.more[i - 1].texture;
                 const LoadAction la = i == 0 ? pass.load : pass.more[i - 1].load;
                 const double* cc = i == 0 ? pass.clearColor : pass.more[i - 1].clearColor;
+                // (gmemClear2d_: an attachment no draw of the pass's like writes or reads has no bin, and its clear is the 2D engine's fill
+                // in the pass's head -- encodeBegin's clearAll, for every attachment not named here -- and not a tile's)
+                if (gmemClear2d_ && ((plan.unplanned >> i) & 1) != 0) continue;
                 if (t != nullptr && la == LoadAction::kClear && render::gmemClearWords(t->info(), cc, gmemClearWords_[i])) gmemClears_ |= 1u << i;
             }
         }
@@ -3768,7 +3771,7 @@ void CommandBuffer::closePass() {
     const uint32_t weight = gmemWeight(open_->draws, open_->fetches);
     if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, weight);
     // what it touched, for its like's GMEM next time (gmemPlan's LIKELY): known of a pass drawn for tiles, either way
-    if (open_->kind != 0 && open_->gmem) queue_.noteTouched(open_->kind, open_->ordinal, open_->written | open_->read | open_->clears | open_->missed);
+    if (open_->kind != 0 && open_->gmem) queue_.noteTouched(open_->kind, open_->ordinal, open_->written | open_->read | (gmemClear2d_ ? 0u : open_->clears) | open_->missed);
     if (open_->dual) {
         // recorded both ways: tiles for a pass of enough draws (gmemWeight), else the sysmem words, head and all
         if (weight >= gmemMinDraws_) {

@@ -6048,6 +6048,15 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_gmem_min_draws(_cb, hm_gmem_draws());
 		hakios_metal_cb_set_gmem_binning(_cb, hm_binning_on());
 		hakios_metal_cb_set_pass_sync(_cb, hm_pass_sync());
+		{
+			static int clear2d = -1;   /* boot-arg metal_gmem_clear2d=1 (default off) */
+
+			if (clear2d < 0) {
+				clear2d = hm_boot_arg_set("metal_gmem_clear2d=1") ? 1 : 0;
+				hm_print("gmem: metal_gmem_clear2d=%d (attachments a pass only clears are left out of its tiles and cleared by the 2D engine)\n", clear2d);
+			}
+			hakios_metal_cb_set_gmem_clear2d(_cb, clear2d);
+		}
 		hakios_metal_cb_set_full_state(_cb, hm_full_state());
 		hakios_metal_cb_set_dirty_groups(_cb, hm_dirty_groups());
 		hakios_metal_cb_set_null_fs_textures(_cb, (hm_gmem_off() & 32) != 0);   /* 32: no texture reads, to time the shaders alone */

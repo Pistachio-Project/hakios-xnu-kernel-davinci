@@ -227,6 +227,9 @@ public:
     }
     // render::Options::gmemBinning for this buffer's draws besides each draw's own (either asks for it)
     void setGmemBinning(bool on) { gmemBinning_ = on; }
+    // an attachment a pass only clears (no draw of its like writes or reads it) is left out of GMEM and cleared by the 2D engine's fill (metal_gmem_clear2d=1):
+    // CoreAnimation's main pass clears two colour attachments it never draws into, which cost it 56 bins and 17 MB of stores where one attachment is 14 bins
+    void setGmemClear2d(bool on) { gmemClear2d_ = on; }
     // metal_pass_sync (render::Options::tailSync): 0 the full flush and wait for idle after each pass, 1 and 2 less
     void setPassSync(uint8_t level) { passSync_ = level; }
     // every fragment texture the null texture (1x1, always in the texture cache): wrong pictures, but a draw's time then
@@ -275,6 +278,7 @@ private:
     uint32_t gmemMinDraws_ = 0;
     bool gmemBinning_ = false;
     uint8_t passSync_ = 0;
+    bool gmemClear2d_ = false;
     bool nullFsTextures_ = false;
     bool fullState_ = envFullState();
     uint32_t dirtyGroups_ = envDirtyGroups();
