@@ -218,7 +218,7 @@ surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unu
  * made of such memory, as many as SCANOUT_SURFACES alive at once (a piece is 6 MB of the scarce contiguous kind); the others
  * are as ever, and so is any that cannot be had in one piece -- those are copied to the panel.
  */
-#define SCANOUT_SURFACES        3
+#define SCANOUT_SURFACES        4               /* (backboardd keeps four of the display's size: 1, 3, 4, 7 on the Mi 9T) */
 static uint32_t gScanoutWidth, gScanoutHeight;
 static volatile SInt32 gScanoutLive;
 static uint32_t gScanoutRefused;
@@ -753,6 +753,19 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	/* (a surface of the display's size, to be fetched by the display block: see SCANOUT_SURFACES) */
 	bool scanout = gScanoutWidth != 0 && width == gScanoutWidth && height == gScanoutHeight && bpe == 4 && planeCount == 0 &&
 	    wrapped == NULL && gScanoutLive < SCANOUT_SURFACES;
+
+	if (scanout) {
+		/*
+		 * Only the window server's: its swap chain is what the display is shown. Others make surfaces of the display's size
+		 * too (the wallpaper's poster, CollectionsPoster, five of them) and took the few pieces of contiguous memory, so
+		 * that backboardd's chain alternated between surfaces fetched by the display and copied ones: every other frame
+		 * small at the corner, then whole again (fb_scanout=1, 25 November).
+		 */
+		char name[32] = "";
+
+		proc_selfname(name, sizeof(name));
+		scanout = strcmp(name, "backboardd") == 0;
+	}
 
 	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc), scanout);
 	if (s->memory == NULL) {
