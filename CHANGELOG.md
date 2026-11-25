@@ -8,6 +8,14 @@ tags yet, so the current work is one section.
 
 ### For whoever brings up a phone
 
+- **The kept data volume stops growing with diagnostics, and a save writes only what changed.** `var_store` leaves out logs
+  and regenerable data (CrashReporter and analytics, powerlog, dyld closures, Spotlight, Biome, CoreDuet, mediaanalysis,
+  app-switcher snapshots, asset downloads, log files over 1 MiB) unless `var_store_diag=1`; shader caches, icon caches,
+  preferences stay and the keychain policy is unchanged. A save prints the biggest directories (`var_store: size:` lines),
+  puts big files' data on 32 KiB boundaries, and compares each block with a table of hashes kept after the slot's
+  archive instead of reading the slot back, writing only blocks that differ (`var_store_full=1` reads back as before).
+  `var_store_every=MINUTES` (at least 2, default off) saves in between so a crash costs less than the run.
+
 - **The loader reads the battery on firmware whose charger protocols take no This.** The Mi 9T's UEFI (BOOT.XF.3.1,
   QcomCharger revision 0x10008) answers every call with success and zeros when it is called with a This. `uefi-charger-no-this`
   in `loader { }` (with `uefi-charger`) makes the loader call the protocols the way those drivers declare them; without it
