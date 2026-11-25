@@ -142,6 +142,7 @@ extern uint64_t get_task_compressed(task_t);
 extern uint64_t get_task_wired_mem(task_t);
 extern void hakios_memtop_line(char *buf, size_t len);
 extern void hakios_iokit_line(char *buf, size_t len);
+extern void hakios_gpu_leaktest(void);
 
 static int
 memtop_one(proc_t p, void *arg __unused)
@@ -200,7 +201,7 @@ memtop_tags(void)
 	static char line[640];
 	int at = 0;
 	uint64_t total = 0;
-	struct { uint64_t size; char name[32]; uint32_t tag; } top[8] = { { 0 } };
+	struct { uint64_t size, mapped; char name[32]; uint32_t tag; } top[8] = { { 0 } };
 
 	if (info == NULL) {
 		return;
@@ -224,13 +225,14 @@ memtop_tags(void)
 					top[j] = top[j - 1];
 				}
 				top[at_i].size = info[i].size;
+				top[at_i].mapped = info[i].mapped;
 				top[at_i].tag = info[i].tag;
 				strlcpy(top[at_i].name, (info[i].flags & VM_KERN_SITE_NAMED) ? info[i].name : "", sizeof(top[at_i].name));
 			}
 		}
 		at = snprintf(line, sizeof(line), "memtags: all tagged allocations %llu MB; biggest:", total >> 20);
 		for (uint32_t i = 0; i < 8 && top[i].size != 0 && at < (int)sizeof(line) - 1; i++) {
-			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s(tag %u) %llu", top[i].name, top[i].tag, top[i].size >> 20);
+			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s(tag %u) %llu (mapped %llu)", top[i].name, top[i].tag, top[i].size >> 20, top[i].mapped >> 20);
 		}
 		printf("%s\n", line);
 	}
@@ -242,10 +244,18 @@ memtop_thread(void *arg __unused, wait_result_t w __unused)
 {
 	static char line[1024];
 
+	uint32_t leaktest = 0;
+	bool tested = false;
+
+	(void)PE_parse_boot_argn("gpu_leaktest", &leaktest, sizeof(leaktest));
 	for (;;) {
 		int at;
 
 		delay_for_interval(memtop_seconds * 1000, NSEC_PER_MSEC);
+		if (leaktest != 0 && !tested && mach_absolute_time() > 30 * NSEC_PER_SEC * 24 / 1000) {
+			tested = true;
+			hakios_gpu_leaktest();
+		}
 		bzero(memtop_best, sizeof(memtop_best));
 		bzero(memtop_wired, sizeof(memtop_wired));
 		proc_iterate(PROC_ALLPROCLIST, memtop_one, NULL, NULL, NULL);

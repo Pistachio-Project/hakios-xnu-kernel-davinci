@@ -49,7 +49,8 @@ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" unsigned int vm_page_free_count, vm_page_wire_count;
 /* every client's buffers together (the 5 s line "gpu memory"): what the GPU's clients hold in the kernel, wired and kept, against the pages left */
 static int64_t gAllBuffers, gAllBufferBytes, gAllKeptBytes;
-static int64_t gLeftBytes, gStuckBytes;   /* (memtop: given back while the GPU was busy; kept for good because the GPU could not be shown to be done) */
+static int64_t gLeftBytes, gStuckBytes;
+static int64_t gGemMadeWire, gGemMade, gGemFreedWire, gGemFreed;   /* (memtop: wired pages gained making a buffer / lost freeing one, noisy: others wire too) */   /* (memtop: given back while the GPU was busy; kept for good because the GPU could not be shown to be done) */
 extern "C" void MiniIOSurfaceExtra(uint64_t * snapshots, uint64_t * held, uint64_t * kept);
 /* The 5 s `memtop` lines: how many of the IOKit objects that hold memory there are alive, and what of it our own drivers know of
  * (the IOKit tag's total is in the memtags line; what is neither here nor in the GPU and surface figures is somebody else's) */
@@ -66,6 +67,9 @@ hakios_iokit_line(char * buf, size_t len)
 	at = (size_t) snprintf(buf, len, "iokit: GPU buffers %lld (%lld MB), kept %lld MB, left %lld MB, stuck %lld MB; surface snapshots %llu MB, "
 	    "client memory held %llu MB, kept pieces %llu MB; live:", gAllBuffers, gAllBufferBytes >> 20, gAllKeptBytes >> 20,
 	    gLeftBytes >> 20, gStuckBytes >> 20, snap >> 20, held >> 20, kept >> 20);
+	at += (size_t) snprintf(buf + at, len - at, " [gem made %lld: %lld KB wired each; freed %lld: %lld KB each]", gGemMade,
+	    gGemMade ? gGemMadeWire * (int64_t) PAGE_SIZE / 1024 / gGemMade : 0, gGemFreed,
+	    gGemFreed ? gGemFreedWire * (int64_t) PAGE_SIZE / 1024 / gGemFreed : 0);
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]) && at < len; i++) {
 		const OSSymbol * name = OSSymbol::withCString(names[i]);
 		const OSMetaClass * mc = name != NULL ? OSMetaClass::getMetaClassWithName(name) : NULL;
@@ -74,6 +78,43 @@ hakios_iokit_line(char * buf, size_t len)
 			at += (size_t) snprintf(buf + at, len - at, " %s %u", shown[i], mc->getInstanceCount());
 		}
 		OSSafeReleaseNULL(name);
+	}
+}
+
+/*
+ * Boot-arg gpu_leaktest=1 (said by memtop once, 30 s in): the kernel half of a buffer's life, alone -- pageable memory made and
+ * wired as gemNew does it, mapped into the kernel and let go, 200 times -- and how many wired pages are left over.
+ */
+extern "C" void hakios_gpu_to_memory(void * start, uint64_t size);
+extern "C" void
+hakios_gpu_leaktest(void)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		const int64_t before = (int64_t) vm_page_wire_count;
+
+		for (int i = 0; i < 200; i++) {
+			IOBufferMemoryDescriptor * m = IOBufferMemoryDescriptor::inTaskWithOptions(NULL, kIODirectionInOut | kIOMemoryPageable |
+			    kIOMapWriteCombineCache, 65536, PAGE_SIZE);
+
+			if (m == NULL) {
+				continue;
+			}
+			if (m->prepare() == kIOReturnSuccess && variant >= 1) {
+				IOMemoryMap * map = m->map(kIOMapAnywhere | kIOMapDefaultCache);
+
+				if (map != NULL) {
+					bzero((void *) map->getVirtualAddress(), 65536);
+					if (variant == 2) {
+						hakios_gpu_to_memory((void *) map->getVirtualAddress(), 65536);
+					}
+					map->release();
+				}
+			}
+			m->release();
+		}
+		IOLog("HakiosGPU: leaktest variant %d (%s): 200 buffers of 64 KB made and let go, wired pages left over: %lld (%lld KB)\n",
+		    variant, variant == 0 ? "prepare" : variant == 1 ? "prepare, kernel map" : "prepare, kernel map, cache flush",
+		    (int64_t) vm_page_wire_count - before, ((int64_t) vm_page_wire_count - before) * (int64_t) PAGE_SIZE / 1024);
 	}
 }
 
@@ -958,11 +999,18 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 				if (b->memory != NULL) { gStuckBytes += (int64_t) b->size; b->memory->retain(); }    /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
 			}
 		}
+		const int64_t wireBefore = (int64_t) vm_page_wire_count;
+		const bool pageable = b->memory != NULL && !b->client && b->surface == NULL && b->map == NULL;
+
 		if (b->map != NULL) {
 			b->map->release();
 		}
 		if (b->memory != NULL) {
 			b->memory->release();
+		}
+		if (pageable) {
+			gGemFreedWire += (int64_t) vm_page_wire_count - wireBefore;
+			gGemFreed++;
 		}
 		if (b->surface != NULL) {
 			MiniIOSurfaceDrop(b->surface);
@@ -1306,6 +1354,7 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 	 * every allocation of the system's, IOSurfaces' too, failed with KERN_NO_SPACE. The zeroes are pushed out of the cache
 	 * through a passing kernel mapping.
 	 */
+	const int64_t wireBefore = (int64_t) vm_page_wire_count;
 	memory = IOBufferMemoryDescriptor::inTaskWithOptions(NULL, kIODirectionInOut | kIOMemoryPageable |
 	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
 	if (memory != NULL && memory->prepare() != kIOReturnSuccess) {
@@ -1319,6 +1368,10 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 			hakios_gpu_to_memory((void *) passing->getVirtualAddress(), size);
 			passing->release();
 		}
+	}
+	if (memory != NULL) {
+		gGemMadeWire += (int64_t) vm_page_wire_count - wireBefore;
+		gGemMade++;
 	}
 	if (memory == NULL) {
 		/* Why: the same size from the kernel's shared data range directly, for its error */
