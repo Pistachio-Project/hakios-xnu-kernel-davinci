@@ -6643,8 +6643,6 @@ static struct {
 	unsigned presents, buffers;
 	double gpu, commit, latency, latencyMax;
 	unsigned passes, draws, dispatches, copies, gmemPasses, tiles;
-	unsigned long long gmemLoad, gmemStore, splitStore;   /* bytes the GMEM passes loaded and stored, and what the split ones stored */
-	unsigned splitPasses;
 	double shadowIn, shadowOut;   /* seconds in surface copies: taken from the surface, written back into it */
 	unsigned shadowIns, shadowOuts;
 	struct { unsigned kind, width, height, draws, tiles; double us; char why[96]; char detail[360]; } slowest[4];   /* the slowest passes of the period (WHY: a sysmem pass's reason) */
@@ -6683,6 +6681,8 @@ static struct {
 	unsigned cbsSince;
 	unsigned binnedPasses;          /* GMEM passes binned by the hardware in this window */
 	BOOL binningOff;                /* the queue's binning was turned off by an overrun of a visibility stream */
+	unsigned long long gmemLoad, gmemStore, splitStore;   /* bytes the GMEM passes loaded and stored, and what the split ones stored */
+	unsigned splitPasses;
 } hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}} };
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
