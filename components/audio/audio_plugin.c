@@ -405,10 +405,28 @@ destroy_device(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectI
 	return kAudioHardwareUnsupportedOperationError;
 }
 
-static OSStatus
-device_client(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object,
-    __unused const AudioServerPlugInClientInfo *client)
+static int haptic_trace = -1;    /* haptic_trace=1 in the boot-args: the hops' times, in microseconds of mach time as the kernel's now_us() */
+
+static bool
+trace_on(void)
 {
+	if (haptic_trace < 0) {
+		char args[700] = "";
+		size_t size = sizeof(args) - 1;
+
+		haptic_trace = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "haptic_trace=1") != NULL;
+	}
+	return haptic_trace > 0;
+}
+
+/* (haptic_trace=1: which process opens the actuator or the speaker: who plays what) */
+static OSStatus
+device_client(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, const AudioServerPlugInClientInfo *client)
+{
+	if ((object == OBJECT_ACTUATOR || object == OBJECT_SPEAKER) && client != NULL && trace_on()) {
+		say("hakios: audio: trace: %s client pid %d id %u (add or remove)\n", object == OBJECT_ACTUATOR ? "actuator" : "speaker",
+		    (int)client->mProcessID, (unsigned)client->mClientID);
+	}
 	return 0;
 }
 
@@ -1142,7 +1160,6 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
 static int haptic = -1;          /* the motor driver; -2: not there (the kernel runs without haptic=5) */
 static unsigned haptic_played;   /* I/O cycles with something to feel in them, since the actuator started */
 static int haptic_peak;
-static int haptic_trace = -1;    /* haptic_trace=1 in the boot-args: the hops' times, in microseconds of mach time as the kernel's now_us() */
 static uint64_t haptic_started;  /* mach time: when the actuator's I/O started, and when the last sound was heard */
 static uint64_t haptic_heard;
 
@@ -1169,13 +1186,7 @@ haptic_open(void)
 	haptic_played = 0;
 	haptic_peak = 0;
 	haptic_started = mach_absolute_time();
-	if (haptic_trace < 0) {
-		char args[700] = "";
-		size_t size = sizeof(args) - 1;
-
-		haptic_trace = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "haptic_trace=1") != NULL;
-	}
-	if (haptic_trace > 0) {
+	if (trace_on()) {
 		say("hakios: audio: trace: actuator I/O started at %llu us\n", mach_us(haptic_started));
 	}
 }
