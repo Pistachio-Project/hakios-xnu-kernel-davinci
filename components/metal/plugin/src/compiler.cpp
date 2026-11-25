@@ -1365,7 +1365,7 @@ std::vector<std::string> gNotes;
 unsigned gNotesMade = 0;
 void cacheNote(const std::string& s) {
     std::lock_guard<std::mutex> g(gNotesLock);
-    if (gNotesMade++ < 600) gNotes.push_back(s);
+    if (gNotesMade++ < 1500) gNotes.push_back(s);
 }
 
 // The file name of a stage in the cache (no directory), "" when no cache is configured: the writable directory
@@ -1829,6 +1829,33 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
     if (!translate(bitcode, size, t, why, constants, known)) return nullptr;
     // the stage is the module's named metadata (air.vertex / air.fragment / air.kernel: air_to_nir.c module_stage)
     const std::string name = t.info.entry_point ? t.info.entry_point : "the function";
+    {
+        // The width the front end's NIR does its arithmetic in, before ir3: every program of the window server compiled with no half
+        // register at all (the "ir3:" lines), and this says whether the AIR is then all 32-bit or ir3 lost the halves. ALU instructions by
+        // result width, the conversions between 16 and 32 bits apart, and the texture instructions with a 16-bit result.
+        unsigned alu32 = 0, alu16 = 0, conv = 0, tex16 = 0, tex32 = 0;
+        nir_foreach_function_impl(impl, t.nir) {
+            nir_foreach_block(block, impl) {
+                nir_foreach_instr(instr, block) {
+                    if (instr->type == nir_instr_type_alu) {
+                        const nir_alu_instr* a = nir_instr_as_alu(instr);
+                        if (a->op == nir_op_f2f16 || a->op == nir_op_f2f32 || a->op == nir_op_f2f16_rtz || a->op == nir_op_f2f16_rtne ||
+                            a->op == nir_op_u2u16 || a->op == nir_op_u2u32 || a->op == nir_op_i2i16 || a->op == nir_op_i2i32) {
+                            conv++;
+                        } else if (a->def.bit_size == 16) {
+                            alu16++;
+                        } else if (a->def.bit_size == 32) {
+                            alu32++;
+                        }
+                    } else if (instr->type == nir_instr_type_tex) {
+                        (nir_instr_as_tex(instr)->def.bit_size == 16 ? tex16 : tex32)++;
+                    }
+                }
+            }
+        }
+        cacheNote("nir " + name + ": arithmetic " + std::to_string(alu32) + " 32-bit and " + std::to_string(alu16) + " 16-bit, " + std::to_string(conv) +
+                  " conversions between widths, textures " + std::to_string(tex32) + " with a 32-bit result and " + std::to_string(tex16) + " with 16");
+    }
     switch (t.nir->info.stage) {
     case MESA_SHADER_VERTEX:
     case MESA_SHADER_FRAGMENT:
