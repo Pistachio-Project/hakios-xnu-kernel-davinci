@@ -140,6 +140,17 @@ choose_window(const struct payload_info *pi)
 				at = 0;
 			}
 		}
+		if (at == 0 && win_base + LOW_DMA_SIZE <= 0x100000000ULL && win_size > LOW_DMA_SIZE + RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE) {
+			/*
+			 * (the window itself starts under 4 GB and took all the free memory there, as on the SM7150 phones with
+			 * the window at 0xa2000000: its first LOW_DMA_SIZE bytes, claimed already, become the low memory, and the
+			 * kernel's RAM starts after them; both are multiples of BASE_ALIGN)
+			 */
+			at = win_base;
+			win_base += LOW_DMA_SIZE;
+			win_size -= LOW_DMA_SIZE;
+			print("low DMA memory carved from the window's start: kernel RAM now %x size %x\n", win_base, win_size);
+		}
 		low_dma = at;
 		print("low DMA memory %x\n", low_dma);
 	}

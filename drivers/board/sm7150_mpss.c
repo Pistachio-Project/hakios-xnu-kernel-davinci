@@ -81,13 +81,14 @@ static void ew_if_create(void);
 
 /*
  * The places that differ from phone to phone: the Pixel 4a's values (sm7150-google-sunfish.dts) unless the board's
- * wcn3990 { } says otherwise (wcn3990_board_setup). rmtfs: with no address of its own, from the loader's low DMA memory
- * (boot-arg lowdma=, 4 MiB on: RAM below 4 GiB that the kernel does not manage) when the board names a size.
+ * wcn3990 { } says otherwise (wcn3990_board_setup). rmtfs: the board's own address, else the loader's low DMA memory
+ * (boot-arg lowdma=, 4 MiB on: RAM below 4 GiB that the kernel does not manage); with neither, there is no buffer and
+ * the modem is not started (the Pixel 4a's 0xfde01000 was RAM of the kernel's own on the Mi 9T: the modem DMAed into it).
  */
 static uint32_t g_mpss_size = 0x9800000u;
 static uint64_t g_msa_addr = 0x98d00000ull;
 static uint32_t g_msa_size = 0x200000u;
-static uint64_t g_rmtfs_phys = 0xfde01000ull;
+static uint64_t g_rmtfs_phys;  /* 0 = none: the modem is not started (no address of any phone is assumed to be free RAM) */
 static uint64_t g_rmtfs_size = 0x600000ull;
 static const char *g_bdf_names[3] = { "bdwlan-sunfish.bin", NULL, NULL };
 static char g_bdf_override[48];
@@ -8450,6 +8451,10 @@ hakios_mpss_sm7150_start(void)
 	 * configd never took en0 up nor ran DHCP on it after a join (0 frames sent, no SIOCSIFFLAGS). The same as the
 	 * Galaxy S7 port's herolte_wifi_early() and apollo's (wardevsa/ios-a5xelte).
 	 */
+	if (g_rmtfs_phys == 0) {
+		hakios_say("mpss: REFUSED: no safe RMTFS buffer (need board.dts wcn3990 rmtfs=, or rmtfs-size= with the loader's lowdma=/lowdma_mb=); the modem is not started\n");
+		return;
+	}
 	ew_if_create();
 	started = true;
 	PE_parse_boot_argn("wlanprobe", &g_wlan_probe, sizeof(g_wlan_probe));
@@ -8531,6 +8536,10 @@ wcn3990_board_setup(void)
 		}
 	}
 	PE_parse_boot_argn("wlan_bdf", g_bdf_override, sizeof(g_bdf_override));
+	if (g_rmtfs_phys != 0) {
+		hakios_say("mpss: RMTFS buffer %#llx +%#llx is %s\n", g_rmtfs_phys, g_rmtfs_size,
+		    b->wcn3990.rmtfs ? "the board's own" : "in the loader's low DMA memory (kept from the kernel and UEFI)");
+	}
 	hakios_say("mpss: modem memory %#llx +%#x, MSA %#llx +%#x, RMTFS %#llx +%#llx, %u rails\n", MPSS_MEMORY, g_mpss_size,
 	    g_msa_addr, g_msa_size, g_rmtfs_phys, g_rmtfs_size, g_wlan_nrails);
 }

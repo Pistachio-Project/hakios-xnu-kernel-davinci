@@ -300,6 +300,19 @@ no_low_memory(void)
 	sound();
 }
 
+/* the SM7150 phones' map: the largest free block begins under 4 GB and takes all the memory there (Mi 9T: window 0xa2000000): the
+ * low memory comes from the window's start, and the window moves up behind it */
+static void
+window_under_4gb(void)
+{
+	range(EfiConventionalMemory, 0xa2000000ULL, 0xf0000000ULL);
+	low_status = EFI_ERROR_BIT | 9;
+	CHECK(choose() == 1 && low_dma == 0xa2000000ULL, "low memory is the block's first bytes: %#llx", (unsigned long long)low_dma);
+	CHECK(win_base == 0xa2000000ULL + LOW_DMA_SIZE && win_size == 0xf0000000ULL - win_base, "the window follows it: %#llx + %#llx",
+	    (unsigned long long)win_base, (unsigned long long)win_size);
+	CHECK((win_base & (BASE_ALIGN - 1)) == 0 && (win_size & (BASE_ALIGN - 1)) == 0, "still whole blocks");
+}
+
 /* "physbase" in the payload (a testing aid): the window is put there, whatever the map says */
 static void
 forced_base(void)
@@ -368,7 +381,7 @@ main(int argc, char **argv)
 		{ "phone_8gb", phone_8gb }, { "payload_near_the_end", payload_near_the_end }, { "ends_are_cut", ends_are_cut },
 		{ "more_than_the_kernel_takes", more_than_the_kernel_takes }, { "largest_free_range", largest_free_range },
 		{ "longer_descriptors", longer_descriptors }, { "nothing_free", nothing_free }, { "firmware_says_no", firmware_says_no },
-		{ "no_low_memory", no_low_memory }, { "forced_base", forced_base }, { "up_to_the_payload", up_to_the_payload },
+		{ "no_low_memory", no_low_memory }, { "window_under_4gb", window_under_4gb }, { "forced_base", forced_base }, { "up_to_the_payload", up_to_the_payload },
 		{ "payload_in_the_middle", payload_in_the_middle }, { "ends_in_the_payload", ends_in_the_payload }, { "memory_map_said", memory_map_said },
 	};
 
