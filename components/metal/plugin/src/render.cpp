@@ -2682,7 +2682,7 @@ bool gmemDrawOk(const Program& program, const RenderPass& pass, const Draw& draw
 }
 
 void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& plan, const std::vector<std::pair<uint64_t, uint32_t>>& bodies,
-                uint64_t table, const Options& o, uint32_t load, uint32_t store, bool fetch, uint32_t clear, const uint32_t (*clearWords)[4], uint64_t vsc) {
+                uint64_t table, const Options& o, uint32_t load, uint32_t store, bool fetch, uint32_t clear, const uint32_t (*clearWords)[4], uint64_t vsc, const BinTiming* timing) {
     const auto [W, H] = windowOf(pass);
     // the colour cache out of the tiles' way (it is not pipelined: after a WFI, as the sysmem value is written)
     stream.waitForIdle();
@@ -2866,7 +2866,23 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
                 event(stream, CACHE_INVALIDATE);
             }
             // (an IB2: the draws' words once in memory, not once a tile in the stream; IB2s, past what one IB_SIZE counts)
-            for (const auto& [at, words] : bodies) stream.indirect(at, words);
+            if (timing != nullptr && timing->tile == ty * plan.cols + tx) {
+                // the timed tile: each draw alone between two stamps of the always-on counter (CP_ALWAYS_ON_COUNTER)
+                auto stamp = [&](uint32_t slot) {
+                    const uint64_t at = timing->stamps + 8ull * slot;
+                    stream.waitForIdle();
+                    const uint32_t w[3] = {CP_REG_TO_MEM_0_REG(0x0980) | CP_REG_TO_MEM_0_CNT(2) | CP_REG_TO_MEM_0_64B, uint32_t(at), uint32_t(at >> 32)};
+                    stream.packet(CP_REG_TO_MEM, w, 3);
+                };
+                for (const auto& [at, words] : timing->prefix) stream.indirect(at, words);
+                for (const BinTiming::Interval& d : timing->draws) {
+                    stamp(uint32_t(2 * d.slot));
+                    for (const auto& [at, words] : d.runs) stream.indirect(at, words);
+                    stamp(uint32_t(2 * d.slot + 1));
+                }
+            } else {
+                for (const auto& [at, words] : bodies) stream.indirect(at, words);
+            }
             crumb(0x300 + ty * plan.cols + tx);
             // The command processor queues each tile's streams and lets one go only at this marker (tu6_render_tile's,
             // under hw binning): without it the third tile's CP_SET_BIN_DATA5 found the queue full and its draws hung
@@ -3267,6 +3283,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
         appendStream(stream_, open_->sysStream);
         open_->sysStream.clear();
         open_->bodies.clear();
+        open_->marks.clear();
         open_->dual = open_->gmem = false;
     }
     if (joins && open_->gmem && (!tileable || missed)) {
@@ -3547,6 +3564,13 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
         dt.pass = profiled_.empty() ? 0 : uint32_t(profiled_.size() - 1);
         render::drawArea(pass, d, dt.area);
         if (timed) dt.slot = int32_t(timedDraws_++);
+        // (a draw in tiles timed inside one bin: its start in the bodies, its slot; the name says which bin at closePass)
+        if (open_->gmem && binTime_ && timedDraws_ < kMaxProfiledDraws) {
+            dt.slot = int32_t(timedDraws_++);
+            open_->marks.emplace_back(uint32_t(into.size()), dt.slot);
+            dt.name = "[bin] " + dt.name;
+            binDraws_.push_back(drawsProfiled_.size());
+        }
         drawsProfiled_.push_back(dt);
         if (timed) drawStamp(uint32_t(2 * dt.slot));
     }
@@ -3853,8 +3877,49 @@ void CommandBuffer::closePass() {
         // than 2^20 words, which one IB2 ran modulo 2^20)
         std::vector<std::pair<uint64_t, uint32_t>> bodies;
         for (const auto& [first, words] : pm4::ibRuns(w)) bodies.emplace_back(ib.gpuAddress() + 4ull * first, words);
+        render::BinTiming timing;
+        if (!open_->marks.empty()) ensureDrawStamps();
+        if (!open_->marks.empty() && drawStamps_ != nullptr) {
+            timing.stamps = drawStamps_->gpuAddress();
+            timing.tile = (plan.rows / 2) * plan.cols + plan.cols / 2;
+            use(*drawStamps_, true);
+            auto runsOf = [&](uint32_t from, uint32_t to) {
+                std::vector<std::pair<uint64_t, uint32_t>> out;
+                const std::vector<uint32_t> part(w.begin() + from, w.begin() + to);
+                for (const auto& [first, words] : pm4::ibRuns(part)) out.emplace_back(ib.gpuAddress() + 4ull * (from + first), words);
+                return out;
+            };
+            const auto& m = open_->marks;
+            timing.prefix = runsOf(0, m[0].first);
+            for (size_t i = 0; i < m.size(); i++) {
+                const uint32_t to = i + 1 < m.size() ? m[i + 1].first : uint32_t(w.size());
+                timing.draws.push_back({m[i].second, runsOf(m[i].first, to)});
+            }
+            // (which bin, in the draws' names: the tile of the plan, of its tiles)
+            for (size_t k = binDraws_.size(); k-- > 0 && binDraws_[k] != ~size_t(0);) {
+                std::string& n = drawsProfiled_[binDraws_[k]].name;
+                if (n.compare(0, 6, "[bin] ") == 0) n = "[bin " + std::to_string(timing.tile) + "/" + std::to_string(plan.tiles()) + "] " + n.substr(6);
+                binDraws_[k] = ~size_t(0);
+            }
+        }
         render::encodeGmem(tiles, open_->pass, plan, bodies, open_->table, open_->options, load, store, open_->read != 0,
-                           open_->clears, open_->clearWords, vsc);
+                           open_->clears, open_->clearWords, vsc, timing.tile != ~0u ? &timing : nullptr);
+        {
+            // what the tiles load and store, in bytes (a whole tile grid's area: the bins' granules), and what a split pass stores
+            // for the draws that follow it
+            const uint64_t px = uint64_t(plan.area[2] - plan.area[0] + 1) * (plan.area[3] - plan.area[1] + 1);
+            for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
+                if (t == nullptr) continue;
+                const uint64_t b = px * t->info().bytesPerPixel;
+                if ((load >> i) & 1) counts_.gmemLoadBytes += b;
+                if ((store >> i) & 1) {
+                    counts_.gmemStoreBytes += b;
+                    if (open_->goesOn) counts_.splitStoreBytes += b;
+                }
+            }
+            if (open_->goesOn) counts_.splitPasses++;
+        }
         appendStream(stream_, tiles);
         counts_.gmemPasses++;
         if (vsc != 0) counts_.binnedPasses++;

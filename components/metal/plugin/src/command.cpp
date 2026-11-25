@@ -497,7 +497,7 @@ void CommandBuffer::stampEnd() {
     stamp(uint32_t(2 * (profiled_.size() - 1) + 1));
 }
 
-void CommandBuffer::drawStamp(uint32_t slot) {
+void CommandBuffer::ensureDrawStamps() {
     if (drawStamps_ == nullptr) {
         std::string why;
         drawStamps_ = queue_.takeBuffer(16 * kMaxProfiledDraws, &why);
@@ -508,6 +508,11 @@ void CommandBuffer::drawStamp(uint32_t slot) {
         memset(drawStamps_->contents(), 0, 16 * kMaxProfiledDraws);
         keep(drawStamps_);
     }
+}
+
+void CommandBuffer::drawStamp(uint32_t slot) {
+    ensureDrawStamps();
+    if (drawStamps_ == nullptr) return;
     const uint64_t at = drawStamps_->gpuAddress() + 8ull * slot;
     stream_.waitForIdle();
     const uint32_t w[3] = {a6xx::CP_REG_TO_MEM_0_REG(0x0980) | a6xx::CP_REG_TO_MEM_0_CNT(2) | a6xx::CP_REG_TO_MEM_0_64B, uint32_t(at),

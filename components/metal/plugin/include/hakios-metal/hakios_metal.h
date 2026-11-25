@@ -558,6 +558,10 @@ void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb *cb, int on);
 /* each draw of CB's sysmem passes timed alone (CommandBuffer::setProfileDraws, before anything is recorded) and, once it
  * has completed, draw I's program name (valid while CB lives) and microseconds; the count is returned, -1 past them */
 void hakios_metal_cb_set_profile_draws(hakios_metal_cb *cb, int on);
+/* with profile draws on: each draw of a GMEM pass timed inside the middle bin (names "[bin K/M] ..."), before anything is recorded */
+void hakios_metal_cb_set_bin_draw_time(hakios_metal_cb *cb, int on);
+/* bytes the GMEM passes loaded and stored (whole bins' granules), split passes (a draw the tiles could not replay ended the tiles) and what those stored */
+void hakios_metal_cb_gmem_bytes(hakios_metal_cb *cb, unsigned long long *load, unsigned long long *store, unsigned *split_passes, unsigned long long *split_store);
 int hakios_metal_cb_draw_time(hakios_metal_cb *cb, unsigned i, const char **name, double *us);
 /* draw I's pass (an index of hakios_metal_cb_pass_time's) and the pixels it can touch, X0 Y0 X1 Y1; -1 past them */
 int hakios_metal_cb_draw_place(hakios_metal_cb *cb, unsigned i, unsigned *pass, unsigned area[4]);

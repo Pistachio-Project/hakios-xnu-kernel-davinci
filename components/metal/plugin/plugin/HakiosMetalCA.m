@@ -6140,7 +6140,14 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_null_fs_textures(_cb, (hm_gmem_off() & 32) != 0);   /* 32: no texture reads, to time the shaders alone */
 		hakios_metal_cb_set_gmem_off(_cb, hm_gmem_off());
 		hakios_metal_cb_set_gmem_tuned(_cb, (hm_gmem_off() & 8) == 0);   /* metal_gmem_off's 8: GMEM wherever a pass can have it */
-		hakios_metal_cb_set_profile_draws(_cb, hm_fps_draws());
+		{
+			static unsigned drawTimeCount;
+			const unsigned every = hm_draw_time_every();
+			const BOOL sample = every != 0 && (++drawTimeCount % every) == 0;
+
+			hakios_metal_cb_set_profile_draws(_cb, hm_fps_draws_explicit() || sample);
+			hakios_metal_cb_set_bin_draw_time(_cb, sample);
+		}
 	}
 	_owesSlot = YES;
 	return self;
@@ -6636,12 +6643,14 @@ static struct {
 	unsigned presents, buffers;
 	double gpu, commit, latency, latencyMax;
 	unsigned passes, draws, dispatches, copies, gmemPasses, tiles;
+	unsigned long long gmemLoad, gmemStore, splitStore;   /* bytes the GMEM passes loaded and stored, and what the split ones stored */
+	unsigned splitPasses;
 	double shadowIn, shadowOut;   /* seconds in surface copies: taken from the surface, written back into it */
 	unsigned shadowIns, shadowOuts;
 	struct { unsigned kind, width, height, draws, tiles; double us; char why[96]; char detail[360]; } slowest[4];   /* the slowest passes of the period (WHY: a sysmem pass's reason) */
 	double passUs;                /* all passes timed, together */
 	char gmemWhy[160];            /* the last reason a pass stayed in sysmem */
-	struct { char name[96]; unsigned count; double us; } programs[48];   /* metal_fps=draws: GPU time by program */
+	struct { char name[96]; unsigned count; double us; double px; unsigned big; } programs[48];   /* metal_fps=draws: GPU time by program */
 	BOOL heavyShown;              /* metal_fps=draws: a heavy pass's draws printed this period */
 	/* the gaps between one commit and the next, where something moves (under 0.25 s): on time for 60 Hz (20 ms at
 	 * most), a frame missed (to 50), a stall (past 50) -- what a user sees as smooth or not, which the GPU's busy
@@ -6783,8 +6792,25 @@ hm_dirty_groups(void)
 }
 
 /* metal_fps=draws: each draw of a sysmem pass timed alone, by program (only sysmem passes are: without metal_gmem=1) */
+static unsigned
+hm_draw_time_every(void)
+{
+	static int n = -1;
+
+	if (n < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		n = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_draw_time=")) != NULL ? atoi(at + 16) : 0;
+		if (n < 0) n = 0;
+	}
+	return (unsigned)n;
+}
+
+/* (metal_draw_time=N also: the draws of every Nth buffer, GMEM passes' inside one bin, reported as metal_fps=draws reports them) */
 static BOOL
-hm_fps_draws(void)
+hm_fps_draws_explicit(void)
 {
 	static int on = -1;
 
@@ -6795,6 +6821,12 @@ hm_fps_draws(void)
 		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=draws") != NULL;
 	}
 	return on != 0;
+}
+
+static BOOL
+hm_fps_draws(void)
+{
+	return hm_fps_draws_explicit() || hm_draw_time_every() != 0;
 }
 
 /* boot-arg metal_gmem_off=N: GMEM's refinements off by the bits of N (hakios_metal_cb_set_gmem_off; 8: the choice of GMEM
@@ -6929,6 +6961,16 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 
 				hakios_metal_cb_gmem_counts(cb, &gp, &tl);
 				hm_fps.gmemPasses += gp;
+				{
+					unsigned long long lb = 0, sb = 0, ssb = 0;
+					unsigned sp = 0;
+
+					hakios_metal_cb_gmem_bytes(cb, &lb, &sb, &sp, &ssb);
+					hm_fps.gmemLoad += lb;
+					hm_fps.gmemStore += sb;
+					hm_fps.splitPasses += sp;
+					hm_fps.splitStore += ssb;
+				}
 				{
 					unsigned bn = 0;
 					int ok = 1;
@@ -7072,6 +7114,15 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				}
 				hm_fps.programs[k].count++;
 				hm_fps.programs[k].us += us;
+				{
+					unsigned pass, area[4];
+
+					if (hakios_metal_cb_draw_place(cb, i, &pass, area) > (int)i && area[2] >= area[0] && area[3] >= area[1]) {
+						const double px = (area[2] - area[0] + 1.0) * (area[3] - area[1] + 1.0);
+						hm_fps.programs[k].px += px;
+						if (px >= 740000) hm_fps.programs[k].big++;   /* (half of an 828x1792 screen or more) */
+					}
+				}
 			}
 			/* metal_fps=timeline: a heavy buffer's every pass, the first 80 such buffers (metal_timeline_from=SECONDS: from
 			 * so long after the first buffer timed, past the lock screen's say) */
@@ -7212,6 +7263,10 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			hm_print("fps: ... GMEM passes binned by the hardware (VSC): %u of %.0f in this window; binning %s\n", hm_fps.binnedPasses,
 				 hm_fps.gmemPasses * 1.0, hm_fps.binningOff ? "TURNED OFF for the queue by a visibility stream overrun: every draw is replayed in every tile" : "on");
 			hm_fps.binnedPasses = 0;
+			hm_print("fps: ... GMEM traffic in this window: %.1f MB loaded, %.1f MB stored by the tiles; %u split passes (a draw the tiles could not replay) stored %.1f MB of that\n",
+				 hm_fps.gmemLoad / 1e6, hm_fps.gmemStore / 1e6, hm_fps.splitPasses, hm_fps.splitStore / 1e6);
+			hm_fps.gmemLoad = hm_fps.gmemStore = hm_fps.splitStore = 0;
+			hm_fps.splitPasses = 0;
 		}
 		{
 			static unsigned windows;
@@ -7358,8 +7413,10 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			if (best < 0) {
 				break;
 			}
-			hm_print("fps: ... draws of %s: %u, %.2f ms on the GPU (%.0f us each)\n", hm_fps.programs[best].name,
-				 hm_fps.programs[best].count, hm_fps.programs[best].us / 1e3, hm_fps.programs[best].us / hm_fps.programs[best].count);
+			hm_print("fps: ... %s of %s: %u, %.2f ms on the GPU (%.0f us each; %u of half the screen or more, %.0f px a draw)\n",
+				 strncmp(hm_fps.programs[best].name, "[bin", 4) == 0 ? "slow draws, one bin," : "draws", hm_fps.programs[best].name,
+				 hm_fps.programs[best].count, hm_fps.programs[best].us / 1e3, hm_fps.programs[best].us / hm_fps.programs[best].count,
+				 hm_fps.programs[best].big, hm_fps.programs[best].px / hm_fps.programs[best].count);
 			hm_fps.programs[best].count = 0;
 		}
 		memset(hm_fps.programs, 0, sizeof(hm_fps.programs));

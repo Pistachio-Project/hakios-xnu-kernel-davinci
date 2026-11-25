@@ -161,7 +161,7 @@ public:
     // What the buffer holds, counted as it is recorded: passes opened (each a pass start, its flushes and the wait for
     // idle at its tail, which is a fixed cost whatever is drawn), the draws in them, and dispatches, copies and clears
     // (each a pass of its own). What a frame's GPU time goes to is read off these beside the time (metal_fps).
-    struct Counts { uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0; };   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
+    struct Counts { uint64_t gmemLoadBytes = 0, gmemStoreBytes = 0, splitStoreBytes = 0; uint32_t splitPasses = 0; uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0; };   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
     bool queueBinningOk() const;
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
@@ -187,6 +187,10 @@ public:
     struct DrawTime { std::string name; double us; uint32_t pass = 0, area[4] = {}; int32_t slot = -1; };
     static constexpr uint32_t kMaxProfiledDraws = 512;
     void setProfileDraws(bool on) { profileDraws_ = on; }
+    // With profileDraws on as well: each draw of a GMEM pass timed inside ONE bin (the middle one: a wait for idle and the
+    // counter before and after each draw of that tile, the other tiles untouched), its DrawTime named "[bin K/M] ..."
+    // with that bin's microseconds. metal_draw_time=N of the plug-in
+    void setBinDrawTime(bool on) { binTime_ = on; }
     std::vector<DrawTime> drawTimes() const;
     // render::Options::gmem for this buffer's draws besides each draw's own (both must allow it): the C API's switch
     void setGmem(bool on) { gmem_ = on; }
@@ -270,7 +274,10 @@ private:
     bool profile_ = false;
     bool tuning_ = false;     // setGmemTuned's (cleared by a failed stamp buffer too)
     bool profileDraws_ = false;
+    bool binTime_ = false;
+    void ensureDrawStamps();
     std::vector<DrawTime> drawsProfiled_;
+    std::vector<size_t> binDraws_;   // drawsProfiled_ indexes of bin-timed draws not yet named by their bin
     uint32_t timedDraws_ = 0;   // (drawsProfiled_ with stamps: the next one's slot)
     std::shared_ptr<Buffer> drawStamps_;
     void drawStamp(uint32_t slot);
@@ -407,6 +414,7 @@ private:
         uint32_t clearWords[kMaxColorOutputs][4] = {};
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
         uint32_t ordinal = 0, draws = 0;
+        std::vector<std::pair<uint32_t, int32_t>> marks;   // metal_draw_time: the bodies word each timed draw starts at, and its stamp slot
         uint32_t fetches = 0;       // its draws that read their attachments (a framebuffer fetch): gmemWeight
         uint32_t missed = 0;        // attachments a draw needed that the plan had no bin for (GmemPlan::unplanned): it ended here
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)

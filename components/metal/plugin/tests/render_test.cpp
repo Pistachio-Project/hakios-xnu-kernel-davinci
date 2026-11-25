@@ -4535,6 +4535,22 @@ TEST(a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_bef
     CHECK(g->status() == CommandBuffer::kCompleted);
     if (g->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", g->error().c_str(), r.fake->stats().lastFault.c_str());
     CHECK_EQ(g->counts().gmemPasses, 1u);
+    // metal_draw_time: the same two draws timed inside the one bin, each between two stamps
+    {
+        auto tb = r.queue->commandBuffer();
+        tb->setProfileDraws(true);
+        tb->setBinDrawTime(true);
+        CHECK(tb->draw(fb, pass, wholeDraw(6), Bindings{}, Bindings{}));
+        CHECK(tb->draw(fb, pass, wholeDraw(6), Bindings{}, Bindings{}));
+        tb->commit();
+        tb->waitUntilCompleted();
+        CHECK(tb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(tb->counts().gmemPasses, 1u);
+        const auto times = tb->drawTimes();
+        CHECK_EQ(times.size(), size_t(2));
+        for (const auto& t : times) CHECK(t.name.compare(0, 5, "[bin ") == 0 && t.us > 0);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+    }
     const auto gd = r.fake->memory(r.fake->stats().lastDraw.fsTexConst, 64);
     uint32_t gw[16] = {};
     if (gd.size() == 64) memcpy(gw, gd.data(), 64);

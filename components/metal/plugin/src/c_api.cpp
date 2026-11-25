@@ -1053,6 +1053,20 @@ void hakios_metal_cb_set_profile_draws(hakios_metal_cb* cb, int on) {
     cb->cb->setProfileDraws(on != 0);
 }
 
+void hakios_metal_cb_set_bin_draw_time(hakios_metal_cb* cb, int on) {
+    if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, on] { cb->cb->setBinDrawTime(on != 0); });
+    cb->cb->setBinDrawTime(on != 0);
+}
+
+void hakios_metal_cb_gmem_bytes(hakios_metal_cb* cb, unsigned long long* load, unsigned long long* store, unsigned* splitPasses, unsigned long long* splitStore) {
+    syncOne(cb);
+    const auto& c = cb->cb->counts();
+    if (load) *load = c.gmemLoadBytes;
+    if (store) *store = c.gmemStoreBytes;
+    if (splitPasses) *splitPasses = c.splitPasses;
+    if (splitStore) *splitStore = c.splitStoreBytes;
+}
+
 int hakios_metal_cb_draw_place(hakios_metal_cb* cb, unsigned i, unsigned* pass, unsigned area[4]) {
     syncOne(cb);
     if (cb->drawTimes.empty()) cb->drawTimes = cb->cb->drawTimes();
