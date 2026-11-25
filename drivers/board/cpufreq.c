@@ -498,8 +498,16 @@ static struct gov_group {
 	uint32_t rows, khz[GOV_ROWS], top, row, down_looks, down_most;
 	uint32_t cores;                 /* the kernel's cores in it, by cpu number */
 	uint64_t looks_at[GOV_ROWS];    /* (for the log: how many looks at each row) */
+	/* pm_gov=1 (below): */
+	uint32_t cap;                   /* the thermal limiter's row, the most that may be asked (thermal=2) */
+	uint32_t want;                  /* what the load asks for, before the caps */
+	bool foreign;                   /* a core of the group is the boot loader's: the load of it is not seen */
+	uint64_t boosts, looks_pm;
 } gov[CPUFREQ_GROUPS];
 static bool gov_on;
+
+static LCK_GRP_DECLARE(gov_lock_group, "hakios-cpugov");
+static LCK_MTX_DECLARE(gov_lock, &gov_lock_group);
 
 static void
 gov_set(struct gov_group *g, uint32_t row)
@@ -508,6 +516,88 @@ gov_set(struct gov_group *g, uint32_t row)
 		vote(g->base, (uint32_t)(g - gov), row);
 		g->row = row;
 	}
+}
+
+/*
+ * POWER MANAGEMENT, phase 2 (boot-arg pm_gov=1; default 0: the governor above, or the top rows). The same look every PARK_MS (and
+ * every PM_SCREEN_OFF_MS with the screen off) asks for what schedutil asks: the frequency the busiest core of the group needs at
+ * its current speed with a quarter to spare, at once when it is more, and, when it is less, only after PM_DOWN_LOOKS looks
+ * and then half of the way down (a gentle ramp down, so that a frame after a quiet look does not find the clock at the floor). On top:
+ *
+ *   - a touch (hakios_touch_last, input.c: every sample of /dev/hakios-touch) holds each group at no less than pm_boost_pct (default
+ *     60) of its top frequency for pm_boost_ms (default 120), as Android's input boost does: the first frame after a touch is
+ *     the one the finger sees;
+ *   - a group whose busiest core is over PM_JUMP_BUSY goes to its top row (the interactive governor's "go hispeed");
+ *   - a group with a core of the boot loader's (the small cores' group: core 0 serves the flash while the kernel runs and its load is not
+ *     seen) is held at no less than pm_foreign_pct (default 45) of its top frequency;
+ *   - the thermal limiter (thermal=2) no longer writes the rows: it hands its row to hakios_cpufreq_pm_cap() as the most allowed;
+ *   - the screen off (pm_screen=1, below) caps the groups.
+ * Every 5 s a line "pm: gov" with the share of the looks each group spent at each frequency, its mean frequency, the boosts.
+ * Without a current sensor in the kernel the mean frequency and the share of the time at the low rows are the numbers to compare
+ * runs by, with the temperature lines of thermal.c ("tl: h").
+ */
+#define PM_DOWN_LOOKS           6
+#define PM_JUMP_BUSY            85
+#define PM_SCREEN_OFF_MS        25
+extern bool hakios_ddr_pm_on(void);
+extern void hakios_ddr_pm_look(uint32_t mean, uint32_t big, bool touch, bool gpu);
+extern uint32_t hakios_adreno_idle_ms(void);
+static bool pm_ddr_on;                  /* pm_ddr=1 and the vote was made (ddr.c) */
+static bool pm_gov;
+static uint32_t pm_boost_pct = 60, pm_boost_ms = 120, pm_foreign_pct = 45;
+extern uint64_t hakios_touch_last;      /* input.c */
+static volatile bool pm_screen_off;     /* pm_screen=1 and the display is dark (hakios_cpufreq_screen()) */
+static uint64_t pm_boost_until;         /* (absolute time) a boost asked for by hakios_cpufreq_screen(), on the screen's coming on */
+static uint32_t pm_screen_mode;         /* boot-arg pm_screen */
+
+/* the lowest row of the group whose frequency is at least PCT percent of its top */
+static uint32_t
+pm_row_at_pct(const struct gov_group *g, uint32_t pct)
+{
+	uint32_t row = 0;
+
+	while (row < g->top && (uint64_t)g->khz[row] * 100 < (uint64_t)g->khz[g->top] * pct) {
+		row++;
+	}
+	return row;
+}
+
+/* what is applied: the want, held to the caps (the thermal limiter's, the screen's) and lifted to the floors (touch, foreign core) */
+static void
+pm_apply(struct gov_group *g, bool boosted)
+{
+	uint32_t d = (uint32_t)(g - gov), row = g->want, cap = MIN(g->cap, g->top);
+
+	if (boosted) {
+		row = MAX(row, pm_row_at_pct(g, pm_boost_pct));
+	}
+	if (g->foreign) {
+		row = MAX(row, pm_row_at_pct(g, pm_foreign_pct));
+	}
+	if (pm_screen_off) {
+		/* the dark display: the big cores' group at its lowest row, the small cores' at half of its top at most */
+		cap = MIN(cap, d == 0 ? pm_row_at_pct(g, 50) : 0);
+		row = MIN(row, cap);
+	}
+	row = MIN(row, cap);
+	gov_set(g, row);
+}
+
+/* the thermal limiter's way in (thermal.c apply()): true when the governor takes the row as a cap, false: write it yourself */
+bool
+hakios_cpufreq_pm_cap(uint32_t domain, uint32_t row)
+{
+	struct gov_group *g;
+
+	if (!pm_gov || !gov_on || domain >= CPUFREQ_GROUPS || gov[domain].base == 0) {
+		return false;
+	}
+	g = &gov[domain];
+	lck_mtx_lock(&gov_lock);
+	g->cap = row;
+	pm_apply(g, false);
+	lck_mtx_unlock(&gov_lock);
+	return true;
 }
 
 /* the groups the kernel has every core of: their tables, and the governor on (cpufreq=1 has raised them) */
@@ -520,6 +610,15 @@ gov_start(void)
 
 	PE_parse_boot_argn("cpu_gov", &on, sizeof(on));
 	PE_parse_boot_argn("thermal", &thermal, sizeof(thermal));
+	PE_parse_boot_argn("pm_gov", &pm_gov, sizeof(pm_gov));
+	PE_parse_boot_argn("pm_boost_pct", &pm_boost_pct, sizeof(pm_boost_pct));
+	PE_parse_boot_argn("pm_boost_ms", &pm_boost_ms, sizeof(pm_boost_ms));
+	PE_parse_boot_argn("pm_foreign_pct", &pm_foreign_pct, sizeof(pm_foreign_pct));
+	PE_parse_boot_argn("pm_screen", &pm_screen_mode, sizeof(pm_screen_mode));
+	if (pm_gov) {
+		on = 1;
+		thermal = 0;            /* (the limiter hands its rows over: hakios_cpufreq_pm_cap()) */
+	}
 	if (!on || thermal >= 2) {
 		printf("cpufreq: every group at its top row (%s)\n", !on ? "cpu_gov=0" : "thermal=2 holds them back itself");
 		return;
@@ -536,9 +635,11 @@ gov_start(void)
 		struct gov_group *g = &gov[d];
 		uint32_t top_khz = 0;
 
-		if (had[d] == 0 || had[d] != board->cpufreq.domain_cores[d]) {
+		if (had[d] == 0 || (had[d] != board->cpufreq.domain_cores[d] && !pm_gov)) {
 			continue;               /* (none of ours, or a core of the loader's in it) */
 		}
+		g->foreign = had[d] != board->cpufreq.domain_cores[d];
+		g->cap = UINT32_MAX;
 		g->base = domain_map(d);
 		if (g->base == 0) {
 			continue;               /* (not the hardware's: raise_domain() has said so) */
@@ -555,9 +656,10 @@ gov_start(void)
 		g->top = g->rows - 1;
 		/* (an index into khz[] and looks_at[]: never past the table, whatever the register reads; Linux bounds it too) */
 		g->row = MIN(rd(g->base + layout->perf_state), g->top);
+		g->want = g->row;
 		gov_on = true;
-		printf("cpufreq: group %u (cores %#x) by its load: %u rows, %u to %u MHz\n", d, g->cores, g->rows, g->khz[0] / 1000,
-		    g->khz[g->top] / 1000);
+		printf("cpufreq: group %u (cores %#x) by its load%s: %u rows, %u to %u MHz%s\n", d, g->cores, pm_gov ? " (pm_gov=1)" : "",
+		    g->rows, g->khz[0] / 1000, g->khz[g->top] / 1000, g->foreign ? ", a core of the loader's: held at no less than pm_foreign_pct" : "");
 	}
 }
 
@@ -600,6 +702,147 @@ gov_look(const uint32_t *busy)
 	}
 }
 
+/* pm_gov=1: a look (see above). NOW is mach_absolute_time(). */
+static void
+gov_look_pm(const uint32_t *busy, uint64_t now)
+{
+	uint64_t boost_ticks;
+	bool boosted;
+
+	nanoseconds_to_absolutetime((uint64_t)pm_boost_ms * NSEC_PER_MSEC, &boost_ticks);
+	boosted = (hakios_touch_last != 0 && now - hakios_touch_last < boost_ticks) || now < pm_boost_until;
+	lck_mtx_lock(&gov_lock);
+	for (uint32_t d = 0; d < CPUFREQ_GROUPS; d++) {
+		struct gov_group *g = &gov[d];
+		uint32_t most = 0, want, need;
+
+		if (g->base == 0) {
+			continue;
+		}
+		for (unsigned int i = 0; i < 32; i++) {
+			if ((g->cores >> i) & 1) {
+				most = MAX(most, busy[i]);
+			}
+		}
+		/* what the busiest core did, at the speed it ran at (the speed asked for: caps may have kept it lower), with room to spare */
+		need = (uint32_t)((uint64_t)g->khz[g->row] * most * GOV_HEADROOM_PCT / 10000);
+		for (want = 0; want < g->top && g->khz[want] < need; want++) {
+		}
+		if (most >= PM_JUMP_BUSY) {
+			want = g->top;
+		}
+		if (want >= g->want) {
+			g->want = want;
+			g->down_looks = 0;
+			g->down_most = 0;
+		} else {
+			g->down_most = MAX(g->down_most, want);
+			if (++g->down_looks >= PM_DOWN_LOOKS) {
+				/* half of the way down to what the last looks asked for at most */
+				g->want = g->want - MAX(1u, (g->want - g->down_most) / 2);
+				g->down_looks = 0;
+				g->down_most = 0;
+			}
+		}
+		if (boosted && g->row < pm_row_at_pct(g, pm_boost_pct)) {
+			g->boosts++;
+		}
+		pm_apply(g, boosted);
+		g->looks_at[g->row]++;
+		g->looks_pm++;
+	}
+	lck_mtx_unlock(&gov_lock);
+}
+
+/* the 5 s line of pm_gov: each group's share of the looks by frequency, its mean, the boosts; the counters start again */
+static void
+gov_report_pm(void)
+{
+	char line[420];
+	size_t at = 0;
+
+	for (uint32_t d = 0; d < CPUFREQ_GROUPS && at < sizeof(line) - 100; d++) {
+		struct gov_group *g = &gov[d];
+		uint64_t sum = 0, khz_sum = 0;
+
+		if (g->base == 0 || g->looks_pm == 0) {
+			continue;
+		}
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " g%u:", d);
+		for (uint32_t r = 0; r < g->rows; r++) {
+			sum += g->looks_at[r];
+			khz_sum += g->looks_at[r] * g->khz[r];
+		}
+		for (uint32_t r = 0; r < g->rows && sum != 0 && at < sizeof(line) - 40; r++) {
+			if (g->looks_at[r] * 100 / sum != 0) {
+				at += (size_t)snprintf(line + at, sizeof(line) - at, " %u=%llu%%", g->khz[r] / 1000, g->looks_at[r] * 100 / sum);
+			}
+		}
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " mean %llu MHz, boosted looks %llu%s;", sum ? khz_sum / sum / 1000 : 0,
+		    g->boosts, g->foreign ? " (floor: loader's core)" : "");
+		memset(g->looks_at, 0, sizeof(g->looks_at));
+		g->boosts = g->looks_pm = 0;
+	}
+	tell("pm: gov (MHz=share of looks):%s screen %s\n", line, pm_screen_off ? "OFF" : "on");
+}
+
+/*
+ * PHASE 5 (boot-arg pm_screen=1): the display's state, from the sysctl hw.backlight.power (backlight.c): 0 is dark. Dark:
+ * the clocks capped (pm_apply: the big cores' group at its lowest row, the small cores' at half of its top, whatever the load
+ * asks), the scheduler given the small cores only (the park thread), the memory vote at its lowest and the GPU at its lowest
+ * level (ddr.c, adreno.c), the park thread looking every PM_SCREEN_OFF_MS instead of PARK_MS. Lit again: every cap off, each group
+ * asked for its top row at once and held up for 300 ms, all the cores recommended, the memory at its top -- before the sysctl
+ * returns, so the first frame finds the machine ready. Needs pm_gov=1 for the processors' part, pm_ddr=1 and pm_gpu=1 for the others.
+ */
+extern void hakios_ddr_pm_screen(bool off);
+extern void hakios_adreno_pm_screen(bool off);
+static uint32_t park_all, park_big;
+static uint64_t screen_off_since;
+
+void hakios_pm_screen(bool off);
+void
+hakios_pm_screen(bool off)
+{
+	uint64_t now = mach_absolute_time(), ticks, since;
+
+	if (pm_screen_mode == 0 || off == pm_screen_off) {
+		return;
+	}
+	if (off) {
+		pm_screen_off = true;
+		screen_off_since = now;
+		lck_mtx_lock(&gov_lock);
+		for (uint32_t d = 0; pm_gov && gov_on && d < CPUFREQ_GROUPS; d++) {
+			if (gov[d].base != 0) {
+				pm_apply(&gov[d], false);
+			}
+		}
+		lck_mtx_unlock(&gov_lock);
+		hakios_ddr_pm_screen(true);
+		hakios_adreno_pm_screen(true);
+		tell("pm: screen: dark: the clocks capped, the small cores only, the memory and the GPU at their lowest\n");
+		return;
+	}
+	nanoseconds_to_absolutetime(300 * NSEC_PER_MSEC, &ticks);
+	pm_boost_until = now + ticks;
+	pm_screen_off = false;
+	lck_mtx_lock(&gov_lock);
+	for (uint32_t d = 0; pm_gov && gov_on && d < CPUFREQ_GROUPS; d++) {
+		if (gov[d].base != 0) {
+			gov[d].want = gov[d].top;
+			pm_apply(&gov[d], true);
+		}
+	}
+	lck_mtx_unlock(&gov_lock);
+	if (park_big != 0 && park_big != park_all) {
+		sched_perfcontrol_update_recommended_cores(park_all);
+	}
+	hakios_ddr_pm_screen(false);
+	hakios_adreno_pm_screen(false);
+	absolutetime_to_nanoseconds(now - screen_off_since, &since);
+	tell("pm: screen: lit again after %llu ms: top rows asked for, every core recommended\n", since / NSEC_PER_MSEC);
+}
+
 /* (every way back to the loader, interrupts off: each governed group at its top row again) */
 static void
 gov_quiesce(void)
@@ -616,7 +859,7 @@ static void
 park_thread(void *arg __unused, wait_result_t wr __unused)
 {
 	const ml_topology_info_t *topology = ml_get_topology_info();
-	uint64_t idle_before[MAX_CPUS] = { 0 }, then = mach_absolute_time(), said = then, ten;
+	uint64_t idle_before[MAX_CPUS] = { 0 }, then = mach_absolute_time(), said = then, said_pm = then, ten;
 	uint32_t big = 0, all = 0, calm = 0;
 	bool parked;
 
@@ -627,8 +870,14 @@ park_thread(void *arg __unused, wait_result_t wr __unused)
 		}
 	}
 	const bool parking = park_wanted && big != all && big != 0;
+	bool screen_seen = false;
 
-	if (!parking && !gov_on) {
+	pm_ddr_on = hakios_ddr_pm_on();
+
+	park_all = all;
+	park_big = big;
+
+	if (!parking && !gov_on && !pm_screen_mode && !pm_ddr_on) {
 		return;
 	}
 	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &ten);
@@ -642,7 +891,7 @@ park_thread(void *arg __unused, wait_result_t wr __unused)
 		uint64_t now, least = 100;
 		uint32_t busy_of[32] = { 0 };
 
-		delay_for_interval(PARK_MS, NSEC_PER_MSEC);
+		delay_for_interval(pm_screen_off ? PM_SCREEN_OFF_MS : PARK_MS, NSEC_PER_MSEC);
 		now = mach_absolute_time();
 		for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS && i < 32; i++) {
 			uint64_t idle = 0, busy;
@@ -659,11 +908,38 @@ park_thread(void *arg __unused, wait_result_t wr __unused)
 		}
 		then = now;
 		park_stat.looks++;
-		if (gov_on) {
+		if (pm_ddr_on) {
+			uint32_t sum = 0, cores = 0, big_most = 0, idle_ms = hakios_adreno_idle_ms();
+			uint64_t touch_ticks;
+
+			for (unsigned int i = 0; i < topology->num_cpus && i < 32; i++) {
+				sum += busy_of[i];
+				cores++;
+				if ((big >> i) & 1) {
+					big_most = MAX(big_most, busy_of[i]);
+				}
+			}
+			nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &touch_ticks);
+			hakios_ddr_pm_look(cores ? sum / cores : 0, big_most, hakios_touch_last != 0 && now - hakios_touch_last < touch_ticks,
+			    idle_ms < 100);
+		}
+		if (pm_screen_off != screen_seen) {
+			screen_seen = pm_screen_off;
+			if (screen_seen && big != 0 && big != all) {
+				sched_perfcontrol_update_recommended_cores(all & ~big);
+			} else if (!screen_seen && big != 0 && big != all) {
+				sched_perfcontrol_update_recommended_cores(all);
+				parked = false;
+				calm = 0;
+			}
+		}
+		if (gov_on && pm_gov) {
+			gov_look_pm(busy_of, now);
+		} else if (gov_on) {
 			gov_look(busy_of);
 		}
-		if (!parking) {
-			/* (no parking: the governor alone) */
+		if (!parking || screen_seen) {
+			/* (no parking: the governor alone; the screen dark: the small cores, as set above) */
 		} else if (parked && least >= park_busy) {
 			sched_perfcontrol_update_recommended_cores(all);
 			parked = false;
@@ -676,6 +952,10 @@ park_thread(void *arg __unused, wait_result_t wr __unused)
 				parked = true;
 				park_stat.parks++;
 			}
+		}
+		if (pm_gov && gov_on && now - said_pm >= ten / 2) {
+			gov_report_pm();
+			said_pm = now;
 		}
 		if (now - said >= ten) {
 			char rows[96] = "";
@@ -717,7 +997,7 @@ park_start(void)
 
 	PE_parse_boot_argn("park_small", &on, sizeof(on));
 	park_wanted = on != 0;
-	if ((park_wanted || gov_on) && kernel_thread_start(park_thread, NULL, &thread) == KERN_SUCCESS) {
+	if ((park_wanted || gov_on || pm_screen_mode || hakios_ddr_pm_on()) && kernel_thread_start(park_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
 }
@@ -740,6 +1020,7 @@ hakios_cpufreq_init(void)
 
 	hakios_cpuload_start();
 	hakios_pm_idle_init();          /* (boot-arg pm_idle=: the cores' idle states; arch/arm64/kernel/cpu_idle.c) */
+	PE_parse_boot_argn("pm_screen", &pm_screen_mode, sizeof(pm_screen_mode));
 	PE_parse_boot_argn("cpufreq", &enabled, sizeof(enabled));
 	if (CONFIG_QCOM_DDR_VOTE) {
 		hakios_ddr_init(enabled != 0);  /* (the memory first, as before: bsd/dev/board/ddr.c) */
