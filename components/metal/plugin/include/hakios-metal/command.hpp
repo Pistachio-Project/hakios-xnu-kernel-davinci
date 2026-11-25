@@ -478,6 +478,9 @@ private:
     // and after the driver's call), the handlers began; and the kernel's own times for the fence
     int64_t commitCalledAt_ = 0, submitCallAt_ = 0, submitReturnAt_ = 0, handlersAt_ = 0;
     HakiosFenceTimes kernelTimes_{};
+    int64_t prevFinishFrom_ = 0, prevFinishTo_ = 0;   // when the waiter was busy finishing the buffer before this one (handlers, slabs)
+    struct PassEnd { uint32_t words, draws; };
+    std::vector<PassEnd> passEnds_;                  // where each closed pass ends in stream_, and the draws up to there (submit's slices)
     bool haveKernelTimes_ = false;
 public:
     int64_t nowNs() const;   // the driver's clock, ns
@@ -485,7 +488,7 @@ public:
     // ms: commit call to the submission's entry; entry to the driver call (the stream copied); the driver call; in the kernel before
     // the ring write (lock and cache flush); the ring write; ring to the core's start; the core's time; the core's end to the interrupt;
     // the interrupt to the waiter's return; the waiter to the handlers. 10 numbers; false when the kernel's times are not known
-    bool pathHops(double out[12]) const;   // (10 hops, then the submissions ahead in the ring and of those another program's)
+    bool pathHops(double out[13]) const;   // (10 hops, then the submissions ahead in the ring and of those another program's)
 private:
 };
 
@@ -591,6 +594,8 @@ private:
     std::unordered_map<uint64_t, std::vector<std::shared_ptr<Buffer>>> freeBuffers_;   // by size: giveSlabs', giveBuffer's
     uint64_t freeBytes_ = 0;
     unsigned inflightLimit_ = 0;
+    unsigned splitDraws_ = 0;                  // HAKIOS_METAL_SPLIT_DRAWS: a buffer's passes given to the GPU in slices of about this many draws
+    int64_t finishFrom_ = 0, finishTo_ = 0;    // the waiter's last finish() (the next buffer's notice waits behind it)
     struct Resident { std::vector<uint32_t> words; std::shared_ptr<Buffer> buffer; };
     std::unordered_multimap<const uint32_t*, Resident> resident_;   // (under lock_) programBuffer's
     uint64_t residentBytes_ = 0;

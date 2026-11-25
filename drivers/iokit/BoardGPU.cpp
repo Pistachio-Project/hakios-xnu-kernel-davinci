@@ -71,6 +71,7 @@ bool hakios_gpu_done(uint32_t fence);
 bool hakios_gpu_irq_on(void);
 void hakios_gpu_noticed(uint32_t fence);
 extern "C" void hakios_gpu_irq_wake(void);
+extern "C" void hakios_gpu_irq_wake_fence(uint32_t fence);
 uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
@@ -297,12 +298,21 @@ static struct {
  * 1 (default): asleep until the core's interrupt wakes it (or, with no interrupt, 200 us); 2: asleep 200 us.
  */
 static TUNABLE(uint32_t, gGPUWaitMode, "gpu_wait", 1);
+#define GPU_FENCE_EVENTS 16
+static int gGPUFenceEvents[GPU_FENCE_EVENTS];   /* the events a wait sleeps on, one for each fence modulo 16: the interrupt wakes the fences it finds done, not every waiter of every program */
 static int gGPUFenceEvent;                      /* the event a wait sleeps on; the core's interrupt wakes it */
 
 extern "C" void
 hakios_gpu_irq_wake(void)
 {
 	thread_wakeup((event_t) &gGPUFenceEvent);
+}
+
+/* The core's interrupt found submission `fence` done: its waiters (and those of others on the same event: fence modulo 16) wake. */
+extern "C" void
+hakios_gpu_irq_wake_fence(uint32_t fence)
+{
+	thread_wakeup((event_t) &gGPUFenceEvents[fence % GPU_FENCE_EVENTS]);
 }
 
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
@@ -329,7 +339,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 			delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
 		} else {
 			/* asleep: the wait is put down first and the core looked at again, so that an interrupt in between is not lost */
-			assert_wait_timeout((event_t) &gGPUFenceEvent, THREAD_UNINT, (gGPUWaitMode == 1 && hakios_gpu_irq_on()) ?
+			assert_wait_timeout((event_t) &gGPUFenceEvents[fence % GPU_FENCE_EVENTS], THREAD_UNINT, (gGPUWaitMode == 1 && hakios_gpu_irq_on()) ?
 			    GPU_IRQ_BACKSTOP_US : GPU_ASK_AGAIN_US, NSEC_PER_USEC);
 			if (hakios_gpu_done(fence)) {
 				clear_wait(current_thread(), THREAD_AWAKENED);

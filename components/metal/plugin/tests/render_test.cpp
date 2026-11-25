@@ -6558,3 +6558,29 @@ TEST(a_tracked_draws_groups_are_written_where_their_registers_always_were) {
     CHECK(link < rast && rast < view && view < blend && blend < draw);
     CHECK(vsCtrl < fsCtrl && fsCtrl < link);
 }
+
+// HAKIOS_METAL_SPLIT_DRAWS: a buffer of several passes given to the GPU in slices, one submission each, comes out as it does whole
+TEST(a_command_buffer_given_in_slices_draws_what_it_does_whole) {
+    setenv("HAKIOS_METAL_SPLIT_DRAWS", "1", 1);
+    Rig r;
+    unsetenv("HAKIOS_METAL_SPLIT_DRAWS");
+    auto t = target(r);
+    auto u = target(r);
+    seed(*t);
+    seed(*u);
+    render::Options sysmem;
+    sysmem.gmem = false;
+    RenderPass a = clearPass(t.get(), 0.25, 0.5, 0.75, 1.0), b = clearPass(u.get(), 1.0, 0.0, 0.0, 1.0);
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}, sysmem));
+    CHECK(cb->draw(flatProgram(), b, wholeDraw(), Bindings{}, Bindings{}, sysmem));
+    CHECK(cb->draw(flatProgram(), a, wholeDraw(), Bindings{}, Bindings{}, sysmem));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const uint8_t first[4] = {64, 128, 191, 255}, second[4] = {255, 0, 0, 255};
+    CHECK(allPixels(*t, first, 4));
+    CHECK(allPixels(*u, second, 4));
+    CHECK(r.fake->stats().submits >= 3u);   // (one a slice: three passes of one draw each)
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}

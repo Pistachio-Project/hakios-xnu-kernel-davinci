@@ -732,6 +732,10 @@ std::shared_ptr<CommandQueue> CommandQueue::make(Gpu& gpu, std::string* why) {
         const char* in = getenv("HAKIOS_METAL_INFLIGHT");
         q->inflightLimit_ = in != nullptr && in[0] != 0 ? unsigned(strtoul(in, nullptr, 0)) : 0;
     }
+    {
+        const char* sp = getenv("HAKIOS_METAL_SPLIT_DRAWS");
+        q->splitDraws_ = sp != nullptr && sp[0] != 0 ? unsigned(strtoul(sp, nullptr, 0)) : 0;
+    }
     q->thread_ = std::thread([p = q.get(), orphaned = q->orphaned_] { p->waiter(orphaned); });
     const char* pre = getenv("HAKIOS_METAL_PREFILL");
     // (on only when asked for -- the plug-in asks, unless boot-arg metal_pool_prefill=0: the host tests compare draws by the
@@ -894,7 +898,30 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     // the stream as runs the GPU's IB_SIZE can count, cut between packets: one IB1 a run, run in order (a stream of
     // more than 2^20 words -- some thousands of draws in one command buffer -- was handed over as one, and the command
     // processor ran its size modulo 2^20)
-    std::vector<std::pair<uint32_t, uint32_t>> runs = pm4::ibRuns(w);
+    // Slices (HAKIOS_METAL_SPLIT_DRAWS, for a program that is not the window server): where the passes closed, a cut every N draws, each slice
+    // its own submission. The kernel lets such a program's submission into the ring only when the ring is nearly empty (gpu_prio), so the
+    // window server's next frame goes in between the slices and not behind the whole buffer. Fences complete in order: the last one is the buffer's.
+    std::vector<std::pair<uint32_t, uint32_t>> cuts;   // [from, to) in words
+    if (cb->queue_.splitDraws_ != 0) {
+        uint32_t from = 0, drawsThen = 0;
+        for (const CommandBuffer::PassEnd& e : cb->passEnds_) {
+            if (e.draws - drawsThen >= cb->queue_.splitDraws_ && e.words > from && e.words < w.size()) {
+                cuts.emplace_back(from, e.words);
+                from = e.words;
+                drawsThen = e.draws;
+            }
+        }
+        if (!cuts.empty()) cuts.emplace_back(from, uint32_t(w.size()));
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> runs = cuts.empty() ? pm4::ibRuns(w) : std::vector<std::pair<uint32_t, uint32_t>>{};
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> sliceRuns;
+    for (const auto& c : cuts) {
+        std::vector<uint32_t> sub(w.begin() + c.first, w.begin() + c.second);
+        auto r = pm4::ibRuns(sub);
+        for (auto& x : r) x.first += c.first;   // (words into the whole stream)
+        for (auto& x : r) x.first *= 4;
+        sliceRuns.push_back(std::move(r));
+    }
     if (runs.size() > Gpu::kMaxSubmitCmds) {
         cb->error_ = "a command stream of " + std::to_string(w.size()) + " words: more than the " + std::to_string(Gpu::kMaxSubmitCmds) +
                      " indirect buffers of " + std::to_string(pm4::kMaxIbWords) + " words one submission takes";
@@ -902,6 +929,9 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
         return;
     }
     for (auto& r : runs) r.first *= 4;   // (in bytes into the command buffer's memory)
+    for (const auto& sr : sliceRuns) {
+        if (sr.size() > Gpu::kMaxSubmitCmds) { sliceRuns.clear(); runs = pm4::ibRuns(w); for (auto& r : runs) r.first *= 4; break; }   // (too many in a slice: one submission as before)
+    }
     int error = 0;
     cb->commands_ = takeCommandBo(4 * w.size(), &error);
     if (cb->commands_ == nullptr) {
@@ -921,7 +951,17 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     cb->status_ = CommandBuffer::kCommitted;
     cb->faultsAtCommit_ = gpu_.faults();
     cb->submitCallAt_ = gpu_.transport().nowNs();
-    int e = gpu_.submit(id_, *cb->commands_, runs, cb->uses_, &cb->fence_);
+    int e = 0;
+    if (sliceRuns.empty()) {
+        e = gpu_.submit(id_, *cb->commands_, runs, cb->uses_, &cb->fence_);
+    } else {
+        // (the slices one after another, the queue's lock held: their fences are consecutive. A slice refused after others went in: those are
+        // waited for before the memory goes anywhere.)
+        for (size_t i = 0; i < sliceRuns.size() && e == 0; i++) {
+            e = gpu_.submit(id_, *cb->commands_, sliceRuns[i], cb->uses_, &cb->fence_);
+            if (e != 0 && i != 0) gpu_.wait(id_, cb->fence_, kPatienceNs);
+        }
+    }
     cb->submitReturnAt_ = gpu_.transport().nowNs();
     if (e != 0) {
         cb->error_ = std::string("the driver refused the submission: ") + strerror(e);
@@ -956,6 +996,8 @@ void CommandQueue::waiter(const std::shared_ptr<bool>& orphaned) {
         g.unlock();
         int e = gpu_.wait(id_, cb->fence_, kPatienceNs);
         cb->completedAt_ = gpu_.transport().nowNs();
+        cb->prevFinishFrom_ = finishFrom_;
+        cb->prevFinishTo_ = finishTo_;
         if (cb->completedAt_ - cb->committedAt_ > 50000000 && e == 0) {
             // (a slow one: the kernel's account of where the time went, asked for here, off the handlers' path)
             cb->haveKernelTimes_ = gpu_.fenceTimes(cb->fence_, &cb->kernelTimes_) == 0;
@@ -988,7 +1030,9 @@ void CommandQueue::waiter(const std::shared_ptr<bool>& orphaned) {
             quarantined_.push_back(cb);
             g.unlock();
         }
+        finishFrom_ = gpu_.transport().nowNs();
         cb->finish(e == 0 ? CommandBuffer::kCompleted : CommandBuffer::kError, !poisoned);
+        finishTo_ = gpu_.transport().nowNs();
         g.lock();
         inFlight_.pop_front();
         changed_.notify_all();
@@ -1008,7 +1052,7 @@ void CommandQueue::waiter(const std::shared_ptr<bool>& orphaned) {
     }
 }
 
-bool CommandBuffer::pathHops(double out[12]) const {
+bool CommandBuffer::pathHops(double out[13]) const {
     auto ms = [](int64_t a, int64_t b) { return a != 0 && b != 0 ? double(b - a) / 1e6 : -1.0; };
     const HakiosFenceTimes& k = kernelTimes_;
     auto kms = [](uint64_t a, uint64_t b) { return a != 0 && b != 0 && b >= a ? double(b - a) / 1e6 : -1.0; };
@@ -1023,6 +1067,13 @@ bool CommandBuffer::pathHops(double out[12]) const {
     // (the kernel's clock and this one are the same while the machine has not slept)
     out[8] = haveKernelTimes_ && k.irqNs != 0 ? ms(int64_t(k.irqNs), completedAt_) : -1.0;
     out[9] = ms(completedAt_, handlersAt_);
+    // how much of the interrupt-to-waiter time the waiter spent in the buffer before this one's finish()
+    if (haveKernelTimes_ && k.irqNs != 0 && prevFinishTo_ != 0) {
+        const int64_t from = std::max<int64_t>(int64_t(k.irqNs), prevFinishFrom_), to = std::min<int64_t>(completedAt_, prevFinishTo_);
+        out[12] = to > from ? double(to - from) / 1e6 : 0.0;
+    } else {
+        out[12] = -1.0;
+    }
     out[10] = haveKernelTimes_ ? double(k.ahead) : -1.0;
     out[11] = haveKernelTimes_ ? double(k.aheadOther) : -1.0;
     return haveKernelTimes_;

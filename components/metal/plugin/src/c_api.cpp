@@ -1814,7 +1814,7 @@ void hakios_metal_cb_commit(hakios_metal_cb* cb, void (*callback)(hakios_metal_c
     cb->cb->commit();
 }
 
-int hakios_metal_cb_path(hakios_metal_cb* cb, double out[12]) {
+int hakios_metal_cb_path(hakios_metal_cb* cb, double out[13]) {
     syncOne(cb);
     return cb->cb->pathHops(out) ? 1 : 0;
 }

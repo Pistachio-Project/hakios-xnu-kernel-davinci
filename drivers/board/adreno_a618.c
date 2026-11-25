@@ -3073,6 +3073,7 @@ a618_gpu_to_memory(void *start, uint64_t size)
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
 extern void gic_v3_spi_mask(uint32_t intid);
 extern void hakios_gpu_irq_wake(void);
+extern void hakios_gpu_irq_wake_fence(uint32_t fence);
 
 bool a618_gpu_done(uint32_t fence);
 static bool gpu_irq_on;                         /* attached, and not given up */
@@ -3115,6 +3116,7 @@ gpu_irq_handler(__unused void *context, uint32_t intid)
 				if (gpu_path[f % GPU_TIMES].fence == f && gpu_path[f % GPU_TIMES].irq_ns == 0) {
 					gpu_path[f % GPU_TIMES].irq_ns = now_ns;
 				}
+				hakios_gpu_irq_wake_fence(f);
 			}
 			gpu_irq_marked = f;
 		}

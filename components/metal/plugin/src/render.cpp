@@ -3868,6 +3868,7 @@ void CommandBuffer::closePass() {
     render::encodeEnd(tail, open_->pass, open_->table, open_->options);
     appendStream(stream_, tail);
     stampEnd();
+    passEnds_.push_back(PassEnd{uint32_t(stream_.words().size()), counts_.draws});
     retirePass();
 }
 
