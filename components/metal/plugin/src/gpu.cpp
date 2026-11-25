@@ -141,17 +141,16 @@ bool memoryLow() {
     static std::atomic<int64_t> checkedNs{0};
     static std::atomic<bool> low{false};
     const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (now - checkedNs.load() < 250000000) return low.load();
+    if (now - checkedNs.load() < 1000000000) return low.load();   // (one sysctl a second at most, whoever asks)
     checkedNs = now;
     unsigned int freePages = 0;
     size_t size = sizeof(freePages);
     uint64_t memsize = 0;
     size_t msize = sizeof(memsize);
-    static const uint64_t total = sysctlbyname("hw.memsize", &memsize, &msize, nullptr, 0) == 0 ? memsize : 0;
+    static const uint64_t total = sysctlbyname("hw.memsize", &memsize, &msize, nullptr, 0) == 0 ? memsize : 1;
     if (sysctlbyname("vm.page_free_count", &freePages, &size, nullptr, 0) != 0 || total == 0) return low.load();
     const uint64_t freeBytes = uint64_t(freePages) * 16384;   // (a page is 16 KB on this kernel; the threshold is generous for 4 KB ones)
-    const uint64_t floor = std::max<uint64_t>(192ull << 20, total / 16);
-    low = freeBytes < floor;
+    low = freeBytes < (64ull << 20);   // (really short: under 64 MB free. The run with 192 MB or 1/16 of the memory as the bar kept nothing and cost 4 fps)
     return low.load();
 #else
     return false;
@@ -164,7 +163,7 @@ namespace {
 uint64_t poolBytes() {
     static const uint64_t v = [] {
         const char* e = getenv("HAKIOS_METAL_TEXPOOL_MB");
-        const long mb = e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : 128;
+        const long mb = e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : 256;
         return uint64_t(mb < 0 ? 0 : mb) << 20;
     }();
     return v;

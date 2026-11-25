@@ -127,7 +127,7 @@ std::unique_ptr<Transport> openKernelGpu(std::string* why);
 
 // --- the GPU --------------------------------------------------------------------------------------------------------
 
-// whether the machine is short of memory (checked at most four times a second): the caches of memory the plug-in keeps for reuse then keep nothing
+// whether the machine is short of memory (checked once a second at most): the caches of memory the plug-in keeps for reuse then keep nothing
 bool memoryLow();
 class Gpu;
 extern std::atomic<uint64_t> gRecycleHits, gRecycleMisses, gRecycleTrimmed, gRecycleCached;
@@ -200,7 +200,7 @@ public:
     // newBo, but from the Bos given back to recycleBo when one of this size and kind is there (not cleared: what the last owner
     // wrote is in it, as the kernel's own kept buffers are given again), and made as newBo does when not
     std::unique_ptr<Bo> newBoRecycled(uint64_t size, uint32_t flags, int* error);
-    // BO for the next newBoRecycled of its size, kept at most HAKIOS_METAL_TEXPOOL_MB (128; 0: none kept) and none for more than
+    // BO for the next newBoRecycled of its size, kept at most HAKIOS_METAL_TEXPOOL_MB (256; 0: none kept) and none for more than
     // HAKIOS_METAL_TEXPOOL_SECONDS (4) -- CoreAnimation makes a texture for a blur or a backdrop each frame and lets it go
     // a few frames later, each made fresh 0.4 to 1.5 ms in the kernel (the 5 s line of HakiosGPU) in the window server's frame
     void recycleBo(std::unique_ptr<Bo> bo);
