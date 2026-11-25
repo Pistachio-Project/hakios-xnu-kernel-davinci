@@ -18,6 +18,7 @@
  *   button NAME [MS]             press a button: home, lock, volup, voldown
  *   read                         print the samples that arrive, forever (to watch the queue)
  *   notify NAME                  post a Darwin notification (com.hakios.unlock: see inject_sb.c)
+ *   bench                        the scripted UI workload of boot-arg ui_bench=N (nothing without it): see bench() below
  *   clock                        how long short sleeps really take (a check of the kernel's timers)
  * Positions are fractions of the screen: 0 0 is the top left corner, 1 1 the bottom right.
  * Example, "swipe up from the bottom edge two minutes after boot":
@@ -28,6 +29,8 @@
 #include <notify.h>
 #include <pthread.h>
 #include <sys/qos.h>
+#include <sys/sysctl.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -148,6 +151,103 @@ zigzag(double x, double y0, double y1, int ms, int times, int step_ms)
 	post(HAKIOS_TOUCH_UP, x, y0);
 }
 
+/*
+ * boot-arg ui_bench=N: the same sequence N times through the queue the touch screen uses, from a fixed time after
+ * boot, between the notifications com.hakios.ui_bench.start and .end that the Metal plug-in's frame pacing keys on
+ * ("frame pacing (ui_bench window)"). Every step logs "ui_bench: step K: WHAT at uptime S" (CLOCK_MONOTONIC, the
+ * clock of the plug-in's lines). Positions are for the default home screen layout of the 1080x2340 panel; no step
+ * taps anywhere but the Settings icon, so nothing is changed: the rest is swipes, and the home button.
+ *   ui_bench_at=S (default 90): uptime of the unlock swipe; the sequence starts 30 s later.
+ */
+static double
+uptime(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+static int bench_step;
+
+static void
+mark(const char *what)
+{
+	printf("ui_bench: step %d: %s at uptime %.3f\n", ++bench_step, what, uptime());
+	fflush(stdout);
+}
+
+static void
+bench(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	const char *at;
+	int rounds, start = 90;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (at = strstr(args, "ui_bench=")) == NULL ||
+	    (rounds = atoi(at + 9)) <= 0) {
+		return;
+	}
+	if ((at = strstr(args, "ui_bench_at=")) != NULL && atoi(at + 12) > 0) {
+		start = atoi(at + 12);
+	}
+	printf("ui_bench: %d rounds, unlock at uptime %d s\n", rounds, start);
+	while (uptime() < start) {
+		usleep(500000);
+	}
+	mark("unlock (swipe up from the bottom edge)");
+	drag(0.5, 0.985, 0.5, 0.3, 250, 0, 0);
+	usleep(3000000);
+	mark("tap where a first boot's alert has Don't Allow (nothing on the home screen)");
+	post(HAKIOS_TOUCH_DOWN, 0.27, 0.582);
+	usleep(60000);
+	post(HAKIOS_TOUCH_UP, 0.27, 0.582);
+	usleep(30000000);
+	notify_post("com.hakios.ui_bench.start");
+	mark("window start");
+	for (int r = 1; r <= rounds; r++) {
+		printf("ui_bench: round %d of %d\n", r, rounds);
+		for (int k = 0; k < 10; k++) {
+			mark(k % 2 == 0 ? "home page swipe left" : "home page swipe right");
+			if (k % 2 == 0) {
+				drag(0.85, 0.5, 0.15, 0.5, 250, 0, 0);
+			} else {
+				drag(0.15, 0.5, 0.85, 0.5, 250, 0, 0);
+			}
+			usleep(1000000);
+		}
+		for (int k = 0; k < 3; k++) {
+			mark("Control Center down (top right corner)");
+			drag(0.92, 0.003, 0.92, 0.5, 250, 0, 0);
+			usleep(2000000);
+			mark("Control Center dismissed (home button)");
+			button(HAKIOS_BUTTON_HOME, 80);
+			usleep(2000000);
+		}
+		mark("open Settings (tap its icon: third row, second)");
+		post(HAKIOS_TOUCH_DOWN, 0.385, 0.57);
+		usleep(60000);
+		post(HAKIOS_TOUCH_UP, 0.385, 0.57);
+		usleep(4000000);
+		for (int k = 0; k < 5; k++) {
+			mark("Settings list scrolled down");
+			drag(0.5, 0.8, 0.5, 0.3, 250, 0, 0);
+			usleep(1000000);
+			mark("Settings list scrolled up");
+			drag(0.5, 0.3, 0.5, 0.8, 250, 0, 0);
+			usleep(1000000);
+		}
+		mark("home (swipe up from the bottom edge)");
+		drag(0.5, 0.995, 0.5, 0.4, 250, 0, 0);
+		usleep(3000000);
+	}
+	mark("window end");
+	notify_post("com.hakios.ui_bench.end");
+	printf("ui_bench: done, %d steps\n", bench_step);
+	fflush(stdout);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -214,6 +314,8 @@ main(int argc, char **argv)
 
 			printf("rwtouch: notification %s: %s\n", argv[i + 1], status == NOTIFY_STATUS_OK ? "posted" : "FAILED");
 			i += 1;
+		} else if (strcmp(step, "bench") == 0) {
+			bench();
 		} else if (strcmp(step, "clock") == 0) {
 			static const useconds_t lengths[] = { 1000, 16000, 100000 };
 			mach_timebase_info_data_t timebase;

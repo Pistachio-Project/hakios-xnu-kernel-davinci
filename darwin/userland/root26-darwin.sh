@@ -491,6 +491,8 @@ if [ -n "${RC_JOBS:-}" ]; then
 else
 cat > $T/etc/rc.jobs <<'EOF'
 # iOS 26/27: towards SpringBoard
+# (boot-arg ui_bench=N: the scripted UI workload, N rounds; nothing without it. rwtouch.c)
+/hakios/bin/rwtouch bench
 /bin/ps -A
 # (with wifi=1: en0 configured by configd's own Wi-Fi service, or else DHCP asked for it; without, nothing)
 /hakios/bin/net_test wifi

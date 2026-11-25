@@ -90,6 +90,8 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <fcntl.h>
+#include <notify.h>
+#include <dispatch/dispatch.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -3554,6 +3556,79 @@ hm_frame_pacing(const char *what, const unsigned *bins, unsigned frames, double 
 	(void)seen;
 }
 
+/* (hakios) boot-arg ui_bench=N: the window of the scripted run (rwtouch bench) posts "com.hakios.ui_bench.start" and
+ * ".end"; the frames counted between them (the same ones as the run's pacing: while the screen moves) get a summary of their
+ * own at the end. Guarded by a mutex: the notifications arrive on a queue of theirs, the frames on the commit thread. */
+static pthread_mutex_t hm_bench_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int hm_bench_active;
+static struct { unsigned bins[500]; unsigned frames, hitches; double worst, began; } hm_bench;
+
+static void
+hm_bench_frame(double frame, BOOL hitch)
+{
+	const unsigned bin = (unsigned)(frame * 2000.0) < 499 ? (unsigned)(frame * 2000.0) : 499;
+
+	pthread_mutex_lock(&hm_bench_lock);
+	if (hm_bench_active) {
+		hm_bench.bins[bin]++;
+		hm_bench.frames++;
+		if (frame > hm_bench.worst) hm_bench.worst = frame;
+		if (hitch) hm_bench.hitches++;
+	}
+	pthread_mutex_unlock(&hm_bench_lock);
+}
+
+static void
+hm_bench_window(BOOL start)
+{
+	struct timespec up;
+
+	clock_gettime(CLOCK_MONOTONIC, &up);
+	pthread_mutex_lock(&hm_bench_lock);
+	if (start) {
+		memset(&hm_bench, 0, sizeof(hm_bench));
+		hm_bench.began = up.tv_sec + up.tv_nsec / 1e9;
+		hm_bench_active = 1;
+		hm_print("fps: ... ui_bench window begins at uptime %.3f s\n", hm_bench.began);
+	} else if (hm_bench_active) {
+		hm_bench_active = 0;
+		hm_print("fps: ... ui_bench window ends at uptime %.3f s (%.1f s)\n", up.tv_sec + up.tv_nsec / 1e9,
+			 up.tv_sec + up.tv_nsec / 1e9 - hm_bench.began);
+		if (hm_bench.frames == 0) {
+			hm_print("fps: ... frame pacing (ui_bench window): no frames while something moved\n");
+		} else {
+			double total = 0, low1 = 0, low01 = 0;
+			unsigned n1 = hm_bench.frames / 100 ? hm_bench.frames / 100 : 1, n01 = hm_bench.frames / 1000 ? hm_bench.frames / 1000 : 1;
+			unsigned k1 = 0, k01 = 0;
+
+			for (unsigned b = 0; b < 500; b++) total += hm_bench.bins[b] * ((b + 0.5) / 2000.0);
+			for (int b = 499; b >= 0 && (k1 < n1 || k01 < n01); b--) {
+				for (unsigned i = 0; i < hm_bench.bins[b] && (k1 < n1 || k01 < n01); i++) {
+					const double t = (b + 0.5) / 2000.0;
+
+					if (k1 < n1) { low1 += t; k1++; }
+					if (k01 < n01) { low01 += t; k01++; }
+				}
+			}
+			hm_print("fps: ... frame pacing (ui_bench window): %u frames, %.1f fps avg, 1%% low %.1f fps, 0.1%% low %.1f fps, "
+				 "worst %.1f ms, %u hitches (frames over 100 ms)\n", hm_bench.frames, hm_bench.frames / total,
+				 k1 ? k1 / low1 : 0.0, k01 ? k01 / low01 : 0.0, hm_bench.worst * 1e3, hm_bench.hitches);
+		}
+	}
+	pthread_mutex_unlock(&hm_bench_lock);
+}
+
+static void
+hm_bench_register(void)
+{
+	static int token_start, token_end;
+
+	notify_register_dispatch("com.hakios.ui_bench.start", &token_start, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+				 ^(int t) { (void)t; hm_bench_window(YES); });
+	notify_register_dispatch("com.hakios.ui_bench.end", &token_end, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+				 ^(int t) { (void)t; hm_bench_window(NO); });
+}
+
 static unsigned hm_pipelines_total;   /* pipelines built in this process (the hitch lines) */
 static unsigned hm_spec_used, hm_spec_fallback;   /* draws of uber pipelines with a specialised program / on the uber shader itself (the fps report) */
 
@@ -6698,7 +6773,13 @@ hm_fps_on(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps") != NULL;
+		const BOOL got = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0;
+
+		on = got && strstr(args, "metal_fps") != NULL;
+		if (got && strstr(args, "ui_bench=") != NULL) {
+			on = 1;   /* the scripted run's window needs the frame counting */
+			hm_bench_register();
+		}
 	}
 	return on != 0;
 }
@@ -7393,6 +7474,7 @@ hm_fps_commit(double seconds)
 					if (frame > hm_fps.frameWorst) hm_fps.frameWorst = frame;
 					if (frame > hm_fps.frameWorstAll) hm_fps.frameWorstAll = frame;
 					hitch = frame > 0.1;
+					if (hm_bench_active) hm_bench_frame(frame, hitch);
 				} else {
 					hm_fps.idleFrames++;
 				}
