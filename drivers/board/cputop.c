@@ -244,7 +244,7 @@ memtop_thread(void *arg __unused, wait_result_t w __unused)
 {
 	static char line[1024];
 
-	uint32_t leaktest = 0;
+	uint32_t leaktest = 1;      /* (gpu_leaktest=0: not) */
 	bool tested = false;
 
 	(void)PE_parse_boot_argn("gpu_leaktest", &leaktest, sizeof(leaktest));

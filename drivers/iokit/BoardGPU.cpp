@@ -49,6 +49,7 @@ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" unsigned int vm_page_free_count, vm_page_wire_count;
 /* every client's buffers together (the 5 s line "gpu memory"): what the GPU's clients hold in the kernel, wired and kept, against the pages left */
 static int64_t gAllBuffers, gAllBufferBytes, gAllKeptBytes;
+static TUNABLE(uint32_t, gGPUUnwire, "gpu_unwire", 1);   /* gpu_unwire=0: a freed buffer's pages are left to the descriptor's own free (as before) */
 static int64_t gLeftBytes, gStuckBytes;
 static int64_t gGemMadeWire, gGemMade, gGemFreedWire, gGemFreed;   /* (memtop: wired pages gained making a buffer / lost freeing one, noisy: others wire too) */   /* (memtop: given back while the GPU was busy; kept for good because the GPU could not be shown to be done) */
 extern "C" void MiniIOSurfaceExtra(uint64_t * snapshots, uint64_t * held, uint64_t * kept);
@@ -89,7 +90,7 @@ extern "C" void hakios_gpu_to_memory(void * start, uint64_t size);
 extern "C" void
 hakios_gpu_leaktest(void)
 {
-	for (int variant = 0; variant < 3; variant++) {
+	for (int variant = 0; variant < 4; variant++) {
 		const int64_t before = (int64_t) vm_page_wire_count;
 
 		for (int i = 0; i < 200; i++) {
@@ -99,7 +100,7 @@ hakios_gpu_leaktest(void)
 			if (m == NULL) {
 				continue;
 			}
-			if (m->prepare() == kIOReturnSuccess && variant >= 1) {
+			if (m->prepare() == kIOReturnSuccess && variant >= 1 && variant <= 2) {
 				IOMemoryMap * map = m->map(kIOMapAnywhere | kIOMapDefaultCache);
 
 				if (map != NULL) {
@@ -110,10 +111,13 @@ hakios_gpu_leaktest(void)
 					map->release();
 				}
 			}
+			if (variant == 3) {
+				m->complete();      /* (variant 3: the prepare() above undone by name, as freeBuffer now does) */
+			}
 			m->release();
 		}
-		IOLog("HakiosGPU: leaktest variant %d (%s): 200 buffers of 64 KB made and let go, wired pages left over: %lld (%lld KB)\n",
-		    variant, variant == 0 ? "prepare" : variant == 1 ? "prepare, kernel map" : "prepare, kernel map, cache flush",
+		printf("HakiosGPU: leaktest variant %d (%s): 200 buffers of 64 KB made and let go, wired pages left over: %lld (%lld KB)\n",
+		    variant, variant == 0 ? "prepare" : variant == 1 ? "prepare, kernel map" : variant == 2 ? "prepare, kernel map, cache flush" : "prepare, complete",
 		    (int64_t) vm_page_wire_count - before, ((int64_t) vm_page_wire_count - before) * (int64_t) PAGE_SIZE / 1024);
 	}
 }
@@ -955,6 +959,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 	gAllBufferBytes -= (int64_t) b->size;
 
 	bool busy = hakios_gpu_ready() && b->fence != 0 && !hakios_gpu_done(b->fence);
+	bool stuck = false;     /* the GPU may still reach the pages: they stay wired, and the buffer's own */
 
 	if (busy && fLeftCount == GPU_LEFT) {
 		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
@@ -982,6 +987,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 			 * pages go
 			 */
 			b->memory->retain();
+			stuck = true;
 			gStuckBytes += (int64_t) b->size;
 			if (b->surface != NULL) {
 				b->surface->retain();
@@ -996,7 +1002,7 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 			if (hakios_gpu_unmap(b->address, b->size)) {
 				hakios_gpu_address_free(b->address, b->size);
 			} else {
-				if (b->memory != NULL) { gStuckBytes += (int64_t) b->size; b->memory->retain(); }    /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
+				if (b->memory != NULL) { stuck = true; gStuckBytes += (int64_t) b->size; b->memory->retain(); }    /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
 			}
 		}
 		const int64_t wireBefore = (int64_t) vm_page_wire_count;
@@ -1006,6 +1012,14 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 			b->map->release();
 		}
 		if (b->memory != NULL) {
+			/*
+			 * The memory gemNew made was wired by prepare(): unwired here, by name, whatever else still holds the descriptor
+			 * (a mapping in a program that has not let go yet keeps it alive, and then its pages stayed wired for as long: run
+			 * 000453, a gigabyte of IOKit-tagged wired pages with no buffer or descriptor to show for it).
+			 */
+			if (!stuck && gGPUUnwire && !b->client && b->surface == NULL && !(b->flags & GPU_BUFFER_HOST)) {
+				b->memory->complete();
+			}
 			b->memory->release();
 		}
 		if (pageable) {
@@ -1024,6 +1038,7 @@ HakiosGPUUserClient::reap(void)
 {
 	for (uint32_t i = 0; i < fLeftCount;) {
 		struct gpu_left * left = &fLeft[i];
+		bool leftStuck = false;
 
 		if (hakios_gpu_ready() && !hakios_gpu_done(left->fence)) {
 			i++;
@@ -1036,13 +1051,16 @@ HakiosGPUUserClient::reap(void)
 			if (hakios_gpu_unmap(left->address, left->size)) {
 				hakios_gpu_address_free(left->address, left->size);
 			} else {
-				if (left->memory != NULL) { gStuckBytes += (int64_t) left->size; left->memory->retain(); } /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
+				if (left->memory != NULL) { leftStuck = true; gStuckBytes += (int64_t) left->size; left->memory->retain(); } /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
 			}
 		}
 		if (left->map != NULL) {
 			left->map->release();
 		}
 		if (left->memory != NULL) {
+			if (gGPUUnwire && !left->client && left->surface == NULL && !(left->flags & GPU_BUFFER_HOST) && !leftStuck) {
+				left->memory->complete();
+			}
 			left->memory->release();
 		}
 		if (left->surface != NULL) {
@@ -1228,6 +1246,8 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 void
 HakiosGPUUserClient::dropKept(struct gpu_kept * k)
 {
+	bool stuck = false;
+
 	if (k->memory == NULL) {
 		return;
 	}
@@ -1235,9 +1255,13 @@ HakiosGPUUserClient::dropKept(struct gpu_kept * k)
 		if (hakios_gpu_unmap(k->address, k->size)) {
 			hakios_gpu_address_free(k->address, k->size);
 		} else {
+			stuck = true;
 			gStuckBytes += (int64_t) k->size;
 			k->memory->retain();    /* (the 3D core may still reach them: the pages, and the addresses, stay its own) */
 		}
+	}
+	if (!stuck && gGPUUnwire && !(k->flags & GPU_BUFFER_HOST)) {
+		k->memory->complete();  /* (kept ones are the kernel's own pageable buffers, wired by gemNew's prepare()) */
 	}
 	k->memory->release();
 	k->memory = NULL;
