@@ -36,6 +36,9 @@ the two the same. What each key means is in `arch/arm64/boot/dts/_template/soc.d
 | `touch-gt9889` | `pins { }` | `touch-i2c { }`: `sda`, `scl`, `interrupt`, `reset`, `address`, `contacts`, `coordinates` | `touchscreen=-1 looks; touchscreen=1` |
 | `torch-pm6150l` | `spmi { }`: `channels` | `torch { }`: `flash`, `alarm` | `torch=1 looks; torch=3 is the light for Darwin` |
 | `haptic-pmic-ldo` | `spmi { }`: `channels` | `vibrator { }`: `peripheral`, `volt-uv` | `haptic_ldo=1 looks; haptic_ldo=3 is the motor for Darwin` |
+| `wifi-wcn3990` | `spmi { }` | nothing | `mpss=1 (wlanprobe=8: the Wi-Fi after the modem)` |
+| `gpu-a618` | nothing | nothing | `gpu=1 (adreno=N: steps 1..N only)` |
+| `adsp-sm7150` | nothing | nothing | `adsp=1 (adsp_step=N: steps 1..N only; the firmware in fw/ of the small image or of the root)` |
 
 The brightness (`backlight { }`), the thermal floors (`thermal { }`), the PMIC's clock (`rtc { }`, which
 needs `spmi { }` in the SoC file) and the partition that may be written (`storage { }`) are not

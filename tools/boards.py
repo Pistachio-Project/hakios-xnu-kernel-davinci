@@ -203,7 +203,7 @@ FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virt
                  'gpu-a618': (),
                  'speaker-aw88261': ('pins', 'clocks', 'rpmh', 'smmu'), 'haptic-aw86927': ('pins',),
                  'imu-lsm6dso': ('pins',), 'imu-bmi160': ('pins',),
-                 'adsp': ('rpmh', 'ipc'), 'wifi-wcn6750': ('rpmh', 'pins', 'spmi', 'ipc', 'smmu'), 'mic-wcd938x': ('pins', 'lpass')}
+                 'adsp': ('rpmh', 'ipc'), 'adsp-sm7150': (), 'wifi-wcn6750': ('rpmh', 'pins', 'spmi', 'ipc', 'smmu'), 'mic-wcd938x': ('pins', 'lpass')}
 # ... and the stream of the SMMU that a part's DMA comes in on: [stream ID, mask], from the device tree's iommus
 STREAM_OF = {'speaker-aw88261': 'audio_stream', 'wifi-wcn6750': 'wifi_stream', 'camera-sm7325': 'camera_stream'}
 WRITES_TO_PMIC = ('bluetooth-wcn-uart', 'torch-pm8350c', 'torch-pm6150l', 'haptic-pmic-ldo', 'camera-sm7325')    # ... these through the arbiter's channels as well
@@ -217,6 +217,7 @@ FEATURE_BOOTARGS = {
     'battery-uefi': 'battery=1',
     'buttons-pmic': 'buttons=1',
     'adsp': 'adsp=1',
+    'adsp-sm7150': 'adsp=1 (adsp_step=N: steps 1..N only; the firmware in fw/ of the small image or of the root)',
     'display-scan': 'fb_scan=1, the default',
     'gpu-a660': 'gpu=1',
     'virtio': 'virtio_net=1, virtio_input=1',

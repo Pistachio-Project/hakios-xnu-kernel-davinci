@@ -69,6 +69,13 @@
  * (how long step 7 watches for "up", default 10), adsp_keep=1, adsp_again=1, adsp_return=1 (back
  * to the loader when the steps are over).
  *
+ * An SM7150 (the Mi 9T; board feature "adsp-sm7150", no adsp { } or ipc { } section needed) is the same driver with that
+ * chip's numbers (chip_sm7150()): the DSP is rung through APCS bits (no IPCC), the TrustZone calls are made between the
+ * crypto engine's bandwidth votes (board/sm7150_rpmh.c, as the modem's are), the rails, the mailbox to the always-on
+ * processor and a missing battery manager do not end the sequence, and adsp_no_shutdown=1 leaves TrustZone's slow
+ * shutdown call out (the modem's driver saw it never answer on this chip, seconds after the start). Its firmware is
+ * fw/adsp.mdt and fw/adsp.b00..b26 (the phone's /vendor/firmware_mnt/image, 18 MB) in the small image or on the root.
+ *
  * Nothing here writes a clock or changes a pin. One request goes to RPMh, as Linux makes it: the
  * DSP's two rails, LCX and LMX, at level 384 while it boots, given back when it says it has asked
  * for its own (see rails()).
@@ -265,8 +272,9 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 
 /* ---- the shared memory (board/wifi.c, step 1) --------------------------------------------------- */
 
-#define SMEM_PHYS               ((unsigned long)hakios_board()->ipc.smem)       /* the SoC file's ipc { } */
-#define SMEM_SIZE               (hakios_board()->ipc.smem_size)
+static uint32_t smem_phys_v, smem_size_v;       /* the SoC file's ipc { } (an SM7150's: chip_sm7150()) */
+#define SMEM_PHYS               ((unsigned long)smem_phys_v)
+#define SMEM_SIZE               smem_size_v
 #define SMEM_US                 0
 #define SMEM_ADSP               2               /* dt: qcom,remote-pid of qcom,smp2p-adsp and qcom,glink/adsp */
 
@@ -450,6 +458,41 @@ static struct block aoss = { "mailbox", 0, 0x400 };              /* where: the S
 
 static struct block ipcc = { "ipcc", 0, 0x1000 };                /* where: the SoC file's ipc { }, at the start */
 
+/*
+ * An SM7150 (the Mi 9T) has no IPCC. A processor is rung by writing a bit to the application processors' global mailbox,
+ * APCS (dt: mailbox@17c00000, qcom,sm8150-apcs-hmss-global; its syscon at 0x17c0000c, which is APCS_IPC): the audio DSP's
+ * for GLINK is the second cell of "mboxes" of qcom,glink/adsp (<&apcs_glb 0x18>: bit 24), its SMP2P the third cell of
+ * "qcom,ipc" of qcom,smp2p-adsp (<&apcs 0 0x1a>: bit 26), the always-on processor's the "qcom,irq-mask" of
+ * qcom,qmp-aop@c300000 (bit 0, as the modem's driver rings it). What the DSP rings back is a GIC interrupt (SPI 170 GLINK,
+ * 172 SMP2P, 162 its watchdog) that nobody here enables: the shared memory is watched instead (as step 7 and the link's
+ * thread do on every phone), so there is nothing to read, clear or enable.
+ */
+static bool sm7150;
+static struct block apcs = { "apcs", 0x17c00000, 0x1000 };
+#define APCS_IPC                0x0c
+#define APCS_AOP                0
+#define APCS_GLINK_ADSP         24
+#define APCS_SMP2P_ADSP         26
+
+static void
+need_bells(void)
+{
+	need(sm7150 ? &apcs : &ipcc);
+}
+
+/* A signal to the audio DSP: IPCC_GLINK or IPCC_SMP2P. */
+static void
+ring_dsp(uint32_t signal)
+{
+	if (sm7150) {
+		need(&apcs);
+		wr(apcs.base + APCS_IPC, 1u << (signal == IPCC_GLINK ? APCS_GLINK_ADSP : APCS_SMP2P_ADSP));
+		return;
+	}
+	need(&ipcc);
+	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | signal);
+}
+
 static struct {
 	uint32_t glink, smp2p, said;
 	uint64_t since;
@@ -463,6 +506,9 @@ static struct {
 static void
 doorbells(void)
 {
+	if (sm7150) {
+		return;                         /* (nothing to read: a ring is an interrupt nobody enables; the memory is looked at) */
+	}
 	for (unsigned i = 0; i < 8; i++) {
 		uint32_t who = rd(ipcc.base + IPCC_RECEIVED);
 
@@ -482,6 +528,7 @@ doorbells(void)
 	}
 }
 
+static bool no_battmgr;                 /* an SM7150: this DSP has no battery manager to ask */
 static uint32_t our_box;                /* where in the message memory our mailbox is; 0: not open */
 
 static bool
@@ -499,6 +546,11 @@ mailbox_wait(uint32_t offset, uint32_t value, uint32_t ms)
 static void
 ring_aop(void)
 {
+	if (sm7150) {
+		need(&apcs);
+		wr(apcs.base + APCS_IPC, 1u << APCS_AOP);
+		return;
+	}
 	wr(ipcc.base + IPCC_SEND, IPCC_AOP << 16 | 0);
 }
 
@@ -509,7 +561,7 @@ mailbox_open(void)
 	uint32_t box, size;
 
 	need(&aoss);
-	need(&ipcc);
+	need_bells();
 	if (get(&aoss, "magic", QMP_MAGIC) != QMP_MAGIC_VALUE || get(&aoss, "version", QMP_VERSION) != 1) {
 		printf("adsp: %u: not a mailbox this knows\n", step);
 		return false;
@@ -616,15 +668,16 @@ out:
  * the list of its levels that the boot loader's command database keeps (cmd-db.c), the first
  * position at or above the level wanted.
  */
-#define CMD_DB_PHYS             (hakios_board()->rpmh.cmd_db)           /* the SoC file's rpmh { } */
-#define CMD_DB_SIZE             (hakios_board()->rpmh.cmd_db_size)
+#define CMD_DB_PHYS             cmd_db_phys_v                           /* the SoC file's rpmh { } */
+#define CMD_DB_SIZE             cmd_db_size_v
+static uint32_t cmd_db_phys_v, cmd_db_size_v, tcs_offset_v;
 
 #include "cmd_db.h"
 
 static const struct cmd_db_header *cmd_db;
 
 static struct block rsc = { "rsc", 0, 0x10000 };        /* where: the SoC file's rpmh { }, at the start */
-#define RSC_TCS_BASE            (hakios_board()->rpmh.tcs_offset)
+#define RSC_TCS_BASE            tcs_offset_v
 #define RSC_IRQ_STATUS          (RSC_TCS_BASE + 0x04)   /* a bit per TCS: done */
 #define RSC_IRQ_CLEAR           (RSC_TCS_BASE + 0x08)
 #define RSC_TCS(n)              (RSC_TCS_BASE + 672 * (n))
@@ -765,8 +818,13 @@ step_survey(void)
 	    smem_item(ITEM_SMP2P_OURS, &size) ? "there" : "not there", smem_item(478, &size) ? "there" : "NOT THERE",
 	    smem_item(479, &size) ? "there" : "NOT THERE", smem_item(480, &size) ? "there" : "not there (the DSP makes it)");
 	show_crash_reason();
-	need(&ipcc);
-	printf("adsp: %u: the doorbells say %#x\n", step, rd(ipcc.base + IPCC_RECEIVED));
+	need_bells();
+	if (sm7150) {
+		printf("adsp: %u: no IPCC on this chip: the DSP is rung through APCS (%#x: bit %u for SMP2P, bit %u for GLINK, bit %u "
+		    "for the always-on processor)\n", step, (unsigned)apcs.phys + APCS_IPC, APCS_SMP2P_ADSP, APCS_GLINK_ADSP, APCS_AOP);
+	} else {
+		printf("adsp: %u: the doorbells say %#x\n", step, rd(ipcc.base + IPCC_RECEIVED));
+	}
 	return smem_partition(SMEM_US, SMEM_ADSP, &size, &size) != 0;
 }
 
@@ -1023,6 +1081,11 @@ step_mailbox(void)
 	lck_mtx_lock(&hakios_aop_mailbox_lock);
 	open = mailbox_open();
 	lck_mtx_unlock(&hakios_aop_mailbox_lock);
+	if (!open && sm7150) {
+		/* (Linux's qcom_q6v5_pas goes on when it has no mailbox: the message only keeps the always-on processor's picture right) */
+		printf("adsp: %u: no mailbox to the always-on processor: the start goes on without telling it\n", step);
+		return true;
+	}
 	return open;
 }
 
@@ -1035,16 +1098,35 @@ static bool stopped_by_its_word;
 static uint32_t our_item;
 static bool smp2p_agreed, smp2p_restart_acks, smp2p_restart_acked;
 
+/* board/sm7150_rpmh.c: the bandwidth votes Linux makes around every PAS call (qcom_scm_bw_enable) */
+extern int hakios_rpmh_crypto_vote(uint32_t vote);
+extern int hakios_rpmh_ddr_vote(uint32_t vote, bool send);
+
 static int32_t
 scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t *answer)
 {
 	int result;
+	bool bandwidth = sm7150 && !leaving;
 
 	function |= SCM_64 | SCM_SIP;
+	if (bandwidth) {
+		/*
+		 * An SM7150's TrustZone reaches memory through the crypto engine's path, which Linux (qcom_scm_bw_enable(),
+		 * the "interconnects" of its scm node) votes at its most around every PAS call; without it the modem's
+		 * PAS_MEM_SETUP came back -3145798 (board/sm7150_rpmh.c, found by the modem's driver). The crypto engine's
+		 * is lowered again after the call; the memory's is left (the memory's own driver votes there too).
+		 */
+		int crypto = hakios_rpmh_crypto_vote(0x3fff), memory = hakios_rpmh_ddr_vote(0x3fff, true);
+
+		printf("adsp: %u: bandwidth votes for TrustZone: crypto engine's path %d, memory %d (0: done)\n", step, crypto, memory);
+	}
 	printf("adsp: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", step, what, function, first,
 	    second, third);
 	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
 	result = hakios_scm_call(function, arguments, first, second, third, answer);
+	if (bandwidth) {
+		(void)hakios_rpmh_crypto_vote(1);
+	}
 	if (result == SCM_GAVE_UP) {
 		printf("adsp: %u: TrustZone keeps saying the call was interrupted\n", step);
 		return -1;
@@ -1089,7 +1171,7 @@ dsp_listen(const struct smp2p *theirs)
 		    step, theirs->flags, smp2p_restart_acked);
 		smem_poke(our_item + SMP2P_AT_FLAGS, (ours.flags & ~SMP2P_RESTART_ACK) | (smp2p_restart_acked ? SMP2P_RESTART_ACK : 0));
 		hakios_barrier();
-		wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+		ring_dsp(IPCC_SMP2P);
 	}
 }
 
@@ -1120,14 +1202,14 @@ dsp_ask_to_stop(uint32_t bound_ms)
 		printf("adsp: %u: the DSP is not asked to stop first: its entry says %#x, not \"up\"\n", step, state);
 		return false;
 	}
-	need(&ipcc);
+	need_bells();
 	value_at = at + SMP2P_AT_VALUE((uint32_t)entry);
 	printf("adsp: %u: about to ask the DSP to stop: bit 0 of our entry \"%s\" at %#lx, and its SMP2P doorbell\n", step,
 	    OUR_ENTRY_STOP, SMEM_PHYS + value_at);
 	snprintf(last_write, sizeof(last_write), "step %u asked the audio DSP to stop", step);
 	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
 	hakios_barrier();
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+	ring_dsp(IPCC_SMP2P);
 	asked = now = now_us();
 	while (now - asked < bound_ms * 1000ull) {
 		if (dsp_words(&theirs) && (dsp_state(&theirs) & (DSP_STOP_ACK | DSP_FATAL))) {
@@ -1142,7 +1224,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	    (now - asked) % 1000, state);
 	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
 	hakios_barrier();
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+	ring_dsp(IPCC_SMP2P);
 	return (state & DSP_STOP_ACK) != 0;
 }
 
@@ -1160,6 +1242,11 @@ dsp_shutdown(const char *why)
 		link_stop();
 	}
 	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
+	if (sm7150 && !leaving && option("adsp_no_shutdown")) {
+		/* (the modem's driver found this slow call never answered when made seconds after the start on this chip) */
+		printf("adsp: %u: adsp_no_shutdown=1: TrustZone is not asked to shut the audio DSP down; it is left running\n", step);
+		return false;
+	}
 	result = scm("to shut the audio DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_ADSP, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("adsp: %u: TRUSTZONE DOES NOT SHUT THE AUDIO DSP DOWN: the call returns %d, its answer is %#llx\n", step, result,
@@ -1167,9 +1254,11 @@ dsp_shutdown(const char *why)
 		return false;
 	}
 	printf("adsp: %u: THE AUDIO DSP IS SHUT DOWN\n", step);
-	need(&ipcc);
-	wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
-	wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_GLINK);   /* (both of the two step 7 listened for) */
+	need_bells();
+	if (!sm7150) {
+		wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
+		wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_GLINK);   /* (both of the two step 7 listened for) */
+	}
 	doorbells();
 	dsp_started = false;
 	mailbox_send("{class: image, res: load_state, name: adsp, val: off}");
@@ -1412,8 +1501,8 @@ step_our_item(void)
 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);
 	hakios_barrier();
 	smp2p_agreed = smp2p_restart_acks = smp2p_restart_acked = false;
-	need(&ipcc);
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+	need_bells();
+	ring_dsp(IPCC_SMP2P);
 	if (!smem_peek(our_item, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC || smp2p_entry(&ours, OUR_ENTRY_STOP) < 0) {
 		printf("adsp: %u: OUR ITEM DOES NOT READ BACK AS WRITTEN\n", step);
 		return false;
@@ -1451,24 +1540,33 @@ step_start(void)
 	have = dsp_words(&last);
 	announce("listen for the audio DSP's doorbells, ask RPMh for its rails, tell the always-on processor that its image is "
 	    "loaded, and ask TrustZone to authenticate the image and let the DSP out of reset");
-	need(&ipcc);
-	for (unsigned i = 0; i < 8 && (rang = rd(ipcc.base + IPCC_RECEIVED)) != IPCC_NOBODY && rang >> 16 == IPCC_LPASS; i++) {
+	need_bells();
+	for (unsigned i = 0; !sm7150 && i < 8 && (rang = rd(ipcc.base + IPCC_RECEIVED)) != IPCC_NOBODY && rang >> 16 == IPCC_LPASS; i++) {
 		put(&ipcc, "heard", IPCC_CLEAR, rang);
 	}
-	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
-	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_GLINK);
+	if (!sm7150) {
+		put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
+		put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_GLINK);
+	}
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
 	if (!rails(384)) {
-		lck_mtx_unlock(&dsp_lock);
-		return false;
+		if (!sm7150) {
+			lck_mtx_unlock(&dsp_lock);
+			return false;
+		}
+		printf("adsp: %u: THE RAILS WERE NOT ASKED FOR: going on (the boot loader may have left them high enough)\n", step);
+	} else {
+		rails_asked = true;
 	}
-	rails_asked = true;
 	if (!mailbox_send("{class: image, res: load_state, name: adsp, val: on}")) {
-		rails(0);
-		rails_asked = false;
-		lck_mtx_unlock(&dsp_lock);
-		return false;
+		if (!sm7150) {
+			rails(0);
+			rails_asked = false;
+			lck_mtx_unlock(&dsp_lock);
+			return false;
+		}
+		printf("adsp: %u: THE ALWAYS-ON PROCESSOR WAS NOT TOLD: going on\n", step);
 	}
 	result = scm("to authenticate the audio DSP's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_ADSP, 0, 0,
 	    &answer);
@@ -1727,7 +1825,7 @@ glink_put(const void *first, uint32_t first_length, const void *second, uint32_t
 	hakios_barrier();
 	smem_poke(glink.descriptor + GLINK_OUR_HEAD, glink_queue_after(head, padded, glink.ours_size));
 	hakios_barrier();
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_GLINK);
+	ring_dsp(IPCC_GLINK);
 	glink.said++;
 	return true;
 }
@@ -1996,7 +2094,7 @@ glink_pump(void)
 		}
 		case GLINK_READ_NOTIFY:
 			glink_advance(length);
-			wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_GLINK);
+			ring_dsp(IPCC_GLINK);
 			break;
 		case GLINK_CLOSE:
 			glink_advance(length);
@@ -2700,7 +2798,7 @@ battmgr_start(void)
 	uint32_t wanted = 1;            /* (on with adsp=1 unless battmgr=0) */
 
 	PE_parse_boot_argn("battmgr", &wanted, sizeof(wanted));
-	if (wanted == 0 || battmgr.runs) {
+	if (wanted == 0 || battmgr.runs || no_battmgr) {
 		return;
 	}
 	/*
@@ -3095,6 +3193,42 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/*
+ * An SM7150 (Snapdragon 730: the Mi 9T, "davinci"; board feature "adsp-sm7150"): the numbers of its audio DSP, from the phone's
+ * own device tree (davinci-data/phone.dts) where this file's other phones have them in board.dts. The DSP is the same
+ * Hexagon of LPASS under the same TrustZone image (qcom,pas-id of qcom,lpass@62400000: 1), its shared-memory items are the
+ * same (smp2p-adsp's <443 429>, smem-id 423, GLINK's 478 to 480 in the partition with processor 2), its channels the same
+ * ("IPCRTR", "apr_audio_svc") and APR the same (domains 4 and 5, services 3 AVCS, 4 AFE, 7 ASM, 8 ADM). What differs:
+ *   - no IPCC: the doorbells go through APCS (above), and nothing is read back
+ *   - memory pil_adsp_region@95700000, 0x2600000 bytes (the image loads from 0x95700000 to 0x97d00000)
+ *   - shared memory smem_region at 0x86000000, 0x200000 bytes, its hardware lock TCSR mutex 3 (0x1f43000)
+ *   - the command database is where the stock boot loader leaves it (0x85f20000: board.dts rpmh { } says so too and is
+ *     used if it is there) and the sequencer is apps_rsc 0x18220000, TCSs from +0xd00
+ *   - the always-on processor's mailbox is the same QMP at 0xc300000 (rung by APCS bit 0)
+ *   - the firmware is adsp.mdt and adsp.b00 to b26 (18 MB: the phone's modem partition, /vendor/firmware_mnt/image)
+ *   - no battery manager: that is the SM7325 DSP's job, over a channel this one does not open
+ * The ADSP's rails are lcx.lvl and lmx.lvl at level 384 (dt: vdd_lpi_cx and vdd_lpi_mx, qcom,vdd_cx-uV-uA 385), as before.
+ */
+static void
+chip_sm7150(const struct hakios_board *board)
+{
+	sm7150 = true;
+	smem_phys_v = 0x86000000u;
+	smem_size_v = 0x200000u;
+	cmd_db_phys_v = board->rpmh.cmd_db != 0 ? board->rpmh.cmd_db : 0x85f20000u;
+	cmd_db_size_v = board->rpmh.cmd_db != 0 ? board->rpmh.cmd_db_size : 0x20000u;
+	rsc.phys = board->rpmh.rsc != 0 ? board->rpmh.rsc : 0x18220000u;
+	tcs_offset_v = board->rpmh.rsc != 0 ? board->rpmh.tcs_offset : 0xd00u;
+	aoss.phys = 0x0c300000u;
+	smem_lock.phys = 0x01f43000u;
+	adsp_firmware = "fw";
+	adsp_memory = 0x95700000u;
+	adsp_memory_size = 0x2600000u;
+	no_battmgr = true;
+	printf("adsp: an SM7150: no IPCC (APCS doorbells), shared memory %#x, command DB %#x, the DSP's memory %#x (%#x bytes)\n",
+	    smem_phys_v, cmd_db_phys_v, adsp_memory, adsp_memory_size);
+}
+
 /* Called while the system starts (bsd/dev/board/drivers.c), after the Wi-Fi's start has been set going. */
 void
 hakios_adsp_init(void)
@@ -3107,25 +3241,34 @@ hakios_adsp_init(void)
 	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
 		return;
 	}
-	if (!hakios_board_has(HAKIOS_HAS_ADSP) || board->adsp.firmware == NULL || board->adsp.memory == 0 ||
-	    board->adsp.memory_size == 0) {
-		printf("adsp: adsp=1 and adsp_step=N are for a phone's audio DSP: this board's board.dts lists no \"adsp\" with "
-		    "an adsp { } section\n");
-		return;
+	if (hakios_board_has(HAKIOS_HAS_ADSP_SM7150) && !hakios_board_has(HAKIOS_HAS_ADSP)) {
+		chip_sm7150(board);
+	} else {
+		if (!hakios_board_has(HAKIOS_HAS_ADSP) || board->adsp.firmware == NULL || board->adsp.memory == 0 ||
+		    board->adsp.memory_size == 0) {
+			printf("adsp: adsp=1 and adsp_step=N are for a phone's audio DSP: this board's board.dts lists no \"adsp\" with "
+			    "an adsp { } section\n");
+			return;
+		}
+		if (board->rpmh.cmd_db == 0 || board->rpmh.rsc == 0 || board->ipc.aoss == 0 || board->ipc.ipcc == 0 ||
+		    board->ipc.smem == 0 || board->ipc.smem_lock == 0) {
+			printf("adsp: disabled: the SoC file does not say where RPMh and the way to the other processors are (rpmh { }, "
+			    "ipc { }): the DSP's supplies are asked for there, and the DSP is talked to through it\n");
+			return;
+		}
+		cmd_db_phys_v = board->rpmh.cmd_db;
+		cmd_db_size_v = board->rpmh.cmd_db_size;
+		tcs_offset_v = board->rpmh.tcs_offset;
+		smem_phys_v = board->ipc.smem;
+		smem_size_v = board->ipc.smem_size;
+		rsc.phys = board->rpmh.rsc;
+		aoss.phys = board->ipc.aoss;
+		ipcc.phys = board->ipc.ipcc;
+		smem_lock.phys = board->ipc.smem_lock;
+		adsp_firmware = board->adsp.firmware;
+		adsp_memory = board->adsp.memory;
+		adsp_memory_size = board->adsp.memory_size;
 	}
-	if (board->rpmh.cmd_db == 0 || board->rpmh.rsc == 0 || board->ipc.aoss == 0 || board->ipc.ipcc == 0 ||
-	    board->ipc.smem == 0 || board->ipc.smem_lock == 0) {
-		printf("adsp: disabled: the SoC file does not say where RPMh and the way to the other processors are (rpmh { }, "
-		    "ipc { }): the DSP's supplies are asked for there, and the DSP is talked to through it\n");
-		return;
-	}
-	rsc.phys = board->rpmh.rsc;
-	aoss.phys = board->ipc.aoss;
-	ipcc.phys = board->ipc.ipcc;
-	smem_lock.phys = board->ipc.smem_lock;
-	adsp_firmware = board->adsp.firmware;
-	adsp_memory = board->adsp.memory;
-	adsp_memory_size = board->adsp.memory_size;
 	if (board->adsp.charge_counter_divisor != 0) {
 		charge_counter_divisor = board->adsp.charge_counter_divisor;
 	}
