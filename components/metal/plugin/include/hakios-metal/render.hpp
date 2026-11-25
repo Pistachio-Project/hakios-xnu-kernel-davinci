@@ -465,6 +465,12 @@ struct Options {
     bool tailDepthFlush = true;  // with a depth attachment: PC_CCU_FLUSH_DEPTH_TS writing a value + the wait for it
     bool tailLrzFlush = true;    // LRZ_FLUSH, 1 word
     bool tailCacheFlush = true;  // CACHE_FLUSH_TS + CP_WAIT_MEM_GTE, as compute's tail
+    // metal_pass_sync: 0 the tail as above; 1 the cache flush and its wait only for a pass whose stages write buffers (tailKeepCacheFlush:
+    // the colour and depth CCUs are cleaned and waited for as before, and the next pass invalidates the texture cache as it begins);
+    // 2 as 1, without the wait for idle ahead of the flush events (an event goes down the pipeline behind the draws before it, and
+    // the wait for its word is the wait for all of them)
+    uint8_t tailSync = 0;
+    bool tailKeepCacheFlush = false;
     bool tailRbDone = false;     // RB_DONE_TS + wait: in neither witness's render end; here for the bisect
     bool tailTimestampBit = false;   // must stay clear (28 October); here for the fake's test only
     bool dedupRegs = true;       // in an open pass, a register write that would put the value the register already holds is
@@ -702,3 +708,8 @@ void encodeBytes(pm4::Stream& stream, uint64_t from, uint64_t to, uint64_t lengt
 }  // namespace render
 
 }  // namespace hakios::metal
+
+namespace hakios::metal::render {
+// what the tails encoded since the last call (all recordings, a pass recorded both ways twice): waits for idle, flush events, waits for a word
+void tailCounts(unsigned* idles, unsigned* flushes, unsigned* waits);
+}  // namespace hakios::metal::render

@@ -987,6 +987,14 @@ void hakios_metal_cb_set_gmem_binning(hakios_metal_cb* cb, int on) {
     cb->cb->setGmemBinning(on != 0);
 }
 
+void hakios_metal_cb_set_pass_sync(hakios_metal_cb* cb, int level) {
+    const uint8_t l = uint8_t(level < 0 ? 0 : level > 2 ? 2 : level);
+    if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, l] { cb->cb->setPassSync(l); });
+    cb->cb->setPassSync(l);
+}
+
+void hakios_metal_tail_counts(unsigned* idles, unsigned* flushes, unsigned* waits) { render::tailCounts(idles, flushes, waits); }
+
 void hakios_metal_cb_set_full_state(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, on] { cb->cb->setFullState(on != 0); });
     cb->cb->setFullState(on != 0);

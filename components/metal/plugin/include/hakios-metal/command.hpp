@@ -102,6 +102,10 @@ public:
     // until this completes; the target's memory is used for write and kept. False with the reason recorded (render::encode's).
     bool draw(const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings, const Bindings& fsBindings,
               const render::Options& options = render::Options{});
+private:
+    bool drawWith(const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings, const Bindings& fsBindings,
+                  const render::Options& options);
+public:
     // a pass with no draw whose load action is Clear (render::encodeClear): the target filled with the clear colour, a
     // complete pass of its own. What an encoder that recorded no draw needs at its end; anything else is refused.
     bool clear(const RenderPass& pass, const render::Options& options = render::Options{});
@@ -206,6 +210,8 @@ public:
     }
     // render::Options::gmemBinning for this buffer's draws besides each draw's own (either asks for it)
     void setGmemBinning(bool on) { gmemBinning_ = on; }
+    // metal_pass_sync (render::Options::tailSync): 0 the full flush and wait for idle after each pass, 1 and 2 less
+    void setPassSync(uint8_t level) { passSync_ = level; }
     // every fragment texture the null texture (1x1, always in the texture cache): wrong pictures, but a draw's time then
     // says what its shader costs without its texture reads -- a measurement switch, as setGmemOff is a bisect's
     void setNullFsTextures(bool on) { nullFsTextures_ = on; }
@@ -246,6 +252,7 @@ private:
     uint32_t gmemOff_ = 0;
     uint32_t gmemMinDraws_ = 0;
     bool gmemBinning_ = false;
+    uint8_t passSync_ = 0;
     bool nullFsTextures_ = false;
     bool fullState_ = envFullState();
     uint32_t dirtyGroups_ = envDirtyGroups();

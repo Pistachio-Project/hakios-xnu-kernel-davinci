@@ -850,6 +850,91 @@ main(void)
 		CHECK(read_head(0, &h0) && h0.generation == 64 && !archive_whole(0, &h0),
 		    "generation 64 in the same slot, torn, is not taken for the whole one remembered");
 	}
+	/*
+	 * incremental_save: a tree with big files, and what each save writes into the flash. The first two saves fill both
+	 * slots; from the third on the slot's old archive is compared by its table of hashes (no read-back), and only the
+	 * blocks that differ are written. Also what the diagnostic list leaves out, and that every archive reads back.
+	 */
+	{
+		static uint64_t hash_a[TABLE_MAX], hash_b[TABLE_MAX];
+		static uint8_t scratch[BUFFER];
+		static char p[4096];
+		uint64_t total;
+
+		new_hash = hash_a;
+		old_hash = hash_b;
+		already = scratch;
+		boot_line = "var_store=1";
+		keychain_wanted = -1;
+		diag_wanted = -1;
+		snprintf(p, sizeof(p), "mkdir -p %s/var/mobile/Library/Caches/shaders %s/var/mobile/Library/Logs/CrashReporter "
+		    "%s/var/db/diagnostics %s/var/mobile/Library/Preferences", test_root, test_root, test_root, test_root);
+		CHECK(system(p) == 0, "the tree's directories");
+		for (int i = 0; i < 6; i++) {
+			snprintf(p, sizeof(p), "head -c %d /dev/urandom > %s/var/mobile/Library/Caches/shaders/s%d", 600000 + i * 1000,
+			    test_root, i);
+			CHECK(system(p) == 0, "shader cache %d", i);
+		}
+		for (int i = 0; i < 300; i++) {
+			snprintf(p, sizeof(p), "head -c %d /dev/urandom > %s/var/mobile/Library/Preferences/p%03d.plist", 300 + i * 7,
+			    test_root, i);
+			(void)system(p);
+		}
+		snprintf(p, sizeof(p), "head -c 3000000 /dev/urandom > %s/var/mobile/Library/Logs/CrashReporter/a.ips; "
+		    "head -c 2000000 /dev/urandom > %s/var/mobile/Library/Preferences/huge.log; "
+		    "head -c 50000 /dev/urandom > %s/var/mobile/Library/Preferences/small.log; "
+		    "head -c 4000000 /dev/urandom > %s/var/db/diagnostics/x.tracev3", test_root, test_root, test_root, test_root);
+		CHECK(system(p) == 0, "logs");
+		memset(&h, 0, sizeof(h));
+		CHECK(save(), "save 1");
+		CHECK(read_head(0, &h) && pass(&h, 0), "the archive reads back whole, pads and all");
+		total = h.bytes / BLOCK;
+		CHECK(h.bytes < 8u << 20, "the archive is %llu bytes: the diagnostic data is not in it", (unsigned long long)h.bytes);
+		CHECK(skipped_logs == 1 && skipped_log_bytes == 2000000, "the big log alone is capped (%llu)", (unsigned long long)skipped_logs);
+		CHECK(save(), "save 2");
+		CHECK(save(), "save 3, with a table");
+		CHECK(old_hash_n != 0, "the slot's old archive was known by its table");
+		CHECK(written_blocks == 0 && skipped_blocks >= total, "nothing changed, nothing written: %llu written, %llu left",
+		    (unsigned long long)written_blocks, (unsigned long long)skipped_blocks);
+		/* one shader cache rewritten in place */
+		snprintf(p, sizeof(p), "head -c 601000 /dev/urandom > %s/var/mobile/Library/Caches/shaders/s1", test_root);
+		CHECK(system(p) == 0 && save() && save(), "a cache changed, two saves");
+		CHECK(written_blocks > 100 && written_blocks < 200, "only its blocks are written: %llu of %llu", (unsigned long long)written_blocks,
+		    (unsigned long long)total);
+		/* a small file added at the front, one preference grown */
+		snprintf(p, sizeof(p), "echo hello > %s/var/aaa; head -c 9000 /dev/urandom > %s/var/mobile/Library/Preferences/p001.plist",
+		    test_root, test_root);
+		CHECK(system(p) == 0 && save() && save(), "a file added in front, two saves");
+		CHECK(written_blocks < 100, "the big files stay where they were: %llu of %llu blocks written", (unsigned long long)written_blocks,
+		    (unsigned long long)total);
+		CHECK(read_head(0, &h) && pass(&h, 0) && read_head(1, &h) && pass(&h, 0), "both archives read back whole");
+		/* a torn slot has no table: it is read back */
+		{
+			static uint8_t zero[BLOCK];
+			CHECK(device_write(slot_at(0), zero, BLOCK) && save(), "a slot whose header is gone is written whole");
+			CHECK(old_hash_n == 0, "with no table to go by it is read back");
+		}
+		/* restore: a file gone, the archive puts it back */
+		snprintf(p, sizeof(p), "cp %s/var/mobile/Library/Caches/shaders/s3 %s/s3.orig; rm %s/var/mobile/Library/Caches/shaders/s3",
+		    test_root, test_root, test_root);
+		CHECK(system(p) == 0 && load(), "load");
+		snprintf(p, sizeof(p), "cmp %s/var/mobile/Library/Caches/shaders/s3 %s/s3.orig", test_root, test_root);
+		CHECK(system(p) == 0, "the cache is back, byte for byte");
+		/* the diagnostic list: var_store_diag=1 keeps it */
+		boot_line = "var_store=1 var_store_diag=1";
+		diag_wanted = -1;
+		CHECK(save(), "a save keeping the diagnostic data");
+		CHECK(skipped_logs == 0, "no log is capped with var_store_diag=1");
+		CHECK(read_head(0, &h) && read_head(1, &h) && (h.bytes > 8u << 20), "and the archive holds it (%llu bytes)", (unsigned long long)h.bytes);
+		boot_line = "var_store=1";
+		diag_wanted = -1;
+		CHECK(is_skipped("mobile/Library/Logs") && is_skipped("db/powerlog") && !is_skipped("mobile/Library/Caches") &&
+		    !is_skipped("mobile/Library/Preferences") && !is_skipped("db/hakios-metal-cache"),
+		    "the diagnostic list leaves out logs and keeps the caches and the preferences");
+		new_hash = old_hash = NULL;
+		already = NULL;
+	}
+
 	{
 		char p[1024];
 

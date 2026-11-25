@@ -19,6 +19,8 @@
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/texture.hpp"
 
+#include <atomic>
+
 namespace hakios::metal {
 
 namespace render {
@@ -1230,6 +1232,8 @@ void passStart(pm4::Stream& stream, uint32_t W, uint32_t H, uint64_t table, cons
     }
 }
 
+std::atomic<unsigned> gTailIdles{0}, gTailFlushes{0}, gTailWaits{0};
+
 void passTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth = false) {
     // 19. the tail: a WFI (as compute's), then what puts the colour in memory -- PC_CCU_FLUSH_COLOR_TS as a 4-word event
     // writing 1 (turnip's form, tu_cmd_buffer.cc:48-70, with a value where turnip writes a dummy) and a wait for it
@@ -1237,18 +1241,26 @@ void passTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth 
     // hakios.adreno.c:3496-3516, so the wait is cheap insurance); LRZ_FLUSH as both witnesses end a pass (tu_lrz.cc:465,
     // fd6_gmem.cc:2114); RB_DONE_TS only under tailRbDone (in neither witness's render end); CACHE_FLUSH_TS writing 2 and
     // CP_WAIT_MEM_GTE for it, compute's measured tail
-    stream.waitForIdle();
+    // (metal_pass_sync 2: no wait for idle first, the flush events being behind the draws in the pipeline already)
+    if (o.tailSync < 2) {
+        stream.waitForIdle();
+        gTailIdles++;
+    }
     {
         const uint64_t ts = table + kTableTimestampsAt;
         if (o.tailCcuFlush) {
             eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, ts, 1, o.tailTimestampBit);
             waitForWord(stream, ts, 1);
+            gTailFlushes++;
+            gTailWaits++;
         }
         // with a depth attachment its CCU too (tu6_emit_flushes' FD_CCU_CLEAN_DEPTH, the 4-word PC_CCU_FLUSH_DEPTH_TS on
         // A6XX): every draw is a pass of its own here, so the next draw's depth test must find this one's depth in memory
         if (depth && o.tailDepthFlush) {
             eventTimestamp(stream, PC_CCU_FLUSH_DEPTH_TS, table + kTableDepthFlushAt, kDepthFlushValue, false);
             waitForWord(stream, table + kTableDepthFlushAt, kDepthFlushValue);
+            gTailFlushes++;
+            gTailWaits++;
         }
         if (o.tailLrzFlush) {
             event(stream, LRZ_FLUSH);
@@ -1257,14 +1269,22 @@ void passTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth 
             eventTimestamp(stream, RB_DONE_TS, ts + 8, 3, o.tailTimestampBit);
             waitForWord(stream, ts + 8, 3);
         }
-        if (o.tailCacheFlush) {
+        if (o.tailCacheFlush && (o.tailSync == 0 || o.tailKeepCacheFlush)) {
             eventTimestamp(stream, CACHE_FLUSH_TS, ts + 4, 2, o.tailTimestampBit);
             waitForWordAtLeast(stream, ts + 4, 2);
+            gTailFlushes++;
+            gTailWaits++;
         }
     }
 }
 
 }  // namespace
+
+void tailCounts(unsigned* idles, unsigned* flushes, unsigned* waits) {
+    *idles = gTailIdles.exchange(0);
+    *flushes = gTailFlushes.exchange(0);
+    *waits = gTailWaits.exchange(0);
+}
 
 namespace {
 // A draw, either WHOLE (its own pass: the batch start, the pass begin, the clears, the draw, the tail) or inside a pass
@@ -3129,6 +3149,22 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
 
 bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
                          const render::Options& options) {
+    if (passSync_ == 0) return drawWith(program, pass, d, vsBindings, fsBindings, options);
+    // (the pass's tail by what its draws did: a program that stores to buffers keeps the cache flush, which is then a difference
+    // between draws and so between passes of the same target)
+    render::Options o = options;
+    o.tailSync = passSync_;
+    o.tailKeepCacheFlush = (program.vs.k.numSsbos != 0 && (program.ssboWrites & 1)) || (program.fs.k.numSsbos != 0 && (program.ssboWrites & 2));
+    for (const Kernel* k : {&program.vs.k, &program.fs.k}) {
+        for (uint32_t i = 0; i < kMaxTextureSlots && i < k->numTextureSlots; i++) {
+            if (k->textures[i].kind == kTexImage) o.tailKeepCacheFlush = true;   // (stib: through the UCHE as a buffer's store is)
+        }
+    }
+    return drawWith(program, pass, d, vsBindings, fsBindings, o);
+}
+
+bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
+                             const render::Options& options) {
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }

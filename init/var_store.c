@@ -101,6 +101,35 @@ static const char *const SKIP[] = {
 };
 
 /*
+ * Diagnostic and regenerable data, left out as well unless boot-arg var_store_diag=1 asks for it (and, with it, the
+ * log files over LOG_CAP below). Everything here is made again by the system or only says what a run did; none of it is
+ * settings, preferences, keychain, or the shader and icon caches, which stay. What it saves is the growth of the store
+ * from run to run (322 MB at generation 4, 627 MB at 13), and with it the time of the save, which grows with the
+ * bytes. Paths are relative to /private/var, a directory's contents are left out, the directory is kept.
+ */
+static const char *const SKIP_DIAG[] = {
+	"Logs", "root/Library/Logs",
+	"mobile/Library/Logs",                  /* CrashReporter, analytics, DiagnosticMessages, MobileInstallation, ... */
+	"db/analyticsd", "db/powerlog", "db/PowerLog", "db/ReportCrash",
+	"db/dyld",                              /* the launch closures and dyld caches: made again at launch */
+	"db/Spotlight", "mobile/Library/Spotlight", "mobile/Library/Metadata/CoreSpotlight",
+	"db/biome", "mobile/Library/Biome",     /* the event streams: personalisation only */
+	"mobile/Library/CoreDuet", "mobile/Library/DuetExpertCenter", "mobile/Library/IntelligencePlatform",
+	"mobile/Library/PowerLog", "mobile/Library/com.apple.aggregated",
+	"mobile/Media/MediaAnalysis",           /* mediaanalysisd's scene and face results */
+	"mobile/Library/SplashBoard/Snapshots", /* the app switcher's pictures */
+	"mobile/Library/Caches/com.apple.dyld",
+	"mobile/Library/Caches/com.apple.nsurlsessiond/Downloads",
+	"mobile/Library/Caches/com.apple.CacheDelete",
+	"MobileAsset/Downloads", "mobile/Library/Caches/com.apple.mobileassetd",
+	"db/CoreDuet", "mobile/Library/Caches/com.apple.coreduetd",
+	NULL,
+};
+
+/* a log file bigger than this is left out (the diagnostic list's second half) */
+#define LOG_CAP         (1u << 20)
+
+/*
  * And by name, wherever it is: LaunchServices' database (com.apple.LaunchServices-*.csstore, in a data container
  * whose name is a UUID). 16.5 made it at every boot by walking /Applications, which is how an application put into
  * the system image appears; kept across boots it is the first boot's, and an application added since is never
@@ -119,7 +148,12 @@ is_launchservices_store(const char *relative)
 	return 0;
 }
 
-enum { ENT_DIR = 1, ENT_FILE = 2, ENT_SYMLINK = 3, ENT_HARDLINK = 4, ENT_DIRTIME = 5 };
+enum { ENT_DIR = 1, ENT_FILE = 2, ENT_SYMLINK = 3, ENT_HARDLINK = 4, ENT_DIRTIME = 5,
+       ENT_PAD = 6 /* size bytes of nothing follow the head: puts the next file's data on a boundary (no path, no pad after) */ };
+
+/* a file this big has its data begin on, and its entry end on, an ALIGN boundary of the archive (pack_one) */
+#define ALIGN           (32u << 10)
+#define ALIGN_MIN       (128u << 10)
 
 #define HEAD_MAGIC      "RDWVAR\0"
 #define HEAD_VERSION    1
@@ -173,6 +207,35 @@ boot_arg_is(const char *name, const char *value)
 		if (strncmp(p, name, n) == 0 && p[n] == '=' && strncmp(p + n + 1, value, v) == 0 &&
 		    (p[n + 1 + v] == 0 || p[n + 1 + v] == ' ')) {
 			return 1;
+		}
+		while (*p && *p != ' ') {
+			p++;
+		}
+	}
+	return 0;
+}
+
+/* The number NAME=<number> in the kernel's arguments is, or 0 */
+static long
+boot_arg_number(const char *name)
+{
+	static char args[1024];
+	size_t len = sizeof(args) - 1, n = strlen(name);
+	long value = 0;
+
+	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
+		return 0;
+	}
+	args[len < sizeof(args) ? len : sizeof(args) - 1] = 0;
+	for (char *p = args; *p;) {
+		while (*p == ' ') {
+			p++;
+		}
+		if (strncmp(p, name, n) == 0 && p[n] == '=') {
+			for (p += n + 1; *p >= '0' && *p <= '9'; p++) {
+				value = value * 10 + (*p - '0');
+			}
+			return value;
 		}
 		while (*p && *p != ' ') {
 			p++;
@@ -434,6 +497,95 @@ device_read(off_t where, void *data, uint64_t n)
 	return 1;
 }
 
+/* ---- what each block of a slot held when it was last saved: so a save need not read it back to know ---- */
+
+/*
+ * A slot's archive is followed by a table of one 64-bit hash a block of it, and the header block (past the header
+ * itself) says where, how long and with what checksum. The save into a slot compares the blocks it is about to write
+ * with the table of the archive that is in that slot (the one before the newest), read at the start while its header
+ * is still whole, instead of reading the whole slot back: only changed blocks cost anything. The table is only ever
+ * trusted while the slot's header checks out and says of the table what the table says of itself; a save that is torn
+ * wrote a zero header first, so the next one into that slot reads the blocks back, as before. Old archives have no
+ * table and are read back once.
+ */
+#define TABLE_AT        64                      /* in the header block, after struct head */
+#define TABLE_MAGIC     "RDWTBL1"
+#define TABLE_MAX       ((uint64_t)SLOT_BYTES / BLOCK)
+
+struct tblhead {
+	char     magic[8];
+	uint64_t generation, bytes, blocks;
+	uint32_t crc;                           /* of the table's bytes */
+	uint32_t self_crc;                      /* of this structure with self_crc zero */
+};
+
+static uint64_t *new_hash;                      /* the hashes of the blocks being written (NULL: no table is kept) */
+static uint64_t *old_hash;                      /* the table of what the slot held */
+static uint64_t old_hash_n;                     /* its blocks; 0: none, read the slot back */
+static off_t stream_base;                       /* where the archive's first byte is */
+static uint64_t hashed_blocks;
+static int read_head(int slot, struct head *into);
+
+static uint64_t
+hash_block(const uint8_t *p)
+{
+	uint64_t h = 0x9E3779B97F4A7C15ull;
+
+	for (unsigned i = 0; i < BLOCK; i += 8) {
+		uint64_t w;
+
+		memcpy(&w, p + i, 8);
+		h = (h ^ w) * 0xff51afd7ed558ccdull;
+		h ^= h >> 29;
+	}
+	return h ^ (h >> 32);
+}
+
+static uint32_t
+tbl_checksum(const struct tblhead *t)
+{
+	struct tblhead copy = *t;
+
+	copy.self_crc = 0;
+	return crc_add(0xffffffffu, &copy, sizeof(copy)) ^ 0xffffffffu;
+}
+
+static uint64_t
+table_bytes(uint64_t blocks)
+{
+	return (blocks * 8 + BLOCK - 1) / BLOCK * BLOCK;
+}
+
+/* The table of SLOT's archive into old_hash, if the slot has a good header and a table that agrees with it. */
+static void
+load_table(int slot)
+{
+	static uint8_t block[BLOCK];
+	struct head h;
+	struct tblhead t;
+	uint64_t n;
+
+	old_hash_n = 0;
+	if (old_hash == NULL || !read_head(slot, &h) || !device_read(slot_at(slot), block, BLOCK)) {
+		return;
+	}
+	memcpy(&t, block + TABLE_AT, sizeof(t));
+	if (memcmp(t.magic, TABLE_MAGIC, sizeof(TABLE_MAGIC)) != 0 || t.self_crc != tbl_checksum(&t) ||
+	    t.generation != h.generation || t.bytes != h.bytes || t.blocks != (h.bytes + BLOCK - 1) / BLOCK ||
+	    t.blocks == 0 || t.blocks > TABLE_MAX) {
+		return;
+	}
+	n = table_bytes(t.blocks);
+	if (slot_at(slot) + BLOCK + (off_t)(t.blocks * BLOCK) + (off_t)n > slot_at(slot) + SLOT_BYTES ||
+	    !device_read(slot_at(slot) + BLOCK + (off_t)(t.blocks * BLOCK), old_hash, n)) {
+		return;
+	}
+	if ((crc_add(0xffffffffu, old_hash, t.blocks * 8) ^ 0xffffffffu) != t.crc) {
+		return;
+	}
+	old_hash_n = t.blocks;
+}
+
 /* ---- writing the archive out ---- */
 
 static int
@@ -454,19 +606,55 @@ out_flush(int last)
 		printf("var_store: the archive does not fit in its slot: nothing more is written\n");
 		return 0;
 	}
-	/*
-	 * What is already there is read first, and if it is what we were about to write, it is not
-	 * written. A volume that Darwin has stopped touching packs to the very same bytes -- measured:
-	 * two saves a minute apart came out with the same checksum -- and the slots hold alternate
-	 * copies of it, so a save that changes nothing then costs reads and no writes at all. Reads
-	 * of this storage are several times cheaper than writes, and flash wears by writing.
-	 */
-	if (already != NULL && device_read(at, already, n) && memcmp(already, buffer, (size_t)n) == 0) {
-		skipped_blocks += n / BLOCK;
-	} else if (!device_write(at, buffer, n)) {
-		return 0;
-	} else {
-		written_blocks += n / BLOCK;
+	{
+		/*
+		 * Each block against what the slot held there: by the old table if there is one, else by reading the slot back
+		 * (a volume Darwin has stopped touching packs to the very same bytes, and a save that changes nothing then
+		 * costs no writes; flash wears by writing and writes are several times dearer than reads). The blocks that
+		 * differ are written in runs, one request a run.
+		 */
+		uint64_t nb = n / BLOCK, first = (uint64_t)(at - stream_base) / BLOCK, run = 0;
+		int have_old = 0;
+
+		if (old_hash_n == 0 && already != NULL && device_read(at, already, n)) {
+			have_old = 1;
+		}
+		for (uint64_t i = 0; i <= nb; i++) {
+			int same = 0;
+
+			if (i < nb) {
+				uint64_t h = 0;
+
+				if (new_hash != NULL || old_hash_n != 0) {
+					h = hash_block(buffer + i * BLOCK);
+				}
+				if (new_hash != NULL && first + i < TABLE_MAX) {
+					new_hash[first + i] = h;
+					hashed_blocks = first + i + 1;
+				}
+				if (old_hash_n != 0) {
+					same = first + i < old_hash_n && old_hash[first + i] == h;
+				} else if (have_old) {
+					same = memcmp(already + i * BLOCK, buffer + i * BLOCK, BLOCK) == 0;
+				}
+			}
+			if (i < nb && !same) {
+				run++;
+				continue;
+			}
+			if (run != 0) {
+				uint64_t from = i - run;
+
+				if (!device_write(at + (off_t)(from * BLOCK), buffer + from * BLOCK, run * BLOCK)) {
+					return 0;
+				}
+				written_blocks += run;
+				run = 0;
+			}
+			if (i < nb) {
+				skipped_blocks++;
+			}
+		}
 	}
 	at += (off_t)n;
 	buffered = 0;
@@ -581,7 +769,8 @@ in_pad(void)
 static void
 stream_start(int slot, uint64_t bytes)
 {
-	at = slot_at(slot) + BLOCK;
+	at = stream_base = slot_at(slot) + BLOCK;
+	hashed_blocks = 0;
 	stream_limit = slot_at(slot) + SLOT_BYTES;
 	buffered = taken = 0;
 	stream_bytes = 0;
@@ -644,11 +833,27 @@ static char path[MAX_PATH];               /* the whole path, under ROOT */
 static struct { uint64_t ino; char path[LINK_PATH]; } *links;
 static uint64_t skipped_kinds, skipped_big;
 
+static int diag_wanted = -1;
+
+static int
+diag_kept(void)
+{
+	if (diag_wanted < 0) {
+		diag_wanted = boot_arg_is("var_store_diag", "1");
+	}
+	return diag_wanted;
+}
+
 static int
 is_skipped(const char *relative)
 {
 	for (int i = 0; SKIP[i] != NULL; i++) {
 		if (strcmp(relative, SKIP[i]) == 0) {
+			return 1;
+		}
+	}
+	for (int i = 0; !diag_kept() && SKIP_DIAG[i] != NULL; i++) {
+		if (strcmp(relative, SKIP_DIAG[i]) == 0) {
 			return 1;
 		}
 	}
@@ -767,6 +972,135 @@ pack_xattrs(uint32_t *count)
 }
 
 /* One entry: its head, its name, its extended attributes, its contents. */
+/* ---- where the bytes are: a summary at the end of every save, for finding what grows ---- */
+
+#define BUCKETS 192
+static struct bucket { char name[72]; uint64_t bytes, entries; } buckets[BUCKETS];
+static uint64_t skipped_logs, skipped_log_bytes;
+
+static void
+account_to(const char *name, size_t n, uint64_t bytes)
+{
+	struct bucket *free_one = NULL;
+
+	for (int i = 0; i < BUCKETS; i++) {
+		if (buckets[i].name[0] == 0) {
+			if (free_one == NULL) {
+				free_one = &buckets[i];
+			}
+			continue;
+		}
+		if (strlen(buckets[i].name) == n && memcmp(buckets[i].name, name, n) == 0) {
+			buckets[i].bytes += bytes;
+			buckets[i].entries++;
+			return;
+		}
+	}
+	if (free_one != NULL && n < sizeof(free_one->name)) {
+		memcpy(free_one->name, name, n);
+		free_one->name[n] = 0;
+		free_one->bytes = bytes;
+		free_one->entries = 1;
+	}
+}
+
+/* a file or whatever of SIZE bytes under RELATIVE: counted for its top directory, and for its first three levels
+ * (mobile/Library/Caches, db/diagnostics...) */
+static void
+account(const char *relative, uint64_t size)
+{
+	size_t n = 0;
+	int level = 0;
+
+	for (; relative[n] != 0; n++) {
+		if (relative[n] == '/') {
+			account_to(relative, n, size);
+			if (++level == 3) {
+				return;
+			}
+		}
+	}
+	if (level == 0) {
+		account_to(relative, n, size);
+	} else if (level < 3 && n != 0) {
+		account_to(relative, n, size);
+	}
+}
+
+static void
+print_summary(void)
+{
+	/* the biggest twenty, by selection */
+	for (int rank = 0; rank < 20; rank++) {
+		struct bucket *best = NULL;
+
+		for (int i = 0; i < BUCKETS; i++) {
+			if (buckets[i].name[0] != 0 && (best == NULL || buckets[i].bytes > best->bytes)) {
+				best = &buckets[i];
+			}
+		}
+		if (best == NULL || best->bytes < (1u << 20)) {
+			break;
+		}
+		printf("var_store: size: %llu bytes %llu entries %s\n", (unsigned long long)best->bytes,
+		    (unsigned long long)best->entries, best->name);
+		best->name[0] = 0;
+	}
+	if (skipped_logs != 0) {
+		printf("var_store: size: %llu log files over %u bytes, %llu bytes, left out (var_store_diag=1 keeps them)\n",
+		    (unsigned long long)skipped_logs, LOG_CAP, (unsigned long long)skipped_log_bytes);
+	}
+}
+
+/* a name that is a log by its ending */
+static int
+is_log_name(const char *relative)
+{
+	static const char *const endings[] = { ".log", ".crash", ".ips", ".asl", ".core", ".trace", ".tracev3", ".log.gz", ".ips.ca.synced", NULL };
+	size_t n = strlen(relative);
+
+	for (int i = 0; endings[i] != NULL; i++) {
+		size_t m = strlen(endings[i]);
+
+		if (n > m && strcmp(relative + n - m, endings[i]) == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* LENGTH bytes of nothing, as an entry that puts the stream on a boundary after it: used on both sides of a big file */
+static int
+pack_pad_to(uint64_t extra_before_boundary)
+{
+	struct entry e;
+	static const uint8_t zero[512];
+	uint64_t t = (ALIGN - (stream_bytes + extra_before_boundary) % ALIGN) % ALIGN;
+
+	if (t == 0) {
+		return 1;
+	}
+	if (t < sizeof(e)) {
+		t += ALIGN;
+	}
+	memset(&e, 0, sizeof(e));
+	e.kind = ENT_PAD;
+	e.size = t - sizeof(e);
+	if (!out(&e, sizeof(e))) {
+		return 0;
+	}
+	for (uint64_t left = e.size; left > 0;) {
+		uint64_t piece = left > sizeof(zero) ? sizeof(zero) : left;
+
+		if (!out(zero, piece)) {
+			return 0;
+		}
+		left -= piece;
+	}
+	entries++;
+	return 1;
+}
+
 static int
 pack_one(const char *relative, const struct stat *st)
 {
@@ -809,6 +1143,11 @@ pack_one(const char *relative, const struct stat *st)
 		 * (not through a symbolic link, and the very file that was looked at: one swapped for a link to a file of
 		 * root's between the lstat and here would go into the archive with this one's owner and mode)
 		 */
+		if (size > LOG_CAP && !diag_kept() && is_log_name(relative)) {
+			skipped_logs++;
+			skipped_log_bytes += size;
+			return 1;       /* a big log: what a run said, not what it keeps */
+		}
 		in_fd = open(path, O_RDONLY | VS_O_NOFOLLOW, 0);
 		if (in_fd < 0) {
 			return 1;       /* gone, or not ours to read: it is not in the archive */
@@ -851,6 +1190,12 @@ pack_one(const char *relative, const struct stat *st)
 	{
 		uint64_t xlen = pack_xattrs(&e.nxattr);
 
+		/* a big file's data on a boundary, so the blocks it fills are the same blocks next time whatever came before it */
+		if (in_fd >= 0 && size >= ALIGN_MIN && !pack_pad_to(sizeof(e) + e.pathlen + xlen)) {
+			close(in_fd);
+			return 0;
+		}
+		account(relative, size);
 		if (!out(&e, sizeof(e)) || !out(relative, e.pathlen) || !out(xpack, xlen)) {
 			if (in_fd >= 0) {
 				close(in_fd);
@@ -889,6 +1234,9 @@ pack_one(const char *relative, const struct stat *st)
 		return 0;
 	}
 	entries++;
+	if (size >= ALIGN_MIN && kind == ENT_FILE && !pack_pad_to(0)) {
+		return 0;       /* (and the next entry on a boundary too: the file growing a little moves nothing after it) */
+	}
 	return 1;
 }
 
@@ -1103,6 +1451,14 @@ save(void)
 	printf("var_store: the keychain is %s\n", keychain_kept() ? "kept too (var_store_keychain=1), and not encrypted" :
 	    "left out (var_store_keychain=1 keeps it)");
 
+	/* what the slot holds, by its table, while its header is still whole */
+	if (boot_arg_is("var_store_full", "1")) {
+		old_hash_n = 0;
+	} else {
+		load_table(slot);
+	}
+	printf("var_store: the slot's old archive is %s\n", old_hash_n != 0 ? "compared by its table of block hashes" :
+	    "read back to compare (no table)");
 	/* the slot's header first, so that a save cut short cannot leave an old header over a new archive */
 	memset(block, 0, sizeof(block));
 	if (!device_write(slot_at(slot), block, BLOCK)) {
@@ -1117,6 +1473,8 @@ save(void)
 	/* a watcher saves more than once: nothing of the save before is carried into this one */
 	memset(links, 0, LINKS * sizeof(*links));
 	skipped_kinds = skipped_big = 0;
+	skipped_logs = skipped_log_bytes = 0;
+	memset(buckets, 0, sizeof(buckets));
 	changed_under = 0;
 	strcpy(path, ROOT);
 	if (!pack_tree("") || !out_flush(1)) {
@@ -1144,9 +1502,28 @@ save(void)
 	}
 	memset(block, 0, sizeof(block));
 	memcpy(block, &h, sizeof(h));
+	/* the table of the blocks, after the archive and before the header that vouches for both */
+	if (new_hash != NULL && hashed_blocks == (h.bytes + BLOCK - 1) / BLOCK && hashed_blocks != 0) {
+		struct tblhead t;
+		uint64_t tb = table_bytes(hashed_blocks);
+		off_t tat = slot_at(slot) + BLOCK + (off_t)(hashed_blocks * BLOCK);
+
+		memset((uint8_t *)new_hash + hashed_blocks * 8, 0, tb - hashed_blocks * 8);
+		if (tat + (off_t)tb <= slot_at(slot) + SLOT_BYTES && device_write(tat, new_hash, tb)) {
+			memset(&t, 0, sizeof(t));
+			memcpy(t.magic, TABLE_MAGIC, sizeof(TABLE_MAGIC));
+			t.generation = h.generation;
+			t.bytes = h.bytes;
+			t.blocks = hashed_blocks;
+			t.crc = crc_add(0xffffffffu, new_hash, hashed_blocks * 8) ^ 0xffffffffu;
+			t.self_crc = tbl_checksum(&t);
+			memcpy(block + TABLE_AT, &t, sizeof(t));
+		}
+	}
 	if (!device_write(slot_at(slot), block, BLOCK)) {
 		return 0;
 	}
+	print_summary();
 	printf("var_store: slot %d: generation %llu, %llu entries, %llu bytes, crc %08x%s%s\n", slot,
 	    (unsigned long long)h.generation, (unsigned long long)h.entries, (unsigned long long)h.bytes,
 	    h.crc, skipped_kinds ? " (sockets and the like left out)" : "",
@@ -1236,6 +1613,9 @@ unpack_one(int make)
 	if (!in(&e, sizeof(e))) {
 		return 0;
 	}
+	if (e.kind == ENT_PAD) {
+		return in_skip(e.size);
+	}
 	if (e.pathlen >= MAX_PATH || e.nxattr > XATTRS) {
 		printf("var_store: an entry this program cannot read (kind %u, path %u bytes)\n", e.kind,
 		    e.pathlen);
@@ -1257,6 +1637,15 @@ unpack_one(int make)
 		const size_t n = strlen(SKIP[i]);
 
 		if (strncmp(relative, SKIP[i], n) == 0 && relative[n] == '/') {
+			make = 0;
+			skipped_load++;
+		}
+	}
+	/* (the diagnostic list too: an archive from before it holds hundreds of MB of it, and the boot would read it back for nothing) */
+	for (int i = 0; make && !diag_kept() && SKIP_DIAG[i] != NULL; i++) {
+		const size_t n = strlen(SKIP_DIAG[i]);
+
+		if (strncmp(relative, SKIP_DIAG[i], n) == 0 && relative[n] == '/') {
 			make = 0;
 			skipped_load++;
 		}
@@ -1899,6 +2288,11 @@ main(int argc, char **argv, char **envp)
 	if (already == MAP_FAILED) {
 		already = NULL;
 	}
+	new_hash = mmap(NULL, TABLE_MAX * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	old_hash = mmap(NULL, TABLE_MAX * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	if (new_hash == MAP_FAILED || old_hash == MAP_FAILED) {
+		new_hash = old_hash = NULL;     /* (no table: the slot is read back, as it was) */
+	}
 	if (strcmp(what, "watch") == 0) {
 		/* (var_store=new as well: a data volume begun anew this boot, kept from now on -- init did not unpack the store) */
 		if (!boot_arg_is("var_store", "1") && !boot_arg_is("var_store", "new")) {
@@ -1910,7 +2304,17 @@ main(int argc, char **argv, char **envp)
 			printf("var_store: var_store_skip: the store is only looked at this boot, not saved\n");
 			return 0;
 		}
-		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
+		/*
+		 * var_store_every=MINUTES: a save in between as well, so a crash costs that much and not the whole run. Off by
+		 * default; at least 2 minutes. A save into the slot that does not hold the newest archive writes the blocks that
+		 * changed since the one before the newest (see the table of hashes), so it is as cheap as what the volume changed.
+		 */
+		long every = argc > 2 ? parse_number(argv[2]) : boot_arg_number("var_store_every") * 60;
+
+		if (argc <= 2 && every > 0 && every < 120) {
+			every = 120;
+		}
+		return watch((int)every) ? 0 : 1;
 	}
 	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
 	if (fd < 0) {

@@ -614,7 +614,8 @@ static BOOL hm_fps_on(void);                          /* metal_fps: command buff
 static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled rendering where a pass allows it */
 static unsigned hm_dirty_groups(void);                /* metal_dirty_groups=MASK: the tracked register groups, a bit each */
 static BOOL hm_full_state(void);                      /* metal_full_state=1: every draw encodes all its register state (no dirty tracking) */
-static BOOL hm_binning_on(void);                      /* metal_gmem_binning=1: the hardware's binning in GMEM passes */
+static BOOL hm_binning_on(void);
+static unsigned hm_pass_sync(void);                      /* metal_gmem_binning=1: the hardware's binning in GMEM passes */
 static unsigned hm_gmem_off(void);                    /* metal_gmem_off=N: GMEM's refinements off, by bit */
 - (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;
 - (void)hakiosRefreshShadow;
@@ -5937,6 +5938,7 @@ HM_REFUSES_OUT_LOUD
 			hm_binning_on() ? "on" : "off");
 		hakios_metal_cb_set_gmem_min_draws(_cb, hm_gmem_draws());
 		hakios_metal_cb_set_gmem_binning(_cb, hm_binning_on());
+		hakios_metal_cb_set_pass_sync(_cb, hm_pass_sync());
 		hakios_metal_cb_set_full_state(_cb, hm_full_state());
 		hakios_metal_cb_set_dirty_groups(_cb, hm_dirty_groups());
 		hakios_metal_cb_set_null_fs_textures(_cb, (hm_gmem_off() & 32) != 0);   /* 32: no texture reads, to time the shaders alone */
@@ -6488,6 +6490,30 @@ hm_gmem_on(void)
  * 26 frames in 750 shown between two without the alert, each drawn anew); with every draw in every tile, none in 1057
  * (metal_gmem_cycle=0,8192,16,8208@12, logs/172853-run.log), at the same number of frames.
  */
+/* boot-arg metal_pass_sync=0|1|2 (default 0): what a pass's tail waits for. 0: the wait for idle, the colour (and depth) CCU flush
+ * with its wait, the cache flush with its wait, after every pass. 1: the cache flush only after a pass whose stages store to
+ * buffers (the next pass invalidates the texture cache as it begins). 2: and no wait for idle ahead of the CCU flush, whose word
+ * is waited for anyway. The fps report's "pass tails" line counts what was encoded either way, for the A/B. */
+static unsigned
+hm_pass_sync(void)
+{
+	static int level = -1;
+
+	if (level < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		level = 0;
+		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_pass_sync=")) != NULL) {
+			level = atoi(at + strlen("metal_pass_sync="));
+			if (level < 0 || level > 2) level = 0;
+		}
+		hm_print("pass tails: metal_pass_sync=%d\n", level);
+	}
+	return (unsigned)level;
+}
+
 static BOOL
 hm_binning_on(void)
 {
@@ -6965,6 +6991,13 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 "%u given up and kept, %u freed\n", made, bytes >> 10, reused, hm_memoryless_stat.made, hm_memoryless_stat.again,
 				 hm_memoryless_stat.kept, hm_memoryless_stat.freed);
 			memset(&hm_memoryless_stat, 0, sizeof(hm_memoryless_stat));
+			{
+				unsigned idles, flushes, waits;
+
+				hakios_metal_tail_counts(&idles, &flushes, &waits);
+				hm_print("fps: ... pass tails (metal_pass_sync=%u): %u waits for idle, %u flush events, %u waits for a flush's word encoded in these windows\n",
+					 hm_pass_sync(), idles, flushes, waits);
+			}
 			hm_cache_notes();
 			{
 				unsigned given, shared, full, big, prefilled, refills;
