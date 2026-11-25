@@ -3886,15 +3886,21 @@ hm_compress_ok(void)
  * the whole screen at 1-2.6 ms with 1 to 12 draws: some 18 MB a blended full-screen draw at ~14 GB/s, at the memory's
  * ceiling, and the same in GMEM. Compression is what moves fewer bytes. Private storage, because this processor never
  * reads such a texture (Metal forbids -getBytes: and -replaceRegion: on one; the core refuses both on a compressed render
- * target by name). Off until it is measured on the phone; metal_noubwc still turns every compressed texture off.
+ * target by name). On by default since the memory-bound heavy scenes (Settings, Control Center, Liquid Glass) of
+ * logs/145651-run.log; boot-arg metal_ubwc_rt=0 turns it off, metal_noubwc turns every compressed texture off. The
+ * fps report says how many were made.
  */
+static unsigned hm_ubwc_rt_made, hm_ubwc_rt_linear, hm_ubwc_rt_reported;
+
 static BOOL
 hm_compress_rt_ok(void)
 {
 	static int on = -1;
 
 	if (on < 0) {
-		on = hm_boot_arg_set("metal_ubwc_rt=1");
+		/* default on (the heavy scenes' blur passes are memory bound: logs/145651-run.log, 828x1792 passes of 2 draws at
+		 * 8.6 to 20 ms on a GPU at 565 MHz); metal_ubwc_rt=0 turns it off again */
+		on = !hm_boot_arg_set("metal_ubwc_rt=0");
 	}
 	return on;
 }
@@ -4160,6 +4166,9 @@ hm_memoryless_give(hakios_metal_texture *t, unsigned type, unsigned format, unsi
 	} else if (hm_compress(descriptor, usage)) {
 		texture = hakios_metal_texture_new_compressed(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],
 							      (unsigned)[descriptor height], (unsigned)usage);
+		if (usage != MTLTextureUsageShaderRead) {
+			__atomic_add_fetch(texture != NULL ? &hm_ubwc_rt_made : &hm_ubwc_rt_linear, 1, __ATOMIC_RELAXED);
+		}
 		if (hm_timeline_on()) {
 			hm_print("timeline: a compressed texture of %lux%lu, format %lu, usage %#lx: %s\n", (unsigned long)[descriptor width],
 				 (unsigned long)[descriptor height], (unsigned long)[descriptor pixelFormat], (unsigned long)usage,
@@ -6754,6 +6763,14 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 hm_fps.gapsOnTime, hm_fps.gapsLate, hm_fps.gapsStall, hm_fps.encode * 1e3 / per, hm_fps.encodeMax * 1e3, hm_fps.held,
 				 hm_fps.waits, hm_fps.waited * 1e3, hm_fps.drawCalls, hm_fps.drawCalls ? hm_fps.drawCpu * 1e6 / hm_fps.drawCalls : 0.0,
 				 hm_fps.drawCalls ? hm_fps.coreCpu * 1e6 / hm_fps.drawCalls : 0.0);
+		}
+		if (hm_compress_rt_ok() || hm_ubwc_rt_made != hm_ubwc_rt_reported) {
+			const unsigned made = __atomic_load_n(&hm_ubwc_rt_made, __ATOMIC_RELAXED);
+
+			hm_print("fps: ... UBWC render targets (metal_ubwc_rt=%d): %u made compressed (%u in these %.1f s), %u made linear after "
+				 "all\n", hm_compress_rt_ok() ? 1 : 0, made, made - hm_ubwc_rt_reported, span,
+				 __atomic_load_n(&hm_ubwc_rt_linear, __ATOMIC_RELAXED));
+			hm_ubwc_rt_reported = made;
 		}
 		if (hm_sampling()) hm_sample_report();
 		if (hm_timeline_on() && hm_fps.sampledBytes[0] + hm_fps.sampledBytes[1] + hm_fps.sampledBytes[2] + hm_fps.sampledBytes[3] + hm_fps.sampledBytes[4] +
