@@ -1300,8 +1300,14 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     }
     // (the groups of register state a pass tracks, render.hpp GroupCache: with no cache every group is encoded, into STREAM;
     // with one, a group is encoded only when the cache has no words for its key, into the cache's out[G])
-    const bool gStatic = grp == nullptr || grp->need(kGroupStatic, true, nullptr, 0);
-    auto sinkOf = [&](Group g) -> pm4::Stream& { return grp != nullptr ? grp->out[g] : stream; };
+    // Each tracked group's words go into the stream where its registers always were, behind the draw's HLSQ invalidate and the loads
+    // before them (done()); a group not tracked (the mask) is encoded whole into the stream as before (sinkOf is the stream).
+    auto tracked = [&](Group g) { return grp != nullptr && ((grp->mask >> g) & 1) != 0; };
+    auto sinkOf = [&](Group g) -> pm4::Stream& { return tracked(g) ? grp->out[g] : stream; };
+    auto ask = [&](Group g, bool withProgram, const void* key, size_t n) { return !tracked(g) || grp->need(g, withProgram, key, n); };
+    auto done = [&](Group g) { if (tracked(g)) grp->emitOne(g, stream); };
+    const bool gPass = ask(kGroupPass, true, nullptr, 0);
+    const bool gLink = ask(kGroupLink, true, nullptr, 0);
     // each stage's pushed constant ranges out of its own [[buffer(n)]] table (Metal's setVertexBuffer / setFragmentBuffer)
     // (each thread's own vectors, emptied here and kept: made anew, they were an allocation or two a draw)
     thread_local std::vector<PushedRange> vsRanges, fsRanges;
@@ -1417,8 +1423,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         return false;
     }
     // the blend group: the program's blending (in the program key), the blend colour, the depth and stencil state
-    bool gBlend = o.blendZsa && grp != nullptr;
-    if (gBlend) {
+    bool gBlend = false;
+    if (o.blendZsa && tracked(kGroupBlend)) {
         uint32_t k[4 + 2 + 1 + 2 * 6 + 2] = {};
         uint32_t n = 0;
         for (int i = 0; i < 4; i++) memcpy(&k[n++], &draw.blendColor[i], 4);
@@ -1434,7 +1440,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         }
         gBlend = grp->need(kGroupBlend, true, k, n * 4);
     }
-    const bool doBlend = grp == nullptr || gBlend;
+    const bool doBlend = !tracked(kGroupBlend) || gBlend;
     BlendWords blends[kMaxColorOutputs] = {};
     uint32_t blendMask = 0;
     for (uint32_t i = 0; doBlend && i < numRt; i++) {
@@ -1587,7 +1593,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // --- the link: ir3_link_shaders over the two stages' tables (src/link.cpp), recomputed here so that a hand-built
     // Program needs none and the one linkProgram stored cannot disagree with the registers
     Linkage link{};
-    if (gStatic) {
+    if (gLink) {
         if (!render::link(vs, fs, &link, why)) {
             return false;
         }
@@ -1610,7 +1616,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, size_t(vsTex.numSamp) * sizeof vsTex.sampWords[0]);
     MrtWords mrts[kMaxColorOutputs] = {};
     uint32_t srgbMask = 0;
-    for (uint32_t i = 0; gStatic && i < numRt; i++) {
+    for (uint32_t i = 0; gPass && i < numRt; i++) {
         // (an unwritten slot with no attachment of its own names another attachment's memory: valid, and never written.
         // In a pass of depth alone it names the depth texture's, as RGBA8 -- 4 bytes a pixel as Depth32Float's plane is,
         // so its rows are the depth's rows -- which RB_MRT_CONTROL 0 never lets it write; memory the pass owns rather
@@ -1630,13 +1636,14 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         if (mrts[i].srgb && fs.colorRegid[i] != kRegidNone) srgbMask |= 1u << i;
     }
     // each attachment's bin in a pass drawn in tiles
-    for (uint32_t i = 0; gStatic && gmem != nullptr && i < numRt; i++) {
+    for (uint32_t i = 0; gPass && gmem != nullptr && i < numRt; i++) {
         if (attachmentOf(pass, i).texture != nullptr) mrts[i].baseGmem = gmem->base[i];
     }
     const a6xx_threadsize fsThreads = fs.k.doubleThreadsize ? THREAD128 : THREAD64;
     const uint32_t* ij = fs.ijRegid;
 
-    pm4::Stream& ss = sinkOf(kGroupStatic);
+    pm4::Stream& sp = sinkOf(kGroupPass);
+    pm4::Stream& sl = sinkOf(kGroupLink);
     if (whole) {
         passStart(stream, W, H, table, o);
         // a Clear: the 2D engine fills the target before any draw state is written, as turnip's subpass begin does it;
@@ -1689,16 +1696,16 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // its base, BASE_GMEM 0 in sysmem, the same format in GRAS_SU_DEPTH_BUFFER_INFO, the flag buffer 0 (no UBWC), no
     // stencil. A6XX's RB_DEPTH_BUFFER_INFO has no tile field: the RB reads and writes depth TILE6_3, the only layout the
     // hardware has for it (fd6_layout.c:157-164), which is how texture.cpp lays a Depth32Float texture out.
-    if (gStatic && o.zsNone && pass.depth == nullptr) {
-        regs(ss, REG_A6XX_RB_DEPTH_BUFFER_INFO, {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_NONE), 0, 0, 0, 0, 0});
-        reg(ss, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_NONE));
-        reg(ss, REG_A6XX_RB_STENCIL_INFO, 0);
+    if (gPass && o.zsNone && pass.depth == nullptr) {
+        regs(sp, REG_A6XX_RB_DEPTH_BUFFER_INFO, {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_NONE), 0, 0, 0, 0, 0});
+        reg(sp, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_NONE));
+        reg(sp, REG_A6XX_RB_STENCIL_INFO, 0);
     }
-    if (gStatic && pass.depth != nullptr) {
+    if (gPass && pass.depth != nullptr) {
         const Texture& d = *pass.depth;
         // (a depth array's layer: that many tiled planes on, sliceBytes apart)
         const uint64_t depthAt = d.levelAddress(pass.depthLevel) + uint64_t(pass.depthSlice) * d.sliceBytes();
-        regs(ss, REG_A6XX_RB_DEPTH_BUFFER_INFO,
+        regs(sp, REG_A6XX_RB_DEPTH_BUFFER_INFO,
              {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
               A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(uint32_t(d.depthPlaneBytes())), uint32_t(depthAt), uint32_t(depthAt >> 32), 0});
         reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32));
@@ -1720,18 +1727,18 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // copies, GRAS_MAX_LAYER_INDEX 0
     // ...and RB_MRT[i] / SP_FS_MRT_REG[i] / the flag buffer for each further target the FS writes, the sRGB bit of each
     // in both copies (SRGB_MRTn is bit n in both registers)
-    if (gStatic && o.mrt) {
+    if (gPass && o.mrt) {
         for (uint32_t i = 0; i < numRt; i++) {
             const MrtWords& m = mrts[i];
-            regs(ss, regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, i), {m.bufInfo, m.pitch, m.arrayPitch, m.baseLo, m.baseHi, m.baseGmem});
-            reg(ss, regSpFsMrtReg(i), m.spFsMrtReg);
-            regs(ss, regRbMrtFlagBuffer(REG_A6XX_RB_MRT_FLAG_BUFFER_ADDR, i), {m.flagLo, m.flagHi, m.flagPitch});
+            regs(sp, regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, i), {m.bufInfo, m.pitch, m.arrayPitch, m.baseLo, m.baseHi, m.baseGmem});
+            reg(sp, regSpFsMrtReg(i), m.spFsMrtReg);
+            regs(sp, regRbMrtFlagBuffer(REG_A6XX_RB_MRT_FLAG_BUFFER_ADDR, i), {m.flagLo, m.flagHi, m.flagPitch});
         }
-        reg(ss, REG_A6XX_GRAS_LRZ_MRT_BUF_INFO_0, A6XX_GRAS_LRZ_MRT_BUF_INFO_0_COLOR_FORMAT(mrtFormatOf(mrts[0].bufInfo)));
-        reg(ss, REG_A6XX_RB_DITHER_CNTL, 0);
-        reg(ss, REG_A6XX_RB_SRGB_CNTL, srgbMask);
-        reg(ss, REG_A6XX_SP_SRGB_CNTL, srgbMask);
-        reg(ss, REG_A6XX_GRAS_MAX_LAYER_INDEX, 0);
+        reg(sp, REG_A6XX_GRAS_LRZ_MRT_BUF_INFO_0, A6XX_GRAS_LRZ_MRT_BUF_INFO_0_COLOR_FORMAT(mrtFormatOf(mrts[0].bufInfo)));
+        reg(sp, REG_A6XX_RB_DITHER_CNTL, 0);
+        reg(sp, REG_A6XX_RB_SRGB_CNTL, srgbMask);
+        reg(sp, REG_A6XX_SP_SRGB_CNTL, srgbMask);
+        reg(sp, REG_A6XX_GRAS_MAX_LAYER_INDEX, 0);
     }
     // 6. one sample (tu6_emit_msaa, tu_cmd_buffer.cc:892-910; fd6 emit_msaa, fd6_gmem.cc:1037-1061): RAS_MSAA_CNTL 0 and
     // DEST_MSAA_CNTL MSAA_DISABLE in the three blocks, the sample-location configs 0 (fd6_context.cc:300-306),
@@ -1739,66 +1746,65 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // ...or a multisample pass's count in all three blocks without MSAA_DISABLE, as tu6_emit_msaa writes it: the GRAS
     // covers samples, the RB writes each covered one, the FS still runs once a pixel (no sample shading). The sample
     // configs stay 0, the standard locations (tu6_emit_sample_locations without custom ones).
-    if (gStatic && o.msaaOff) {
+    if (gPass && o.msaaOff) {
         const a3xx_msaa_samples m = samples == 4 ? MSAA_FOUR : samples == 2 ? MSAA_TWO : MSAA_ONE;
-        regs(ss, REG_A6XX_SP_TP_RAS_MSAA_CNTL, {A6XX_SP_TP_RAS_MSAA_CNTL_SAMPLES(m),
+        regs(sp, REG_A6XX_SP_TP_RAS_MSAA_CNTL, {A6XX_SP_TP_RAS_MSAA_CNTL_SAMPLES(m),
                                                     m == MSAA_ONE ? A6XX_SP_TP_DEST_MSAA_CNTL_MSAA_DISABLE : A6XX_SP_TP_DEST_MSAA_CNTL_SAMPLES(m)});
-        reg(ss, REG_A6XX_SP_TP_SAMPLE_CONFIG, 0);
-        regs(ss, REG_A6XX_GRAS_RAS_MSAA_CNTL, {A6XX_GRAS_RAS_MSAA_CNTL_SAMPLES(m),
+        reg(sp, REG_A6XX_SP_TP_SAMPLE_CONFIG, 0);
+        regs(sp, REG_A6XX_GRAS_RAS_MSAA_CNTL, {A6XX_GRAS_RAS_MSAA_CNTL_SAMPLES(m),
                                                    m == MSAA_ONE ? A6XX_GRAS_DEST_MSAA_CNTL_MSAA_DISABLE : A6XX_GRAS_DEST_MSAA_CNTL_SAMPLES(m), 0});   // ..., GRAS_SAMPLE_CONFIG
-        regs(ss, REG_A6XX_RB_RAS_MSAA_CNTL, {A6XX_RB_RAS_MSAA_CNTL_SAMPLES(m),
+        regs(sp, REG_A6XX_RB_RAS_MSAA_CNTL, {A6XX_RB_RAS_MSAA_CNTL_SAMPLES(m),
                                                  m == MSAA_ONE ? A6XX_RB_DEST_MSAA_CNTL_MSAA_DISABLE : A6XX_RB_DEST_MSAA_CNTL_SAMPLES(m), 0});       // ..., RB_SAMPLE_CONFIG
-        reg(ss, REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL, 0);
+        reg(sp, REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL, 0);
     }
     // 7. RB_RENDER_CNTL: CCUSINGLECACHELINESIZE 2 in both pipelines (tu_cmd_buffer.cc:633-693; fd6_gmem.cc:531-552), 0 in
     // r3d_dst (tu_clear_blit.cc:1408) -- renderCntlZero for the bisect. A plain type-4: has_cp_reg_write is false here.
-    if (gStatic && o.renderCntl) {
+    if (gPass && o.renderCntl) {
         uint32_t flagMrts = 0;
         for (uint32_t i = 0; i < numRt; i++) flagMrts |= mrts[i].flagPitch != 0 ? 1u << i : 0u;
-        reg(ss, REG_A6XX_RB_RENDER_CNTL, o.renderCntlZero ? 0u : rbRenderCntlSysmem() | A6XX_RB_RENDER_CNTL_FLAG_MRTS(flagMrts));
+        reg(sp, REG_A6XX_RB_RENDER_CNTL, o.renderCntlZero ? 0u : rbRenderCntlSysmem() | A6XX_RB_RENDER_CNTL_FLAG_MRTS(flagMrts));
     }
     // 8. LRZ off (tu_lrz.cc:936-944 via a zero state; r3d :1622-1623; fd6 build_lrz with no zsbuf, fd6_emit.cc:262-270)
     // and fd6's zeroed LRZ buffer registers (emit_lrz, fd6_gmem.cc:250-260): BASE (2), PITCH, FAST_CLEAR_BUFFER_BASE (2)
-    if (gStatic && o.lrzOff) {
-        reg(ss, REG_A6XX_GRAS_LRZ_CNTL, 0);
-        reg(ss, REG_A6XX_RB_LRZ_CNTL, 0);
-        regs(ss, REG_A6XX_GRAS_LRZ_BUFFER_BASE, {0, 0, 0, 0, 0});
+    if (gPass && o.lrzOff) {
+        reg(sp, REG_A6XX_GRAS_LRZ_CNTL, 0);
+        reg(sp, REG_A6XX_RB_LRZ_CNTL, 0);
+        regs(sp, REG_A6XX_GRAS_LRZ_BUFFER_BASE, {0, 0, 0, 0, 0});
     }
     // 9. program config (tu6_emit_program_config, tu_pipeline.cc:1272-1300; fd6 setup_config_stateobj, fd6_program.cc:
     // 400-458): HLSQ_INVALIDATE_CMD for the five graphics stages and the 3D IBOs, then SP_xS_CONFIG / HLSQ_xS_CNTL per
     // stage with HS, DS and GS off (NTEX = NSAMP = num_samp = 0; CONSTLEN in the field's units of 4 vec4, the FS's 0 is
     // ENABLED alone), SP_IBO_COUNT 0 (fd6's nibo(fs))
-    // the program group: the stages' config and control registers, their object start and private memory (the program key, the
-    // programs' addresses, and the private memory each stage is given)
-    bool gProgram = true;
-    if (grp != nullptr) {
-        gProgram = false;
-        if (o.programConfig || o.programVs || o.programFs) {
-            uint32_t k[4 + 2 * 5];
-            uint32_t n = 0;
-            k[n++] = uint32_t(vsProgram); k[n++] = uint32_t(vsProgram >> 32); k[n++] = uint32_t(fsProgram); k[n++] = uint32_t(fsProgram >> 32);
-            for (const auto& [st, b] : {std::pair<const Stage*, const Bindings*>{&vs, &vsBindings}, {&fs, &fsBindings}}) {
-                const PrivateMemory pm = st->k.pvtmemSize != 0 ? b->privateMemory : PrivateMemory{};
-                k[n++] = uint32_t(pm.address); k[n++] = uint32_t(pm.address >> 32); k[n++] = pm.perFiber; k[n++] = pm.perSp; k[n++] = pm.perWave ? 1u : 0u;
-            }
-            gProgram = grp->need(kGroupProgram, true, k, n * 4);
-        }
-    }
-    pm4::Stream& ps = sinkOf(kGroupProgram);
+    done(kGroupPass);
+    // the program groups: the stages' config and control registers (the program key), and each stage's object start and private
+    // memory (the program key, the program's address, the private memory the stage is given)
+    const bool gConfig = ask(kGroupConfig, true, nullptr, 0);
+    pm4::Stream& pc = sinkOf(kGroupConfig);
+    auto stageKey = [&](const Stage& st, const Bindings& b, uint64_t address, uint32_t* k) {
+        const PrivateMemory pm = st.k.pvtmemSize != 0 ? b.privateMemory : PrivateMemory{};
+        k[0] = uint32_t(address); k[1] = uint32_t(address >> 32);
+        k[2] = uint32_t(pm.address); k[3] = uint32_t(pm.address >> 32); k[4] = pm.perFiber; k[5] = pm.perSp; k[6] = pm.perWave ? 1u : 0u;
+    };
+    uint32_t kvs[7] = {}, kfs[7] = {};
+    stageKey(vs, vsBindings, vsProgram, kvs);
+    stageKey(fs, fsBindings, fsProgram, kfs);
+    const bool gProgVs = ask(kGroupProgVs, true, kvs, sizeof kvs);
+    const bool gProgFs = ask(kGroupProgFs, true, kfs, sizeof kfs);
     if (o.programConfig) {
         reg(stream, REG_A6XX_HLSQ_INVALIDATE_CMD,
             A6XX_HLSQ_INVALIDATE_CMD_VS_STATE | A6XX_HLSQ_INVALIDATE_CMD_HS_STATE | A6XX_HLSQ_INVALIDATE_CMD_DS_STATE |
                 A6XX_HLSQ_INVALIDATE_CMD_GS_STATE | A6XX_HLSQ_INVALIDATE_CMD_FS_STATE | A6XX_HLSQ_INVALIDATE_CMD_GFX_IBO);
-        if (gProgram) reg(ps, REG_A6XX_SP_VS_CONFIG, spXsConfig(vs.k.numSamp, vs.k.numSamp, vs.k.numSsbos));
-        if (gProgram) reg(ps, REG_A6XX_HLSQ_VS_CNTL, hlsqVsCntl(vs.k.constlen));
-        if (gProgram) reg(ps, REG_A6XX_SP_HS_CONFIG, 0);
-        if (gProgram) reg(ps, REG_A6XX_HLSQ_HS_CNTL, 0);
-        if (gProgram) reg(ps, REG_A6XX_SP_DS_CONFIG, 0);
-        if (gProgram) reg(ps, REG_A6XX_HLSQ_DS_CNTL, 0);
-        if (gProgram) reg(ps, REG_A6XX_SP_GS_CONFIG, 0);
-        if (gProgram) reg(ps, REG_A6XX_HLSQ_GS_CNTL, 0);
-        if (gProgram) reg(ps, REG_A6XX_SP_FS_CONFIG, spXsConfig(fs.k.numSamp, fs.k.numSamp, fs.k.numSsbos));
-        if (gProgram) reg(ps, REG_A6XX_HLSQ_FS_CNTL, hlsqFsCntl(fs.k.constlen));
+        if (gConfig) reg(pc, REG_A6XX_SP_VS_CONFIG, spXsConfig(vs.k.numSamp, vs.k.numSamp, vs.k.numSsbos));
+        if (gConfig) reg(pc, REG_A6XX_HLSQ_VS_CNTL, hlsqVsCntl(vs.k.constlen));
+        if (gConfig) reg(pc, REG_A6XX_SP_HS_CONFIG, 0);
+        if (gConfig) reg(pc, REG_A6XX_HLSQ_HS_CNTL, 0);
+        if (gConfig) reg(pc, REG_A6XX_SP_DS_CONFIG, 0);
+        if (gConfig) reg(pc, REG_A6XX_HLSQ_DS_CNTL, 0);
+        if (gConfig) reg(pc, REG_A6XX_SP_GS_CONFIG, 0);
+        if (gConfig) reg(pc, REG_A6XX_HLSQ_GS_CNTL, 0);
+        if (gConfig) reg(pc, REG_A6XX_SP_FS_CONFIG, spXsConfig(fs.k.numSamp, fs.k.numSamp, fs.k.numSsbos));
+        if (gConfig) reg(pc, REG_A6XX_HLSQ_FS_CNTL, hlsqFsCntl(fs.k.constlen));
+        done(kGroupConfig);
         // the 3D IBO table's count (fd6's nibo(fs); here the larger of the two stages', the table being one), and the table
         // itself: CP_LOAD_STATE6 (the plain opcode) of ST6_SHADER into SB6_IBO, as both witnesses load it (tu_pipeline.cc:
         // 183, fd6_image.cc:308-335 -- bindless there, from the table here, the SP_CS_IBO way), then SP_IBO at it
@@ -1818,17 +1824,19 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // (ST6_CONSTANTS, direct, at immediatesOffsetVec4)
     // ... then the pushed constant ranges, indirect, as compute uploads them (fd6_emit_user_consts / tu6_emit_xs's ranges,
     // tu_shader.cc:1397-1421) into the stage's own block
-    auto programOf = [&](const Stage& s, const Bindings& b, const std::vector<PushedRange>& ranges, const std::vector<uint32_t>& ubos, uint64_t address,
+    auto programOf = [&](bool genc, Group group, const Stage& s, const Bindings& b, const std::vector<PushedRange>& ranges, const std::vector<uint32_t>& ubos, uint64_t address,
                          uint32_t ctrlReg0, uint32_t regCtrl0, uint32_t regInstrlen, uint32_t regObjFirstExec, uint32_t regHwStackOffset) {
-        if (gProgram) reg(ps, regCtrl0, ctrlReg0);
-        if (gProgram) reg(ps, regInstrlen, s.k.instrlen);
+        pm4::Stream& rs = sinkOf(group);
+        if (genc) reg(rs, regCtrl0, ctrlReg0);
+        if (genc) reg(rs, regInstrlen, s.k.instrlen);
         // (the CS's field helpers: the VS's and the FS's registers lay their fields out the same, and tu6_emit_xs writes
         // every stage's through the VS's)
         const PrivateMemory pm = s.k.pvtmemSize != 0 ? b.privateMemory : PrivateMemory{};
-        if (gProgram) regs(ps, regObjFirstExec,
+        if (genc) regs(rs, regObjFirstExec,
              {0, uint32_t(address), uint32_t(address >> 32), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(pm.perFiber), uint32_t(pm.address),
               uint32_t(pm.address >> 32), A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)});
-        if (gProgram) reg(ps, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
+        if (genc) reg(rs, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
+        done(group);
         loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
         if (s.k.numImmediates != 0) {
             const uint32_t padded = (s.k.numImmediates + 3) & ~3u;   // (whole vec4: the tail zeros)
@@ -1855,7 +1863,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         }
     };
     if (o.programVs) {
-        programOf(vs, vsBindings, vsRanges, vsUbos, vsProgram, spVsCtrlReg0(uint32_t(vs.k.maxReg + 1), uint32_t(vs.k.maxHalfReg + 1), vs.k.branchstackHw, vs.k.mergedRegs, vs.k.earlyPreamble),
+        programOf(gProgVs, kGroupProgVs, vs, vsBindings, vsRanges, vsUbos, vsProgram, spVsCtrlReg0(uint32_t(vs.k.maxReg + 1), uint32_t(vs.k.maxHalfReg + 1), vs.k.branchstackHw, vs.k.mergedRegs, vs.k.earlyPreamble),
                   REG_A6XX_SP_VS_CTRL_REG0, REG_A6XX_SP_VS_INSTRLEN, REG_A6XX_SP_VS_OBJ_FIRST_EXEC_OFFSET, REG_A6XX_SP_VS_PVT_MEM_HW_STACK_OFFSET);
     }
     // 10a. the VS's driver params, every draw since they are the draw's own (tu6_emit_vs_params, tu_cmd_buffer.cc:
@@ -1868,7 +1876,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         loadDirect(stream, vs, ST6_CONSTANTS, uint32_t(vs.k.driverParamsOffsetVec4), 1, params, 4);
     }
     if (o.programFs) {
-        programOf(fs, fsBindings, fsRanges, fsUbos, fsProgram,
+        programOf(gProgFs, kGroupProgFs, fs, fsBindings, fsRanges, fsUbos, fsProgram,
                   spFsCtrlReg0(uint32_t(fs.k.maxReg + 1), uint32_t(fs.k.maxHalfReg + 1), fs.k.branchstackHw, fsThreads, fs.totalIn != 0, fs.needFullQuad != 0,
                                fs.needPixlod != 0, fs.k.earlyPreamble, fs.k.mergedRegs),
                   REG_A6XX_SP_FS_CTRL_REG0, REG_A6XX_SP_FS_INSTRLEN, REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET, REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET);
@@ -1918,7 +1926,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         // the VFD group: its control registers and the attributes' decode, a function of the program and the vertex descriptor's fetch
         // (what the draw's own buffers give each fetch -- base, size, stride -- and the index offsets stay with the draw)
         bool gVfd = true;
-        if (grp != nullptr) {
+        {
             uint32_t k[2 + 3 * kMaxVertexAttributes];
             uint32_t n = 0;
             k[n++] = fetch.count;
@@ -1928,7 +1936,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
                 k[n++] = fetch.stepRate[loc];
                 k[n++] = fetch.dest[loc];
             }
-            gVfd = grp->need(kGroupVfd, true, k, n * 4);
+            gVfd = ask(kGroupVfd, true, k, n * 4);
         }
         pm4::Stream& vf = sinkOf(kGroupVfd);
         if (gVfd) {
@@ -1950,6 +1958,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         }
         reg(vf, REG_A6XX_PC_RESTART_INDEX, draw.indexBuffer != nullptr && draw.indexType == 0 ? 0xffffu : 0xffffffffu);
         }
+        done(kGroupVfd);
         if (fetch.count != 0) {
             for (uint32_t bi = 0; bi < kMaxVertexBuffers; bi++) {
                 if (!fetch.used[bi]) continue;
@@ -1970,33 +1979,33 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // varyings and a stale PS_REPL from the window server's RECTLIST blit would corrupt the first varying draw),
     // PC_PS_CNTL 0, and stream-out off as tu6_setup_streamout writes it (tu_pipeline.cc:496-512; type-4 here, not
     // CP_CONTEXT_REG_BUNCH)
-    if (gStatic && o.vpc) {
+    if (gLink && o.vpc) {
         for (uint32_t i = 0; i < (link.cnt + 1) / 2; i++) {
             const Linkage::Var& a = link.var[2 * i];
             const bool hasB = 2 * i + 1 < link.cnt;
             const Linkage::Var& b = link.var[hasB ? 2 * i + 1 : 2 * i];
-            reg(ss, regSpVsOutReg(i), spVsOutReg(a.regid, a.compmask, hasB ? b.regid : 0u, hasB ? b.compmask : 0u));
+            reg(sl, regSpVsOutReg(i), spVsOutReg(a.regid, a.compmask, hasB ? b.regid : 0u, hasB ? b.compmask : 0u));
         }
         for (uint32_t i = 0; i < (link.cnt + 3) / 4; i++) {
             uint32_t loc[4] = {0, 0, 0, 0};
             for (uint32_t j = 0; j < 4 && 4 * i + j < link.cnt; j++) loc[j] = link.var[4 * i + j].loc;
-            reg(ss, regSpVsVpcDstReg(i), spVsVpcDstReg(loc[0], loc[1], loc[2], loc[3]));
+            reg(sl, regSpVsVpcDstReg(i), spVsVpcDstReg(loc[0], loc[1], loc[2], loc[3]));
         }
-        reg(ss, REG_A6XX_VPC_VS_PACK, vpcVsPack(link.maxLoc, link.positionLoc, link.psizeLoc));
-        reg(ss, REG_A6XX_VPC_VS_CLIP_CNTL, vpcVsClipCntl(0));
-        reg(ss, REG_A6XX_VPC_VS_CLIP_CNTL_V2, vpcVsClipCntl(0));
-        reg(ss, REG_A6XX_GRAS_VS_CL_CNTL, grasVsClCntl(0, 0));
-        reg(ss, REG_A6XX_PC_VS_OUT_CNTL, pcVsOutCntl(link.maxLoc, link.psizeLoc != kLocNone));
-        reg(ss, REG_A6XX_SP_VS_PRIMITIVE_CNTL, spVsPrimitiveCntl(link.cnt));
-        reg(ss, REG_A6XX_VPC_VS_LAYER_CNTL, vpcVsLayerCntl());
-        reg(ss, REG_A6XX_VPC_VS_LAYER_CNTL_V2, vpcVsLayerCntl());
-        reg(ss, REG_A6XX_GRAS_VS_LAYER_CNTL, 0);
-        ss.registers(regVpcVaryingInterpMode(0), link.interpMode, kVpcVaryingRegs);
-        ss.registers(regVpcVaryingPsReplMode(0), link.psReplMode, kVpcVaryingRegs);
-        reg(ss, REG_A6XX_PC_PS_CNTL, 0);
-        reg(ss, REG_A6XX_VPC_SO_CNTL, 0);
-        reg(ss, REG_A6XX_VPC_SO_STREAM_CNTL, 0);
-        reg(ss, REG_A6XX_PC_SO_STREAM_CNTL, 0);
+        reg(sl, REG_A6XX_VPC_VS_PACK, vpcVsPack(link.maxLoc, link.positionLoc, link.psizeLoc));
+        reg(sl, REG_A6XX_VPC_VS_CLIP_CNTL, vpcVsClipCntl(0));
+        reg(sl, REG_A6XX_VPC_VS_CLIP_CNTL_V2, vpcVsClipCntl(0));
+        reg(sl, REG_A6XX_GRAS_VS_CL_CNTL, grasVsClCntl(0, 0));
+        reg(sl, REG_A6XX_PC_VS_OUT_CNTL, pcVsOutCntl(link.maxLoc, link.psizeLoc != kLocNone));
+        reg(sl, REG_A6XX_SP_VS_PRIMITIVE_CNTL, spVsPrimitiveCntl(link.cnt));
+        reg(sl, REG_A6XX_VPC_VS_LAYER_CNTL, vpcVsLayerCntl());
+        reg(sl, REG_A6XX_VPC_VS_LAYER_CNTL_V2, vpcVsLayerCntl());
+        reg(sl, REG_A6XX_GRAS_VS_LAYER_CNTL, 0);
+        sl.registers(regVpcVaryingInterpMode(0), link.interpMode, kVpcVaryingRegs);
+        sl.registers(regVpcVaryingPsReplMode(0), link.psReplMode, kVpcVaryingRegs);
+        reg(sl, REG_A6XX_PC_PS_CNTL, 0);
+        reg(sl, REG_A6XX_VPC_SO_CNTL, 0);
+        reg(sl, REG_A6XX_VPC_SO_STREAM_CNTL, 0);
+        reg(sl, REG_A6XX_PC_SO_STREAM_CNTL, 0);
     }
     // 13. the FS's inputs (tu6_emit_fs_inputs, tu_shader.cc:1627-1812; fd6 emit_fs_inputs, fd6_program.cc:921-1112):
     // SP_FS_PREFETCH_CNTL with no prefetch commands and IJ_WRITE_DISABLE when no perspective pixel barycentric is read;
@@ -2007,7 +2016,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // sample registers 0; VPC_VAR_DISABLE[0..3] = ~varmask; VPC_CNTL_0 with NUMNONPOSVAR = total_in
     const bool needSize = validReg(fs.faceRegid) || fs.fragcoordCompmask != 0;
     const uint32_t ijbits = ijBits(ij, needSize, false);
-    if (gStatic && o.fsInputs) {
+    if (gLink && o.fsInputs) {
         {
             // with the prefetch commands after it in the same pkt4 (fd6 emit_fs_inputs, fd6_program.cc:947-971; A6XX keeps the
             // slots in the command, no SP_FS_BINDLESS_PREFETCH_CMD)
@@ -2017,32 +2026,32 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
                 const SamplerPrefetch& pf = fs.prefetch[i];
                 w[1 + i] = spFsPrefetchCmd(pf.src, pf.sampId, pf.texId, pf.dst, pf.wrmask, pf.half != 0, pf.cmd);
             }
-            ss.registers(REG_A6XX_SP_FS_PREFETCH_CNTL, w, 1 + fs.numSamplerPrefetch);
+            sl.registers(REG_A6XX_SP_FS_PREFETCH_CNTL, w, 1 + fs.numSamplerPrefetch);
         }
-        regs(ss, REG_A6XX_HLSQ_CONTROL_1_REG,
+        regs(sl, REG_A6XX_HLSQ_CONTROL_1_REG,
              {hlsqControl1Reg(), hlsqControl2Reg(fs.faceRegid, fs.sampleIdRegid, fs.sampleMaskInRegid, ij[IJ_PERSP_CENTER_RHW]),
               hlsqControl3Reg(ij[IJ_PERSP_PIXEL], ij[IJ_LINEAR_PIXEL], ij[IJ_PERSP_CENTROID], ij[IJ_LINEAR_CENTROID]),
               hlsqControl4Reg(ij[IJ_PERSP_SAMPLE], ij[IJ_LINEAR_SAMPLE], fs.fragCoordRegid, validReg(fs.fragCoordRegid) ? fs.fragCoordRegid + 2 : kRegidNone),
               hlsqControl5Reg()});
-        reg(ss, REG_A6XX_HLSQ_FS_CNTL_0, hlsqFsCntl0(fsThreads, fs.totalIn != 0));
-        reg(ss, REG_A6XX_GRAS_CNTL, grasCntl(ijbits, fs.fragcoordCompmask));
-        regs(ss, REG_A6XX_RB_RENDER_CONTROL0,
+        reg(sl, REG_A6XX_HLSQ_FS_CNTL_0, hlsqFsCntl0(fsThreads, fs.totalIn != 0));
+        reg(sl, REG_A6XX_GRAS_CNTL, grasCntl(ijbits, fs.fragcoordCompmask));
+        regs(sl, REG_A6XX_RB_RENDER_CONTROL0,
              {rbRenderControl0(ijbits, fs.fragcoordCompmask, fs.totalIn != 0),
               rbRenderControl1(validReg(fs.faceRegid), validReg(fs.sampleIdRegid), validReg(fs.sampleMaskInRegid), validReg(ij[IJ_PERSP_CENTER_RHW]))});
-        reg(ss, REG_A6XX_RB_SAMPLE_CNTL, 0);
-        reg(ss, REG_A6XX_GRAS_LRZ_PS_INPUT_CNTL, 0);
-        reg(ss, REG_A6XX_GRAS_SAMPLE_CNTL, 0);
+        reg(sl, REG_A6XX_RB_SAMPLE_CNTL, 0);
+        reg(sl, REG_A6XX_GRAS_LRZ_PS_INPUT_CNTL, 0);
+        reg(sl, REG_A6XX_GRAS_SAMPLE_CNTL, 0);
         uint32_t disable[kVpcVarDisableRegs];
         for (uint32_t i = 0; i < kVpcVarDisableRegs; i++) disable[i] = vpcVarDisable(link.varmask[i]);
-        ss.registers(regVpcVarDisable(0), disable, kVpcVarDisableRegs);
-        reg(ss, REG_A6XX_VPC_CNTL_0, vpcCntl0(fs.totalIn, kLocNone, fs.totalIn != 0, kLocNone));
+        sl.registers(regVpcVarDisable(0), disable, kVpcVarDisableRegs);
+        reg(sl, REG_A6XX_VPC_CNTL_0, vpcCntl0(fs.totalIn, kLocNone, fs.totalIn != 0, kLocNone));
     }
     // 14. the FS's outputs (tu6_emit_fs_outputs, tu_shader.cc:1816-1898; fd6 emit_fs_outputs :1114-1184 and
     // build_prog_fb_rast, fd6_emit.cc:302-350): SP_FS_OUTPUT_CNTL0 with no depth/sample-mask/stencil register, MRT 1 in
     // both CNTL1 copies, SP_FS_OUTPUT_REG[0] the colour register, RENDER_COMPONENTS 0xf for the one target in both
     // copies, RB_FS_OUTPUT_CNTL0 0 (nothing but colour is written)
     // (with MRT n and SP_FS_OUTPUT_REG[0 .. n-1] for an FS that writes n targets: the registers run on from CNTL1)
-    if (gStatic && o.fsOutputs) {
+    if (gLink && o.fsOutputs) {
         // (the components of a slot drawn as unwritten -- no attachment for it in this pass -- taken out of the link's)
         uint32_t components = link.mrtComponents;
         for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
@@ -2054,8 +2063,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         std::vector<uint32_t> out = {components, spFsOutputCntl0(fragDepth ? fs.depthRegid : kRegidNone, kRegidNone, kRegidNone, dual),
                                      A6XX_SP_FS_OUTPUT_CNTL1_MRT(numRt)};
         for (uint32_t i = 0; i < numOut; i++) out.push_back(spFsOutputReg(fs.colorRegid[i], fs.colorHalf[i] != 0));
-        ss.registers(REG_A6XX_SP_FS_RENDER_COMPONENTS, out.data(), uint32_t(out.size()));
-        regs(ss, REG_A6XX_RB_FS_OUTPUT_CNTL0, {(fragDepth ? A6XX_RB_FS_OUTPUT_CNTL0_FRAG_WRITES_Z : 0u) | (dual ? A6XX_RB_FS_OUTPUT_CNTL0_DUAL_COLOR_IN_ENABLE : 0u),
+        sl.registers(REG_A6XX_SP_FS_RENDER_COMPONENTS, out.data(), uint32_t(out.size()));
+        regs(sl, REG_A6XX_RB_FS_OUTPUT_CNTL0, {(fragDepth ? A6XX_RB_FS_OUTPUT_CNTL0_FRAG_WRITES_Z : 0u) | (dual ? A6XX_RB_FS_OUTPUT_CNTL0_DUAL_COLOR_IN_ENABLE : 0u),
                                                    A6XX_RB_FS_OUTPUT_CNTL1_MRT(numRt), components});
     }
     // 15. the rasterizer (tu6_emit_rast, tu_pipeline.cc:3120-3218; fd6_rasterizer.cc:22-140): GRAS_CL_CNTL with Metal's
@@ -2067,10 +2076,11 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // PC_RASTER_CNTL and VPC_UNKNOWN_9107 0; point size 1 with turnip's limits; polygon offsets 0; the four shading-rate
     // registers 0 (has_legacy_pipeline_shading_rate); GRAS_SC_CNTL for sysmem (:3351-3380); PC_PRIMITIVE_CNTL_0 0 (the
     // first vertex provokes, no restart)
+    done(kGroupLink);
     bool gRast = o.rast;
-    if (gRast && grp != nullptr) {
+    if (gRast) {
         const uint32_t k[5] = {draw.cullMode, draw.winding, draw.indexBuffer != nullptr ? 1u : 0u, ordered ? 1u : 0u, orderedSysmem ? 1u : 0u};
-        gRast = grp->need(kGroupRast, false, k, sizeof k);
+        gRast = ask(kGroupRast, false, k, sizeof k);
     }
     pm4::Stream& rs = sinkOf(kGroupRast);
     if (gRast) {
@@ -2097,6 +2107,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         // :5851-5862, which is off for a draw without indices, where the index register would be stale)
         reg(rs, REG_A6XX_PC_PRIMITIVE_CNTL_0, draw.indexBuffer != nullptr ? A6XX_PC_PRIMITIVE_CNTL_0_PRIMITIVE_RESTART : 0u);
     }
+    if (o.rast) done(kGroupRast);
     // 16. the viewport and the scissors (tu6_emit_viewport, tu_pipeline.cc:2432-2540; tu6_emit_scissor :2657-2688):
     // GRAS_CL_VPORT[0]'s six floats with Metal's NEGATIVE y scale (viewportWords: NDC y up, row 0 at the top -- reasoning
     // from the convention, which the probe's orientation line measures), the viewport scissor as the viewport's integer
@@ -2105,9 +2116,9 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // when none), BR inclusive (both witnesses: the fd6 'off by one' in a6xx-draw.md was spurious)
     if (o.viewportScissor) {
         bool gView = true;
-        if (grp != nullptr) {
+        {
             const double k[6] = {vp.x, vp.y, vp.width, vp.height, vp.znear, vp.zfar};
-            gView = grp->need(kGroupViewport, false, k, sizeof k);
+            gView = ask(kGroupViewport, false, k, sizeof k);
         }
         pm4::Stream& vw = sinkOf(kGroupViewport);
         if (gView) {
@@ -2121,6 +2132,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(vw, REG_A6XX_GRAS_CL_GUARDBAND_CLIP_ADJ, guardbandClipAdj(vp.x + vp.width / 2, vp.width / 2, vp.y + vp.height / 2, -vp.height / 2));
         regs(vw, REG_A6XX_RB_Z_CLAMP_MIN, {fui(zmin), fui(zmax)});
         }
+        done(kGroupViewport);
         regs(stream, regGrasScScreenScissor(REG_A6XX_GRAS_SC_SCREEN_SCISSOR_TL, 0), {scissorXY(sc.x, sc.y), scissorXY(sc.x + sc.width - 1, sc.y + sc.height - 1)});
     }
     // 17. blending off, depth and stencil off (tu_pipeline.cc:2980-3062, 3240-3331; fd6_blend.cc:45-150; fd6_zsa.cc):
@@ -2174,6 +2186,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         }
         regs(bz, REG_A6XX_RB_Z_BOUNDS_MIN, {fui(0.0f), fui(1.0f)});
     }
+    if (o.blendZsa) done(kGroupBlend);
     // 18. the draw (r3d_run, tu_clear_blit.cc:1661-1670; tu_CmdDraw :6209-6227; fd6 draw_emit, fd6_draw.cc:170-180):
     // CP_DRAW_INDX_OFFSET's 3-word form, the indices generated (AUTO_INDEX), IGNORE_VISIBILITY as r3d (the pipelines'
     // USE_VISIBILITY under visCullUse: with CP_SET_VISIBILITY_OVERRIDE 1 either should draw; unmeasured), one instance
@@ -2274,20 +2287,24 @@ void GroupCache::begin() {
     for (int& p : pending_) p = kSame;
 }
 
-void GroupCache::setProgramKey(const void* key, size_t n) {
+void GroupCache::setProgramKey(const void* key, size_t n, const void* vs, const void* fs, size_t stageBytes) {
     const uint64_t h = hashBytes(key, n);
-    if (programId_ < int(programs_.size())) {
-        const ProgramKey& cur = programs_[size_t(programId_)];
-        if (cur.hash == h && cur.bytes.size() == n && memcmp(cur.bytes.data(), key, n) == 0) return;   // (the last draw's program, most often)
-    }
+    auto same = [&](const ProgramKey& k) {
+        return k.hash == h && k.bytes.size() == n && memcmp(k.bytes.data(), key, n) == 0 && k.stages.size() == 2 * stageBytes &&
+               memcmp(k.stages.data(), vs, stageBytes) == 0 && memcmp(k.stages.data() + stageBytes, fs, stageBytes) == 0;
+    };
+    if (programId_ < int(programs_.size()) && same(programs_[size_t(programId_)])) return;   // (the last draw's program, most often)
     for (size_t i = 0; i < programs_.size(); i++) {
-        if (programs_[i].hash == h && programs_[i].bytes.size() == n && memcmp(programs_[i].bytes.data(), key, n) == 0) {
+        if (same(programs_[i])) {
             programId_ = int(i);
             return;
         }
     }
     if (programs_.size() >= kMaxPrograms) reset();   // (the entries name programs by number)
-    programs_.push_back(ProgramKey{h, std::vector<uint8_t>(static_cast<const uint8_t*>(key), static_cast<const uint8_t*>(key) + n)});
+    ProgramKey k{h, std::vector<uint8_t>(static_cast<const uint8_t*>(key), static_cast<const uint8_t*>(key) + n), std::vector<uint8_t>(2 * stageBytes)};
+    memcpy(k.stages.data(), vs, stageBytes);
+    memcpy(k.stages.data() + stageBytes, fs, stageBytes);
+    programs_.push_back(std::move(k));
     programId_ = int(programs_.size()) - 1;
 }
 
@@ -2366,36 +2383,30 @@ const std::vector<uint32_t>& GroupCache::delta(G& grp, int from, int to) {
     return dst.deltas.back().wire;
 }
 
-void GroupCache::emit(pm4::Stream& to) {
-    for (uint32_t g = 0; g < kGroupCount; g++) {
-        int p = pending_[g];
-        if (p == kSame) continue;
-        G& grp = g_[g];
-        if (p == kNew) {
-            std::vector<uint32_t> flat;
-            if (!flatten(out[g], &flat)) {
-                // (a group writes registers and nothing else; if one ever does not, it is written as it is, every draw)
-                const std::vector<uint32_t>& w = out[g].words();
-                for (size_t i = 0; i < w.size();) {
-                    const pm4::Header h = pm4::decodeOwn(w[i]);
-                    if (h.kind == pm4::Header::kRegisters) to.registers(h.reg, &w[i + 1], h.count);
-                    else to.packet(h.opcode, h.count ? &w[i + 1] : nullptr, h.count);
-                    i += 1 + h.count;
-                }
-                grp.last = -1;
-                continue;
-            }
-            if (grp.entries.size() >= kMaxEntries) {
-                grp.entries.clear();
-                grp.last = -1;
-            }
-            grp.entries.push_back(Entry{newHash_[g], newProgram_[g], std::move(newKey_[g]), std::move(flat), out[g].words(), {}});
-            p = int(grp.entries.size()) - 1;
+void GroupCache::emitOne(uint32_t g, pm4::Stream& to) {
+    if (suppress) return;
+    int p = pending_[g];
+    if (p == kSame) return;
+    pending_[g] = kSame;
+    G& grp = g_[g];
+    if (p == kNew) {
+        std::vector<uint32_t> flat;
+        if (!flatten(out[g], &flat)) {
+            // (a group writes registers and nothing else; if one ever does not, it is written as it is, every draw)
+            to.append(out[g].words().data(), out[g].words().size());
+            grp.last = -1;
+            return;
         }
-        const std::vector<uint32_t>& wire = grp.last < 0 ? grp.entries[size_t(p)].wire : delta(grp, grp.last, p);
-        to.append(wire.data(), wire.size());
-        grp.last = p;
+        if (grp.entries.size() >= kMaxEntries) {
+            grp.entries.clear();
+            grp.last = -1;
+        }
+        grp.entries.push_back(Entry{newHash_[g], newProgram_[g], std::move(newKey_[g]), std::move(flat), out[g].words(), {}});
+        p = int(grp.entries.size()) - 1;
     }
+    const std::vector<uint32_t>& wire = grp.last < 0 ? grp.entries[size_t(p)].wire : delta(grp, grp.last, p);
+    to.append(wire.data(), wire.size());
+    grp.last = p;
 }
 
 void GroupCache::forget() {
@@ -3346,10 +3357,15 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             groupsSys = &newSys_;
         }
         groupsBody->begin();
-        groupsBody->setProgramKey(key, keyBytes);
+        // (a pass whose draws the tiles skip by visibility, binned, keeps the draws' own whole state: what a skipped draw leaves in the
+        // registers is not what the next draw's delta assumes)
+        const bool binned = gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3;
+        groupsBody->mask = binned ? 0u : dirtyGroups_;
+        groupsSys->mask = dirtyGroups_;
+        groupsBody->setProgramKey(key, keyBytes, &program.vs, &program.fs, sizeof(Stage));
         if (dual || (joins && open_->dual)) {
             groupsSys->begin();
-            groupsSys->setProgramKey(key, keyBytes);
+            groupsSys->setProgramKey(key, keyBytes, &program.vs, &program.fs, sizeof(Stage));
         }
     }
     if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
@@ -3370,6 +3386,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         Piece sysTable = table;
         if (program.fs.fbRead && !piece(render::kTableBytes, &sysTable, &why, false)) {
             gmemClears_ = 0;
+            if (groupsBody != nullptr) groupsBody->forget();
             return fail(std::string("no memory for the draw's table: ") + why);
         }
         render::Options sysOptions = encodeOptions;
@@ -3380,6 +3397,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         if (!render::encodeInPass(bodySys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(), sysTable.contents(), &why,
                                   sysOptions, nullptr, joins && open_->lastFetched, groupsSys)) {
             gmemClears_ = 0;
+            if (groupsBody != nullptr) groupsBody->forget();   // (the body's groups were written into a stream that is dropped)
             return refuseWork(why);
         }
     }
@@ -3477,12 +3495,10 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         if (timed) drawStamp(uint32_t(2 * dt.slot));
     }
     if (options.dedupRegs && open_->options.dedupRegs) {
-        // the groups' words first (they are register writes the draw's own stream follows), then the draw deduplicated; a packet
-        // that made the deduplication forget what the registers hold makes the groups forget theirs as well
-        if (groupsBody != nullptr) groupsBody->emit(into);
+        // the draw deduplicated (its groups' words are in it, where encodeDraw wrote them); a packet that made the deduplication
+        // forget what the registers hold makes the groups forget theirs as well
         if (appendDeduped(into, body, open_->gmem ? open_->bodyRegs : open_->regs) && groupsBody != nullptr) groupsBody->forget();
         if (open_->dual) {
-            if (groupsSys != nullptr) groupsSys->emit(open_->sysStream);
             if (appendDeduped(open_->sysStream, bodySys, open_->regs) && groupsSys != nullptr) groupsSys->forget();
         }
     } else {

@@ -611,6 +611,7 @@ static BOOL hm_fps_on(void);                          /* metal_fps: command buff
 #define HM_CACHE_DIR  "/private/var/db/hakios-metal-cache"     /* compiled stages, kept across boots by var_store */
 #define HM_CACHE_SEED "/hakios/share/hakios-metal-cache"     /* the same, baked into the image (read-only) */
 static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled rendering where a pass allows it */
+static unsigned hm_dirty_groups(void);                /* metal_dirty_groups=MASK: the tracked register groups, a bit each */
 static BOOL hm_full_state(void);                      /* metal_full_state=1: every draw encodes all its register state (no dirty tracking) */
 static BOOL hm_binning_on(void);                      /* metal_gmem_binning=1: the hardware's binning in GMEM passes */
 static unsigned hm_gmem_off(void);                    /* metal_gmem_off=N: GMEM's refinements off, by bit */
@@ -5769,6 +5770,7 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_gmem_min_draws(_cb, hm_gmem_draws());
 		hakios_metal_cb_set_gmem_binning(_cb, hm_binning_on());
 		hakios_metal_cb_set_full_state(_cb, hm_full_state());
+		hakios_metal_cb_set_dirty_groups(_cb, hm_dirty_groups());
 		hakios_metal_cb_set_null_fs_textures(_cb, (hm_gmem_off() & 32) != 0);   /* 32: no texture reads, to time the shaders alone */
 		hakios_metal_cb_set_gmem_off(_cb, hm_gmem_off());
 		hakios_metal_cb_set_gmem_tuned(_cb, (hm_gmem_off() & 8) == 0);   /* metal_gmem_off's 8: GMEM wherever a pass can have it */
@@ -6343,6 +6345,29 @@ hm_full_state(void)
 		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_full_state=1") != NULL;
 	}
 	return on != 0;
+}
+
+/*
+ * metal_dirty_groups=MASK (decimal or 0x hex): which register groups the per-pass dirty tracking covers, a bit each -- 0 pass (target,
+ * MRT, MSAA), 1 config (SP/HLSQ_xS_CONFIG), 2 progVs, 3 progFs, 4 vfd, 5 link (VPC, FS in/out), 6 rast, 7 viewport, 8 blend/depth/stencil;
+ * a group with its bit clear is encoded whole every draw. All (0x1ff) when absent; metal_full_state=1 is the same as 0.
+ */
+static unsigned
+hm_dirty_groups(void)
+{
+	static long mask = -1;
+
+	if (mask < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		mask = 0x1ff;
+		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_dirty_groups=")) != NULL) {
+			mask = strtol(at + strlen("metal_dirty_groups="), NULL, 0) & 0x1ff;
+		}
+	}
+	return (unsigned)mask;
 }
 
 /* metal_fps=draws: each draw of a sysmem pass timed alone, by program (only sysmem passes are: without metal_gmem=1) */

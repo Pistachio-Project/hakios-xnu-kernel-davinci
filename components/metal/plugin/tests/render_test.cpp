@@ -6275,7 +6275,7 @@ struct Lcg {
 // a pseudo-random run of draws in several passes, as a command buffer set to FULL (every draw encodes all its state) or not
 // writes it, and the registers the fake sees at each draw. MODE: 0 sysmem, 1 GMEM, 2 GMEM binned, 3 both ways (dual), 4 sysmem with
 // depth and occlusion queries.
-std::vector<RegFile> stateSequence(bool full, int mode, uint32_t seed, size_t* words = nullptr, bool* ok = nullptr) {
+std::vector<RegFile> stateSequence(bool full, int mode, uint32_t seed, size_t* words = nullptr, bool* ok = nullptr, uint32_t groups = render::kAllGroups) {
     Rig r;
     r.fake->recordDrawRegisters(true);
     std::string why;
@@ -6298,6 +6298,7 @@ std::vector<RegFile> stateSequence(bool full, int mode, uint32_t seed, size_t* w
     o.gmemBinning = mode == 2;
     auto cb = r.queue->commandBuffer();
     cb->setFullState(full);
+    cb->setDirtyGroups(groups);
     cb->setGmem(o.gmem);
     cb->setGmemBinning(mode == 2);
     cb->setGmemTuned(true);
@@ -6436,7 +6437,8 @@ TEST(the_registers_of_a_state_group_are_written_by_no_other_group_or_the_draw) {
             memset(table->contents(), 0, render::kTableBytes);
             render::GroupCache gc;
             gc.begin();
-            gc.setProgramKey("k", 1);
+            gc.setProgramKey("k", 1, &p->vs, &p->fs, sizeof(Stage));
+            gc.suppress = true;
             pm4::Stream rest;
             const bool ok = render::encodeInPass(rest, *p, pass, d, vsb, fsb, vsAddr->gpuAddress(), fsAddr->gpuAddress(), table->gpuAddress(),
                                                  static_cast<uint8_t*>(table->contents()), &why, render::Options{}, nullptr, false, &gc);
@@ -6470,4 +6472,89 @@ TEST(the_registers_of_a_state_group_are_written_by_no_other_group_or_the_draw) {
             }
         }
     }
+}
+
+// metal_dirty_groups: any subset of the groups tracked, the rest encoded whole every draw, makes the same registers at every draw
+TEST(any_subset_of_the_tracked_groups_leaves_the_registers_of_every_draw_as_before) {
+    std::vector<uint32_t> masks = {0, render::kAllGroups, 0x155, 0x0aa};
+    for (uint32_t g = 0; g < render::kGroupCount; g++) {
+        masks.push_back(1u << g);
+        masks.push_back(render::kAllGroups & ~(1u << g));
+    }
+    for (int mode : {0, 1, 3, 4}) {
+        const auto full = stateSequence(true, mode, 9);
+        CHECK(!full.empty());
+        for (uint32_t mask : masks) {
+            bool ok = false;
+            const auto got = stateSequence(false, mode, 9, nullptr, &ok, mask);
+            CHECK(ok);
+            CHECK(got == full);
+            if (got != full) std::printf("       mode %d, groups %#x differ\n", mode, mask);
+        }
+    }
+}
+
+// The order inside a tracked draw is the order the draw always had: the HLSQ invalidate, then the program's registers, then its shader
+// load, the link's registers after the loads, the draw last -- for a draw that changes every group (a second program, another viewport...)
+TEST(a_tracked_draws_groups_are_written_where_their_registers_always_were) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r, 256, 256);
+    auto src = target(r, 32, 32, kTextureUsageRead);
+    Sampler smp;
+    std::string why;
+    CHECK(makeSampler(SamplerDesc{}, &smp, &why));
+    auto ub = newBuffer(*r.gpu, 1 << 14, &why);
+    CHECK(ub != nullptr);
+    if (ub == nullptr) return;
+    RenderPass pass;
+    pass.color0 = t.get();
+    render::Options o;
+    o.gmem = false;
+    auto cb = r.queue->commandBuffer();
+    Bindings vsb, fsb;
+    vsb.buffers = {Binding{ub.get(), 0}, Binding{ub.get(), 4096}};
+    fsb.buffers = {Binding{ub.get(), 0}};
+    Draw d1 = wholeDraw(6, 256, 256);
+    CHECK(cb->draw(flatProgram(), pass, d1, vsb, fsb, o));
+    const size_t from = cb->streamWords();
+    Program tex = texProgram();
+    tex.blend = ColorBlend{true, 0, 0, 1, 7, 1, 7, 0xf};
+    Bindings tfs = fsb;
+    tfs.textures = {src.get()};
+    tfs.samplers = {&smp};
+    Draw d2 = wholeDraw(6, 256, 256);
+    d2.viewport = Viewport{10, 10, 100, 100, 0.1, 0.9};
+    d2.cullMode = 2;
+    CHECK(cb->draw(tex, pass, d2, vsb, tfs, o));
+    // the stream cannot be read back before the buffer ends: encode the second draw's words by committing and reading what the fake saw
+    // is not possible either, so the order is read from the command buffer's own stream words
+    const std::vector<uint32_t>& w = cb->streamForTest();
+    auto regAt = [&](uint32_t reg) -> long {
+        for (size_t i = from; i < w.size();) {
+            const pm4::Header h = pm4::decodeOwn(w[i]);
+            if (h.kind == pm4::Header::kRegisters && reg >= h.reg && reg < h.reg + h.count) return long(i);
+            i += 1 + h.count;
+        }
+        return -1;
+    };
+    auto opAt = [&](uint32_t opcode, size_t after) -> long {
+        for (size_t i = after; i < w.size();) {
+            const pm4::Header h = pm4::decodeOwn(w[i]);
+            if (h.kind == pm4::Header::kCommand && h.opcode == opcode) return long(i);
+            i += 1 + h.count;
+        }
+        return -1;
+    };
+    const long inval = regAt(REG_A6XX_HLSQ_INVALIDATE_CMD), config = regAt(REG_A6XX_SP_VS_CONFIG), vsCtrl = regAt(REG_A6XX_SP_VS_CTRL_REG0),
+               fsCtrl = regAt(REG_A6XX_SP_FS_CTRL_REG0), vsLoad = opAt(CP_LOAD_STATE6_GEOM, from), link = regAt(REG_A6XX_VPC_VS_PACK),
+               rast = regAt(REG_A6XX_GRAS_SU_CNTL), view = regAt(REG_A6XX_GRAS_CL_VPORT_XOFFSET), blend = regAt(REG_A6XX_SP_BLEND_CNTL),
+               draw = opAt(CP_DRAW_INDX_OFFSET, from);
+    CHECK(inval >= 0 && vsCtrl >= 0 && fsCtrl >= 0 && vsLoad >= 0 && link >= 0 && rast >= 0 && view >= 0 && blend >= 0 && draw >= 0);
+    CHECK(inval < vsCtrl);
+    CHECK(config < 0 || (inval < config && config < vsCtrl));   // (the config registers, when the two programs differ in them)
+    CHECK(vsCtrl < vsLoad);
+    CHECK(vsLoad < link);
+    CHECK(link < rast && rast < view && view < blend && blend < draw);
+    CHECK(vsCtrl < fsCtrl && fsCtrl < link);
 }

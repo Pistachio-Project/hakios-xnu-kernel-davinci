@@ -592,20 +592,34 @@ bool encode(pm4::Stream& stream, const Program& program, const RenderPass& pass,
 // and written whole or as a delta. What a group writes is written by no one else in the pass (render_test checks the
 // register sets are disjoint), so the state of a group is the key it last wrote, not a shadow of its registers.
 // Only register writes: the loads, the draw and the rest of the draw stay in the draw's own stream.
-enum Group : uint32_t { kGroupStatic, kGroupProgram, kGroupVfd, kGroupRast, kGroupViewport, kGroupBlend, kGroupCount };
+// The groups, in the bit order of the mask (boot-arg metal_dirty_groups=MASK, env HAKIOS_METAL_DIRTY_GROUPS), in the order a draw writes them:
+//   bit 0 pass       RB_DEPTH/ZS, RB_MRT, MSAA, RB_RENDER_CNTL, LRZ off      bit 5 link    VPC link, FS inputs, FS outputs
+//   bit 1 config     SP/HLSQ_xS_CONFIG and _CNTL of the five stages          bit 6 rast    rasterizer registers
+//   bit 2 progVs     VS CTRL_REG0, INSTRLEN, OBJ_START, pvt mem              bit 7 viewport viewport, clamps, guardband
+//   bit 3 progFs     the same for the FS                                     bit 8 blend   blend, depth, stencil
+//   bit 4 vfd        VFD control, decode, restart index
+// A group with its bit clear is encoded whole in the draw's own stream every draw, as before the tracking.
+enum Group : uint32_t { kGroupPass, kGroupConfig, kGroupProgVs, kGroupProgFs, kGroupVfd, kGroupLink, kGroupRast, kGroupViewport, kGroupBlend, kGroupCount };
+constexpr uint32_t kAllGroups = (1u << kGroupCount) - 1;
 class GroupCache {
 public:
+    GroupCache() { begin(); }
+    uint32_t mask = kAllGroups;   // the groups tracked
+    bool suppress = false;        // (a test's: emitOne writes nothing, so that the draw's own stream is what is left)
     // a draw begins: nothing pending
     void begin();
     // PROGRAM_KEY: what the program and the pass's options decide, which a group's key may start with (the caller sets it once a
     // draw); the cache numbers the keys it has seen, so that a group's key is that number and its own extra bytes
-    void setProgramKey(const void* key, size_t n);
+    // The numbered key also holds a copy of the two stages (STAGES: VS then FS, STAGE_BYTES each), compared whole: a kernel's address
+    // that another program has come to hold is another program.
+    void setProgramKey(const void* key, size_t n, const void* vs, const void* fs, size_t stageBytes);
     // whether group G must be encoded into out[G] for a draw with this key (the program key's number and EXTRA if
     // WITH_PROGRAM); false: the cache knows its words
     bool need(uint32_t g, bool withProgram, const void* extra, size_t n);
     pm4::Stream out[kGroupCount];
-    // the words the draw needs, written to TO (before the draw's own stream), and what the cache holds noted for the next draw
-    void emit(pm4::Stream& to);
+    // group G's words for this draw, written to TO at the place in the draw's stream where the group's registers belong, and what
+    // the cache holds noted for the next draw
+    void emitOne(uint32_t g, pm4::Stream& to);
     // the registers hold something else than the last emit left (a packet that may have changed them behind the stream's back):
     // the next draw writes every group whole
     void forget();
@@ -627,11 +641,11 @@ private:
         std::vector<Entry> entries;
         int last = -1;
     };
-    struct ProgramKey { uint64_t hash; std::vector<uint8_t> bytes; };
+    struct ProgramKey { uint64_t hash; std::vector<uint8_t> bytes, stages; };
     static constexpr int kSame = -1, kNew = -2;
     static constexpr size_t kMaxEntries = 96, kMaxPrograms = 256;
     G g_[kGroupCount];
-    int pending_[kGroupCount] = {-1, -1, -1, -1, -1, -1};
+    int pending_[kGroupCount];
     uint64_t newHash_[kGroupCount] = {};
     int newProgram_[kGroupCount] = {};
     std::vector<uint8_t> newKey_[kGroupCount];

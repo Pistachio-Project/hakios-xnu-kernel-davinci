@@ -120,6 +120,14 @@ bool envFullState() {
     return on;
 }
 
+uint32_t envDirtyGroups() {
+    static const uint32_t mask = [] {
+        const char* e = getenv("HAKIOS_METAL_DIRTY_GROUPS");
+        return e == nullptr || e[0] == 0 ? render::kAllGroups : uint32_t(strtoul(e, nullptr, 0)) & render::kAllGroups;
+    }();
+    return mask;
+}
+
 uint64_t CommandBuffer::programAddress(const Kernel& k, std::string* why) {
     const uint32_t n = std::max<uint32_t>(k.numWords, 1);
     auto same = [&](const Uploaded& u) {

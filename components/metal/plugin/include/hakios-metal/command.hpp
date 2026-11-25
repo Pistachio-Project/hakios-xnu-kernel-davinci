@@ -34,6 +34,8 @@ namespace hakios::metal {
 
 // HAKIOS_METAL_FULL_STATE=1 in the environment: CommandBuffer::setFullState from the start (read once)
 bool envFullState();
+// HAKIOS_METAL_DIRTY_GROUPS=MASK (decimal or 0x hex): CommandBuffer::setDirtyGroups from the start (read once); all groups when unset
+uint32_t envDirtyGroups();
 
 class CommandQueue;
 class Texture;
@@ -211,10 +213,14 @@ public:
     // tracking of render::GroupCache (the debug switch: boot-arg metal_full_state=1, or HAKIOS_METAL_FULL_STATE=1 on a host);
     // the two make the same state at every draw
     void setFullState(bool on) { fullState_ = on; }
+    // which register groups are tracked (render::Group's bits, render.hpp): a group with its bit clear is encoded whole every draw, as
+    // with setFullState; boot-arg metal_dirty_groups=MASK, for bisecting on the phone. All by default.
+    void setDirtyGroups(uint32_t mask) { dirtyGroups_ = mask & render::kAllGroups; }
     // why the last pass that could not be drawn in GMEM was not (gmemPlan's or gmemDrawOk's reason), empty when none was refused
     const std::string& gmemRefusal() const { return gmemWhy_; }
     // the words recorded so far (what the command processor will read)
     size_t streamWords() const { return stream_.words().size(); }
+    const std::vector<uint32_t>& streamForTest() const { return stream_.words(); }
     size_t streamCapacity() const { return stream_.capacity(); }   // (words it holds room for: the queue's memory, takePass)
     std::vector<PassTime> passTimes() const;
     // why profiled pass I of a draw was drawn in sysmem ("" for a GMEM pass, or one not profiled); valid while the buffer lives
@@ -242,6 +248,7 @@ private:
     bool gmemBinning_ = false;
     bool nullFsTextures_ = false;
     bool fullState_ = envFullState();
+    uint32_t dirtyGroups_ = envDirtyGroups();
     uint32_t gmemClears_ = 0, gmemClearWords_[kMaxColorOutputs][4] = {};   // (draw's, for the pass it opens)
     std::string gmemWhy_;
     std::unordered_map<uint64_t, uint32_t> ordinals_;   // passes opened so far into each kind of target

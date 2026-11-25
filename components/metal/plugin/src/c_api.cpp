@@ -964,6 +964,11 @@ void hakios_metal_cb_set_full_state(hakios_metal_cb* cb, int on) {
     cb->cb->setFullState(on != 0);
 }
 
+void hakios_metal_cb_set_dirty_groups(hakios_metal_cb* cb, unsigned mask) {
+    if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, mask] { cb->cb->setDirtyGroups(mask); });
+    cb->cb->setDirtyGroups(mask);
+}
+
 void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, on] { cb->cb->setNullFsTextures(on != 0); });
     cb->cb->setNullFsTextures(on != 0);
