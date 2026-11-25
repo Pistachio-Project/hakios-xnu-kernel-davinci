@@ -2,6 +2,8 @@
 #
 #   make test            build and run the tests on this machine (macOS or Linux, any C++17 compiler), against the
 #                        fake GPU (include/hakios-metal/fake_gpu.hpp), which runs the command streams it is given
+#   make bench           the per-draw encoding of a CoreAnimation-like pass, timed (tools/bench_draw.cpp; HAKIOS_METAL_BENCH=N rounds,
+#                        BENCH_MODE=gmem|sys|dual)
 #   make tsan            the same under ThreadSanitizer (out/host-thread/)
 #   make asan            the same under AddressSanitizer (out/host-address/)
 #   make check           the tests, then the Metal plug-in (plugin/) on this Mac twice: as hakios-xnu-kernel builds it without
@@ -65,7 +67,7 @@ CORE      = src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.
 HOST      = $(CORE) src/fake_gpu.cpp
 TESTS     = $(wildcard tests/*_test.cpp) tests/main.cpp
 
-.PHONY: test tsan asan check ios darwin clean sweep
+.PHONY: test tsan asan check ios darwin clean sweep bench
 
 # (and the front end's archive: a test binary linked before the front end changed passed or failed for the old one)
 $(HOSTOUT)/tests: $(HOST) $(TESTS) $(wildcard include/hakios-metal/*.hpp) $(wildcard tests/fixtures/*.hpp) tests/test.hpp plugin/ca_paths.c plugin/ca_paths.h \
@@ -84,6 +86,17 @@ $(HOSTOUT)/sweep: tools/sweep.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp)
 sweep: $(HOSTOUT)/sweep
 
 # (with the compiler in, compiler_test compiles every tools/kernels/*.ll against its fixture: their bitcode must be there)
+# the per-draw encoding benchmark (tools/bench_draw.cpp): ~100 draws a pass, four pipelines, buffers and textures bound
+# per draw, GMEM with binning, through the fake GPU; ns a draw at best
+$(HOSTOUT)/bench_draw: tools/bench_draw.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp) $(wildcard tests/fixtures/*.hpp)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -pthread -o $@ tools/bench_draw.cpp $(HOST) $(HOSTLIBS)
+
+bench: $(HOSTOUT)/bench_draw
+	$(HOSTOUT)/bench_draw
+	BENCH_MODE=sys $(HOSTOUT)/bench_draw
+	BENCH_MODE=dual $(HOSTOUT)/bench_draw
+
 test: $(HOSTOUT)/tests $(if $(strip $(MESA)),$(KERNEL_BC))
 	$(HOSTOUT)/tests
 
