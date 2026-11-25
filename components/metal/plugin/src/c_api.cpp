@@ -959,6 +959,11 @@ void hakios_metal_cb_set_gmem_binning(hakios_metal_cb* cb, int on) {
     cb->cb->setGmemBinning(on != 0);
 }
 
+void hakios_metal_cb_set_full_state(hakios_metal_cb* cb, int on) {
+    if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, on] { cb->cb->setFullState(on != 0); });
+    cb->cb->setFullState(on != 0);
+}
+
 void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, on] { cb->cb->setNullFsTextures(on != 0); });
     cb->cb->setNullFsTextures(on != 0);
