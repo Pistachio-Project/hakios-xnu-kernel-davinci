@@ -973,64 +973,67 @@ pack_xattrs(uint32_t *count)
 /* One entry: its head, its name, its extended attributes, its contents. */
 /* ---- where the bytes are: a summary at the end of every save, for finding what grows ---- */
 
-#define BUCKETS 192
-static struct bucket { char name[72]; uint64_t bytes, entries; } buckets[BUCKETS];
-static uint64_t skipped_logs, skipped_log_bytes;
+#define BUCKETS 4096                    /* a power of two: a hash table, probed linearly */
+static struct bucket { char name[80]; uint64_t bytes, entries; } buckets[BUCKETS];
+static uint64_t skipped_logs, skipped_log_bytes, dropped_buckets;
 
 static void
 account_to(const char *name, size_t n, uint64_t bytes)
 {
-	struct bucket *free_one = NULL;
+	uint32_t h = 2166136261u;
 
-	for (int i = 0; i < BUCKETS; i++) {
-		if (buckets[i].name[0] == 0) {
-			if (free_one == NULL) {
-				free_one = &buckets[i];
-			}
-			continue;
+	if (n >= sizeof(buckets[0].name)) {
+		return;
+	}
+	for (size_t i = 0; i < n; i++) {
+		h = (h ^ (uint8_t)name[i]) * 16777619u;
+	}
+	for (uint32_t tries = 0; tries < BUCKETS; tries++) {
+		struct bucket *b = &buckets[(h + tries) % BUCKETS];
+
+		if (b->name[0] == 0) {
+			memcpy(b->name, name, n);
+			b->name[n] = 0;
+			b->bytes = bytes;
+			b->entries = 1;
+			return;
 		}
-		if (strlen(buckets[i].name) == n && memcmp(buckets[i].name, name, n) == 0) {
-			buckets[i].bytes += bytes;
-			buckets[i].entries++;
+		if (strlen(b->name) == n && memcmp(b->name, name, n) == 0) {
+			b->bytes += bytes;
+			b->entries++;
 			return;
 		}
 	}
-	if (free_one != NULL && n < sizeof(free_one->name)) {
-		memcpy(free_one->name, name, n);
-		free_one->name[n] = 0;
-		free_one->bytes = bytes;
-		free_one->entries = 1;
-	}
+	dropped_buckets++;
 }
 
-/* a file or whatever of SIZE bytes under RELATIVE: counted for its top directory, and for its first three levels
- * (mobile/Library/Caches, db/diagnostics...) */
+/*
+ * a file or whatever of SIZE bytes under RELATIVE: counted for each of its leading directories, three levels deep
+ * (mobile/Library/Caches...), five under the per-service temp and cache directories and the shared containers, where
+ * the bytes of this volume have been (dirs_cleaner/1O/com.apple.audiomxd/...)
+ */
 static void
 account(const char *relative, uint64_t size)
 {
 	size_t n = 0;
-	int level = 0;
+	int level = 0, deepest = strncmp(relative, "dirs_cleaner", 12) == 0 || strncmp(relative, "containers", 10) == 0 ? 5 : 3;
 
 	for (; relative[n] != 0; n++) {
 		if (relative[n] == '/') {
 			account_to(relative, n, size);
-			if (++level == 3) {
+			if (++level == deepest) {
 				return;
 			}
 		}
 	}
-	if (level == 0) {
-		account_to(relative, n, size);
-	} else if (level < 3 && n != 0) {
-		account_to(relative, n, size);
-	}
+	account_to(relative, n, size);
 }
 
 static void
 print_summary(void)
 {
-	/* the biggest twenty, by selection */
-	for (int rank = 0; rank < 20; rank++) {
+	/* the biggest forty (a megabyte at least; half of one deep down), by selection */
+	for (int rank = 0; rank < 40; rank++) {
 		struct bucket *best = NULL;
 
 		for (int i = 0; i < BUCKETS; i++) {
@@ -1038,12 +1041,15 @@ print_summary(void)
 				best = &buckets[i];
 			}
 		}
-		if (best == NULL || best->bytes < (1u << 20)) {
+		if (best == NULL || best->bytes < (512u << 10)) {
 			break;
 		}
 		printf("var_store: size: %llu bytes %llu entries %s\n", (unsigned long long)best->bytes,
 		    (unsigned long long)best->entries, best->name);
-		best->name[0] = 0;
+		best->name[0] = 0;     /* (open addressing: the table is not probed again this save) */
+	}
+	if (dropped_buckets != 0) {
+		printf("var_store: size: %llu names did not fit the summary\n", (unsigned long long)dropped_buckets);
 	}
 	if (skipped_logs != 0) {
 		printf("var_store: size: %llu log files over %u bytes, %llu bytes, left out (var_store_diag=1 keeps them)\n",
@@ -1472,7 +1478,7 @@ save(void)
 	/* a watcher saves more than once: nothing of the save before is carried into this one */
 	memset(links, 0, LINKS * sizeof(*links));
 	skipped_kinds = skipped_big = 0;
-	skipped_logs = skipped_log_bytes = 0;
+	skipped_logs = skipped_log_bytes = dropped_buckets = 0;
 	memset(buckets, 0, sizeof(buckets));
 	changed_under = 0;
 	strcpy(path, ROOT);
