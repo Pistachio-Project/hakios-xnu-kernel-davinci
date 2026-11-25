@@ -37,7 +37,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include "hk_trace.h"
 
 extern Boolean MGGetBoolAnswer(CFStringRef key);
 extern CFTypeRef MGCopyAnswer(CFStringRef key);
@@ -47,24 +46,6 @@ static bool said_mg, said_copy;
 
 static void
 say(const char *format, ...) __printflike(1, 2);
-
-void
-hk_trace_say(const char *format, ...)
-{
-	char line[320];
-	va_list ap;
-	int n;
-
-	va_start(ap, format);
-	n = vsnprintf(line, sizeof(line), format, ap);
-	va_end(ap);
-	if (n > (int)sizeof(line) - 1) {
-		n = (int)sizeof(line) - 1;
-	}
-	if (n > 0) {
-		write(2, line, (size_t)n);
-	}
-}
 
 static void
 say(const char *format, ...)
@@ -234,84 +215,13 @@ try_hooks(void)
 	}
 }
 
-/*
- * What a tap on the control calls is not known (-[SBUIFlashlightController turnFlashlightOnForReason:] was never
- * reached by one), so every method of the classes of the flashlight is logged as it is called: SBUIFlashlightController,
- * AVFlashlight, every class with "Flashlight" in its name (CCUIFlashlightModule and its view controller among them,
- * not the accessibility ones), and, of the Control Center classes, the methods named for a tap, a toggle or an intent.
- * Each class once. hk_trace.h says what is left alone.
- */
-static CFMutableSetRef traced;
-static unsigned traced_methods;
-
-static bool
-wanted_method(const char *name)
-{
-	static const char *const parts[] = { "lashlight", "oggle", "erformIntent", "erformAction", "ctionTriggered", "idTap",
-	    "Tapped", "handleTap", "executeIntent", "runIntent", "setSelected", "ControlValue", NULL };
-
-	for (int i = 0; parts[i] != NULL; i++) {
-		if (strstr(name, parts[i]) != NULL) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static void
-trace_classes(void)
-{
-	unsigned count = 0;
-	Class *classes = objc_copyClassList(&count);
-
-	if (traced == NULL) {
-		traced = CFSetCreateMutable(NULL, 0, NULL);
-	}
-	for (unsigned i = 0; i < count; i++) {
-		const char *name = class_getName(classes[i]);
-		const char *image = class_getImageName(classes[i]);
-		bool named = strstr(name, "Flashlight") != NULL && strstr(name, "Accessibility") == NULL && strncmp(name, "AX", 2) != 0
-		    && strncmp(name, "WF", 2) != 0 && strncmp(name, "SA", 2) != 0 && strncmp(name, "ORCH", 4) != 0;
-		bool control = image != NULL && strstr(image, "ControlCenter") != NULL && strncmp(name, "AX", 2) != 0;
-
-		if (CFSetContainsValue(traced, classes[i]) || !(named || control)) {
-			continue;
-		}
-		CFSetAddValue(traced, classes[i]);
-		if (named) {
-			unsigned n = hk_trace_class(classes[i], "flashlight");
-
-			traced_methods += n;
-			say("hakios: flash: tracing %u methods of %s\n", n, name);
-		} else {
-			unsigned total = 0, n = 0;
-			Method *list = class_copyMethodList(classes[i], &total);
-
-			for (unsigned k = 0; k < total && traced_methods < 600; k++) {
-				if (wanted_method(sel_getName(method_getName(list[k]))) && hk_trace_method(classes[i], false, list[k], "cc")) {
-					n++;
-					traced_methods++;
-				}
-			}
-			free(list);
-			if (n > 0) {
-				say("hakios: flash: tracing %u methods of %s\n", n, name);
-			}
-		}
-	}
-	free(classes);
-}
-
 static void
 image_added(const struct mach_header *header, intptr_t slide)
 {
 	(void)header;
 	(void)slide;
-	if (kernel_torch) {
-		if (!(has_done && init_done && turn_done)) {
-			try_hooks();
-		}
-		trace_classes();
+	if (kernel_torch && !(has_done && init_done && turn_done)) {
+		try_hooks();
 	}
 }
 
