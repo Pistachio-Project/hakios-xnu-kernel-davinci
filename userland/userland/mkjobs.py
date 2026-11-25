@@ -261,7 +261,10 @@ DENY += ('fileindexerd', 'spotlightknowledged.updater', 'icloudmailagent')
 # CPU in the run, searchpartyd (Find My accessories: no Bluetooth, UWB) 2.1 s, findmydeviced / findmylocated (no
 # network, no location) 0.7 / 0.9 s, nearbyd (UWB) 0.5 s, audioaccessoryd (no accessories) 0.8 s, carkitd (no
 # CarPlay) 0.2 s. All are on-demand jobs here, so nothing waits for them. ALLOW="sharingd" etc. puts one back.
-DENY_DAVINCI = ('com.apple.sharingd', 'searchpartyd', 'findmydeviced', 'findmylocated', 'nearbyd', 'audioaccessoryd', 'carkitd')
+# With no modem (CommCenter is denied above) visual voicemail, the radios' coexistence manager and the wireless
+# diagnostics have nothing to do: vmd 0.24 s, WirelessRadioManagerd 0.42 s in a run (logs/140130-run.log).
+DENY_DAVINCI = ('com.apple.sharingd', 'searchpartyd', 'findmydeviced', 'findmylocated', 'nearbyd', 'audioaccessoryd', 'carkitd',
+                'com.apple.voicemail.vmd', 'WirelessRadioManager', 'wirelessinsightsd')
 if os.environ.get('BOARD') == 'davinci':
     DENY += DENY_DAVINCI
 
