@@ -4175,6 +4175,8 @@ hm_compress_ok(void)
  * fps report says how many were made.
  */
 static unsigned hm_ubwc_rt_made, hm_ubwc_rt_linear, hm_ubwc_rt_reported;
+/* textures made by layout: UBWC 8-bit, UBWC fp16, linear under 65536 pixels, linear mipped, linear non-2D, linear large 2D (the ones UBWC missed) */
+static unsigned hm_layouts_made[6], hm_layouts_reported[6];
 
 static BOOL
 hm_compress_rt_ok(void)
@@ -4192,12 +4194,18 @@ hm_compress_rt_ok(void)
 static BOOL
 hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 {
+	const MTLPixelFormat pf = [descriptor pixelFormat];
+	/* (metal_ubwc_half=0: RGBA16F and RG16F render targets stay linear) */
+	static int halfOn = -1;
+	if (halfOn < 0) halfOn = !hm_boot_arg_set("metal_ubwc_half=0");
+	const BOOL half = (pf == MTLPixelFormatRGBA16Float || pf == MTLPixelFormatRG16Float) && halfOn;
+
 	if (!hm_compress_ok() || [descriptor textureType] != MTLTextureType2D || [descriptor mipmapLevelCount] != 1 || [descriptor sampleCount] != 1 ||
-	    ([descriptor pixelFormat] != MTLPixelFormatRGBA8Unorm && [descriptor pixelFormat] != MTLPixelFormatBGRA8Unorm) ||
+	    (pf != MTLPixelFormatRGBA8Unorm && pf != MTLPixelFormatBGRA8Unorm && !half) ||
 	    [descriptor width] * [descriptor height] < 65536) {
 		return NO;
 	}
-	if (usage == MTLTextureUsageShaderRead && [descriptor storageMode] == MTLStorageModeShared) {
+	if (!half && usage == MTLTextureUsageShaderRead && [descriptor storageMode] == MTLStorageModeShared) {
 		return YES;
 	}
 	/* (the descriptor's own usage for the view bit: the caller's USAGE has it dropped already) */
@@ -4485,6 +4493,14 @@ hm_memoryless_give(hakios_metal_texture *t, unsigned type, unsigned format, unsi
 	}
 	HakiosMetalTexture *made = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];
 	if (memoryless && made != nil) [made hakiosKeepMemoryAs:shape];
+	{
+		/* the layouts made, for the fps report: UBWC (the 8-bit formats / the 16-bit float ones), and linear ones by size and by why */
+		const BOOL big = [descriptor width] * [descriptor height] >= 65536;
+		const BOOL fp16 = [descriptor pixelFormat] == MTLPixelFormatRGBA16Float || [descriptor pixelFormat] == MTLPixelFormatRG16Float;
+		const unsigned k = hakios_metal_texture_is_compressed(texture) ? (fp16 ? 1 : 0) : !big ? 2 : [descriptor mipmapLevelCount] > 1 ? 3 :
+				   [descriptor textureType] != MTLTextureType2D ? 4 : 5;
+		__atomic_add_fetch(&hm_layouts_made[k], 1, __ATOMIC_RELAXED);
+	}
 	return made;
 }
 
@@ -7168,6 +7184,12 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 "all\n", hm_compress_rt_ok() ? 1 : 0, made, made - hm_ubwc_rt_reported, span,
 				 __atomic_load_n(&hm_ubwc_rt_linear, __ATOMIC_RELAXED));
 			hm_ubwc_rt_reported = made;
+		}
+		if (memcmp(hm_layouts_made, hm_layouts_reported, sizeof(hm_layouts_made)) != 0) {
+			hm_print("fps: ... textures made by layout: %u UBWC 8-bit, %u UBWC fp16 | linear: %u small, %u mipped, %u not 2D, %u large 2D unmipped "
+				 "(metal_ubwc_half=%d)\n", hm_layouts_made[0], hm_layouts_made[1], hm_layouts_made[2], hm_layouts_made[3], hm_layouts_made[4],
+				 hm_layouts_made[5], hm_boot_arg_set("metal_ubwc_half=0") ? 0 : 1);
+			memcpy(hm_layouts_reported, hm_layouts_made, sizeof(hm_layouts_made));
 		}
 		if (hm_sampling()) hm_sample_report();
 		if (hm_timeline_on() && hm_fps.sampledBytes[0] + hm_fps.sampledBytes[1] + hm_fps.sampledBytes[2] + hm_fps.sampledBytes[3] + hm_fps.sampledBytes[4] +

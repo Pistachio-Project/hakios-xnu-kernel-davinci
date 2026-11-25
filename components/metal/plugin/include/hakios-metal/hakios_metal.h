@@ -148,6 +148,8 @@ hakios_metal_texture *hakios_metal_texture_new(hakios_metal_device *device, unsi
  * kernel stores into UBWC on this GPU). NULL with the reason. */
 hakios_metal_texture *hakios_metal_texture_new_compressed(hakios_metal_device *device, unsigned pixel_format, unsigned width, unsigned height,
     unsigned usage);
+/* 1 when the texture is in the UBWC layout */
+int hakios_metal_texture_is_compressed(hakios_metal_texture *texture);
 /* where a texture's pixels live: 0 its own memory, 1 an IOSurface, 2 a buffer's rows, 3 compressed (with rows of its own) */
 unsigned hakios_metal_texture_origin(hakios_metal_texture *texture);
 /* ...of LEVELS mip levels (MTLTextureDescriptor.mipmapLevelCount: 1 to floor(log2(max(width, height))) + 1) */

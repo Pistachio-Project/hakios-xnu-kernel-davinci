@@ -634,6 +634,8 @@ hakios_metal_texture* hakios_metal_texture_new_compressed(hakios_metal_device* d
     return r;
 }
 
+int hakios_metal_texture_is_compressed(hakios_metal_texture* t) { return t != nullptr && t->texture != nullptr && t->texture->compressed() ? 1 : 0; }
+
 namespace {
 hakios_metal_texture* textureOverSurface(hakios_metal_device* d, unsigned surfaceId, unsigned plane, unsigned pixelFormat, unsigned width, unsigned height,
                                          unsigned usage, const Texture::SurfacePlane* chroma) {

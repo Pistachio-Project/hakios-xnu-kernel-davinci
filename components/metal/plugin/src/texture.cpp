@@ -449,14 +449,21 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         // an image is optimal): the flag buffer first, then the tiled data, at offsets fdl gives
 #ifdef HAKIOS_METAL_MESA
         if (desc.type != TextureType::k2D || desc.mipLevels != 1 || desc.samples != 1 ||
-            (desc.format != PixelFormat::kRGBA8Unorm && desc.format != PixelFormat::kBGRA8Unorm)) {
-            refuse(why, std::string("a compressed ") + info->name + " texture: one level of 2D, single-sampled RGBA8Unorm or BGRA8Unorm is what is served");
+            (desc.format != PixelFormat::kRGBA8Unorm && desc.format != PixelFormat::kBGRA8Unorm && desc.format != PixelFormat::kRGBA16Float &&
+             desc.format != PixelFormat::kRG16Float)) {
+            refuse(why, std::string("a compressed ") + info->name + " texture: one level of 2D, single-sampled RGBA8Unorm, BGRA8Unorm, RGBA16Float or RG16Float is what is served");
             return nullptr;
         }
         // (no kernel stores into one: before A7XX a storage image is left uncompressed, there being no UBWC through the
         // IBO path -- turnip's ubwc_possible, tu_image.cc:376-387, supports_ibo_ubwc an a7xx field)
         if ((desc.usage & kTextureUsageWrite) != 0) {
             refuse(why, std::string("a compressed ") + info->name + " texture with shader-write usage: a kernel stores through linear rows alone on this GPU");
+            return nullptr;
+        }
+        // (the 16-bit float formats: render targets alone -- the rows that fill a texture are the 8-bit swap's)
+        const bool half = desc.format == PixelFormat::kRGBA16Float || desc.format == PixelFormat::kRG16Float;
+        if (half && (desc.usage & kTextureUsageRenderTarget) == 0) {
+            refuse(why, std::string("a compressed ") + info->name + " texture that is not a render target: its rows could not be filled");
             return nullptr;
         }
         // (rows for this processor only for one it does not draw into: a render target's truth is what the GPU drew,
@@ -474,7 +481,7 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         fdl_layout l{};
         l.ubwc = true;
         l.tile_mode = a6xx::TILE6_3;
-        if (dev == nullptr || !fdl6_layout(&l, dev, PIPE_FORMAT_R8G8B8A8_UNORM, 1, desc.width, desc.height, 1, 1, 1, false, false, true, nullptr) || !l.ubwc) {
+        if (dev == nullptr || !fdl6_layout(&l, dev, half ? (desc.format == PixelFormat::kRGBA16Float ? PIPE_FORMAT_R16G16B16A16_FLOAT : PIPE_FORMAT_R16G16_FLOAT) : PIPE_FORMAT_R8G8B8A8_UNORM, 1, desc.width, desc.height, 1, 1, 1, false, false, true, nullptr) || !l.ubwc) {
             refuse(why, "no UBWC layout for a " + n(desc.width) + " x " + n(desc.height) + " texture on this chip");
             return nullptr;
         }
