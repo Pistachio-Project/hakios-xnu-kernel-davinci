@@ -9,7 +9,8 @@
 #include <kern/cpu_number.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
-#include <libkern/libkern.h>
+#include <kern/misc_protos.h>
+#include <string.h>
 #include <machine/atomic.h>
 #include <machine/machine_routines.h>
 #include <arm/caches_internal.h>
@@ -120,18 +121,13 @@ extern int64_t psci_smp_feature(uint32_t function);
 extern int hakios_board_cpu_group_of(unsigned core);
 extern void loader_log_line(const char *line);
 
-/* (to the loader's log, which the phone's log is made from; longer than pm_say()'s 192 bytes) */
-static void __printflike(1, 2)
-pm_say(const char *format, ...)
-{
-	char line[480];
-	va_list list;
-
-	va_start(list, format);
-	vsnprintf(line, sizeof(line), format, list);
-	va_end(list);
-	loader_log_line(line);
-}
+/* (to the loader's log, which the phone's log is made from; longer than hakios_tl()'s 192 bytes) */
+#define pm_say(...) \
+	do { \
+		char pm_line[480]; \
+		snprintf(pm_line, sizeof(pm_line), __VA_ARGS__); \
+		loader_log_line(pm_line); \
+	} while (0)
 
 static inline uint64_t
 pm_us_to_ticks(uint64_t us)
