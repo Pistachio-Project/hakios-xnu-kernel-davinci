@@ -1079,6 +1079,8 @@ bool CommandBuffer::pathHops(double out[13]) const {
     return haveKernelTimes_;
 }
 
+bool CommandBuffer::queueBinningOk() const { return queue_.binningOk(); }
+
 int64_t CommandBuffer::nowNs() const { return queue_.gpuClockNs(); }
 
 }  // namespace hakios::metal

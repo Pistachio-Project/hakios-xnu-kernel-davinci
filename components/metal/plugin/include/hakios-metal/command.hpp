@@ -162,6 +162,7 @@ public:
     // idle at its tail, which is a fixed cost whatever is drawn), the draws in them, and dispatches, copies and clears
     // (each a pass of its own). What a frame's GPU time goes to is read off these beside the time (metal_fps).
     struct Counts { uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0; };   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
+    bool queueBinningOk() const;
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
     // of each pass and after its tail -- whose wait for idle makes the end the end -- for the first kMaxProfiled passes:

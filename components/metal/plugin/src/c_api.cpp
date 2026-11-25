@@ -977,6 +977,12 @@ int hakios_metal_cb_pass_time(hakios_metal_cb* cb, unsigned i, unsigned* kind, u
     return int(t.size());
 }
 
+void hakios_metal_cb_binning(hakios_metal_cb* cb, unsigned* binned, int* binningOk) {
+    syncOne(cb);
+    *binned = cb->cb->counts().binnedPasses;
+    *binningOk = cb->cb->queueBinningOk() ? 1 : 0;
+}
+
 void hakios_metal_cb_counts(hakios_metal_cb* cb, unsigned* passes, unsigned* draws, unsigned* dispatches, unsigned* copies, unsigned* clears) {
     syncOne(cb);
     const CommandBuffer::Counts& c = cb->cb->counts();
@@ -1348,6 +1354,16 @@ hakios_metal_program* hakios_metal_program_specialize_part(hakios_metal_program*
     r->program = std::move(p);
     r->color = base->color;
     return r;
+}
+
+int hakios_metal_program_stage_regs(hakios_metal_program* p, unsigned stage, int* fullRegs, int* halfRegs, unsigned* pvtmemBytes, unsigned* branchstack) {
+    if (p == nullptr || stage > 1) return -1;
+    const Kernel& k = (stage == 0 ? p->program->program.vs : p->program->program.fs).k;
+    *fullRegs = k.maxReg + 1;
+    *halfRegs = k.maxHalfReg + 1;
+    *pvtmemBytes = k.pvtmemSize;
+    *branchstack = k.branchstackHw;
+    return 0;
 }
 
 unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stage) {

@@ -3867,6 +3867,21 @@ hm_pipeline_note(double ms)
 				}
 			}
 		}
+		{
+			/* the compiler's own account of the hot stages: instruction words (ir3), full and half registers (the wave count a core runs
+			 * falls as they rise), private memory a fiber (a spill) -- with a fragment stage of 300 words or more only, the rest being cheap */
+			int vf = 0, vh = 0, ff = 0, fh = 0;
+			unsigned vp = 0, fp = 0, vb = 0, fb = 0;
+			const unsigned fw = hakios_metal_program_stage_words(program, 1);
+
+			hakios_metal_program_stage_regs(program, 0, &vf, &vh, &vp, &vb);
+			hakios_metal_program_stage_regs(program, 1, &ff, &fh, &fp, &fb);
+			if (fw >= 300 || fp != 0 || vp != 0) {
+				hm_print("ir3: %s: vertex %u words, %d full and %d half registers, %u bytes of private memory; fragment %u words, %d full and %d half "
+					 "registers, %u bytes of private memory (spills), branch stack %u\n", hakios_metal_program_name(program),
+					 hakios_metal_program_stage_words(program, 0), vf, vh, vp, fw, ff, fh, fp, fb);
+			}
+		}
 		hm_print("linked %s (%p) for pixel format %u: the vertex stage binds %u resources, the fragment stage %u; fragment constants not 0:%s\n",
 			 hakios_metal_program_name(program), (void *)program, format, hakios_metal_program_resource_count(program, 0),
 			 hakios_metal_program_resource_count(program, 1), [set UTF8String]);
@@ -6588,6 +6603,8 @@ static struct {
 	char hitchSlow[360];
 	unsigned long long snapBuffers, snapKb, snapTexMiss, snapStageMiss, snapPipelines, snapCbs;
 	unsigned cbsSince;
+	unsigned binnedPasses;          /* GMEM passes binned by the hardware in this window */
+	BOOL binningOff;                /* the queue's binning was turned off by an overrun of a visibility stream */
 } hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}} };
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
@@ -6843,6 +6860,14 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 
 				hakios_metal_cb_gmem_counts(cb, &gp, &tl);
 				hm_fps.gmemPasses += gp;
+				{
+					unsigned bn = 0;
+					int ok = 1;
+
+					hakios_metal_cb_binning(cb, &bn, &ok);
+					hm_fps.binnedPasses += bn;
+					if (!ok) hm_fps.binningOff = YES;
+				}
 				hm_fps.tiles += tl;
 				if (hakios_metal_cb_gmem_refusal(cb)[0] != 0) {
 					strlcpy(hm_fps.gmemWhy, hakios_metal_cb_gmem_refusal(cb), sizeof(hm_fps.gmemWhy));
@@ -7114,6 +7139,11 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			 hm_fps.commit * 1e3, hm_fps.buffers ? hm_fps.latency * 1e3 / hm_fps.buffers : 0.0, hm_fps.latencyMax * 1e3,
 			 hm_fps.passes / per, hm_fps.draws / per, hm_fps.dispatches / per, hm_fps.copies / per, hm_fps.gmemPasses / per,
 			 hm_fps.tiles / per);
+		if (hm_fps.gmemPasses != 0) {
+			hm_print("fps: ... GMEM passes binned by the hardware (VSC): %u of %.0f in this window; binning %s\n", hm_fps.binnedPasses,
+				 hm_fps.gmemPasses * 1.0, hm_fps.binningOff ? "TURNED OFF for the queue by a visibility stream overrun: every draw is replayed in every tile" : "on");
+			hm_fps.binnedPasses = 0;
+		}
 		{
 			static unsigned windows;
 

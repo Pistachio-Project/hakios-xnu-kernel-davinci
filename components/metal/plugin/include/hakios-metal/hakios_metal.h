@@ -332,6 +332,8 @@ int hakios_metal_function_control_bytes(const void *fs_bitcode, size_t fs_size, 
     unsigned fs_count, unsigned binding, size_t length, uint8_t *mask);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
+/* a stage's register footprint as ir3 left it (full and half registers: SP_xS_CTRL_REG0), its private memory a fiber (spills) and branch stack */
+int hakios_metal_program_stage_regs(hakios_metal_program *program, unsigned stage, int *full_regs, int *half_regs, unsigned *pvtmem_bytes, unsigned *branchstack);
 void hakios_metal_program_free(hakios_metal_program *program);
 /* the buffers made from the kernel and those taken again from a queue's pool since the last call, and the bytes made */
 void hakios_metal_buffer_counts(unsigned *made, unsigned *reused, unsigned long long *bytes);
@@ -520,6 +522,8 @@ void hakios_metal_cb_skip_refused(hakios_metal_cb *cb, int on);
 void hakios_metal_cb_set_profile(hakios_metal_cb *cb, int on);
 int hakios_metal_cb_pass_time(hakios_metal_cb *cb, unsigned i, unsigned *kind, unsigned *width, unsigned *height, unsigned *draws, double *us);
 /* what CB holds so far (CommandBuffer::counts): passes opened, draws, dispatches, copies and clears; any pointer NULL */
+/* the GMEM passes of this buffer that were binned by the hardware (VSC), and whether binning is still on for the queue (a visibility stream that overran its pitch turns it off for good) */
+void hakios_metal_cb_binning(hakios_metal_cb *cb, unsigned *binned, int *binning_ok);
 void hakios_metal_cb_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *draws, unsigned *dispatches, unsigned *copies, unsigned *clears);
 /* tiled rendering (render::Options::gmem) for CB's passes from now on, on by default; and of what CB holds, the passes
  * drawn in GMEM and their tiles, and pass I's tiles as profiled (0: in sysmem, -1 past them) */
