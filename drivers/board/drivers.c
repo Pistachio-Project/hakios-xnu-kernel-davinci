@@ -31,6 +31,7 @@ extern void hakios_prof_start(void);            /* osfmk/arm64/prof.c */
 extern void hakios_backlight_init(void);        /* bsd/dev/board/backlight.c */
 extern void hakios_thermal_init(void);          /* bsd/dev/board/thermal.c */
 extern void hakios_imu_init(void);              /* bsd/dev/board/imu.c */
+extern void hakios_battery_qg_init(void);      /* bsd/dev/board/battery_qg.c */
 extern void hakios_rtc_init(void);              /* bsd/dev/board/rtc.c */
 
 /* The touch screen: the driver of the controller this board has, if it lists one. */
@@ -104,6 +105,9 @@ hakios_drivers_init(void)
 	}
 	if (CONFIG_BATTERY_FROM_LOADER) {
 		hakios_battery_init();  /* boot-arg battery=1: the charger's state, from the loader */
+	}
+	if (CONFIG_QCOM_BATTERY_QG) {
+		hakios_battery_qg_init();  /* boot-arg batt_live=1: the PMIC fuel gauge's current and voltage, live */
 	}
 	if (CONFIG_QCOM_UFS) {
 		hakios_ufs_init();  /* the phone's storage, read only */
