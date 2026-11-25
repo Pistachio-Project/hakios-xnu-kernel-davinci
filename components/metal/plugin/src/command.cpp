@@ -523,8 +523,10 @@ std::vector<CommandBuffer::DrawTime> CommandBuffer::drawTimes() const {
 
 std::string CommandBuffer::passDetail(size_t i) const {
     if (i >= profiled_.size()) return {};
-    const PassTime& t = profiled_[i];
+    const std::vector<PassTime> timed = passTimes();
+    const PassTime& t = timed.size() > i ? timed[i] : profiled_[i];
     std::string out = t.head;
+    if (t.gapUs != 0) out += " [" + std::to_string(int(t.gapUs)) + " us after the pass before]";
     out += " " + std::to_string(t.draws) + " draws";
     if (t.blended != 0) out += " (" + std::to_string(t.blended) + " blended)";
     out += ", fs up to " + std::to_string(t.maxFsWords) + " words";
@@ -543,6 +545,7 @@ std::vector<CommandBuffer::PassTime> CommandBuffer::passTimes() const {
     const auto* t = static_cast<const uint64_t*>(profileStamps_->contents());
     for (size_t i = 0; i < out.size(); i++) {
         out[i].us = t[2 * i + 1] > t[2 * i] ? double(t[2 * i + 1] - t[2 * i]) / 19.2 : 0.0;
+        out[i].gapUs = i > 0 && t[2 * i] > t[2 * i - 1] && t[2 * i - 1] != 0 ? double(t[2 * i] - t[2 * i - 1]) / 19.2 : 0.0;
     }
     return out;
 }

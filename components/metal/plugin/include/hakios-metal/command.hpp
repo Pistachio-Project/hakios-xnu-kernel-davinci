@@ -174,7 +174,9 @@ public:
         std::vector<std::pair<std::string, uint32_t>> names;   // the first 6 programs, draws each
         uint32_t sampled = 0, sampledMips = 0, blended = 0, maxFsWords = 0;
         uint64_t sampledPixels = 0;
-        uint32_t maxSampledW = 0, maxSampledH = 0; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+        uint32_t maxSampledW = 0, maxSampledH = 0;
+        double gapUs = 0;   // from the end of the pass before (in this command buffer) to the start of this one: what ran between, or nothing
+    };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
     static constexpr uint32_t kMaxProfiled = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,

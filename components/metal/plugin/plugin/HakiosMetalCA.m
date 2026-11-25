@@ -615,6 +615,7 @@ static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled ren
 static unsigned hm_dirty_groups(void);                /* metal_dirty_groups=MASK: the tracked register groups, a bit each */
 static BOOL hm_full_state(void);                      /* metal_full_state=1: every draw encodes all its register state (no dirty tracking) */
 static BOOL hm_binning_on(void);
+static unsigned hm_spec_used, hm_spec_fallback;   /* draws of uber pipelines with a specialised program / on the uber shader itself (the fps report) */
 static unsigned hm_pass_sync(void);                      /* metal_gmem_binning=1: the hardware's binning in GMEM passes */
 static unsigned hm_gmem_off(void);                    /* metal_gmem_off=N: GMEM's refinements off, by bit */
 - (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;
@@ -1308,6 +1309,7 @@ HM_REFUSES_OUT_LOUD
 - (unsigned)hakiosColorWrites;
 - (void)hakiosKeepFragment:(NSData *)air constants:(const hakios_metal_constant *)constants count:(unsigned)count;
 - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count;
+- (BOOL)hakiosCanSpecialise;
 @end
 
 @interface HakiosMetalCommandQueue : _MTLCommandQueue {
@@ -6994,6 +6996,14 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 hm_memoryless_stat.kept, hm_memoryless_stat.freed);
 			memset(&hm_memoryless_stat, 0, sizeof(hm_memoryless_stat));
 			{
+				const unsigned used = __atomic_exchange_n(&hm_spec_used, 0, __ATOMIC_RELAXED), fell = __atomic_exchange_n(&hm_spec_fallback, 0, __ATOMIC_RELAXED);
+
+				if (used + fell != 0) {
+					hm_print("fps: ... uber shader draws: %u on a program specialised for their buffer, %u on the uber shader itself (%.0f%%; its draws "
+						 "cost several times: 3 to 8 ms against tens of us in earlier runs)\n", used, fell, 100.0 * fell / (used + fell));
+				}
+			}
+			{
 				unsigned long long hits, misses, trimmed, cachedKb;
 
 				hakios_metal_texture_pool_counts(&hits, &misses, &trimmed, &cachedKb);
@@ -8732,6 +8742,8 @@ hm_spec_off(void)
  * one of its draws took 9.6 ms over 1.2 million pixels with its textures' reads gone or not, when the path its
  * configuration takes is 16 to 48 instructions. Such a pipeline keeps its fragment function so that a program can be
  * compiled for each content of the buffer (hakios_metal_program_specialize). */
+- (BOOL)hakiosCanSpecialise { return _specBinding >= 0 && _specialised != nil; }
+
 - (void)hakiosKeepFragment:(NSData *)air constants:(const hakios_metal_constant *)constants count:(unsigned)count
 {
 	_specBinding = -1;
@@ -9927,6 +9939,12 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	}
 	hakios_metal_cb_set_vertex_textures(cb, vsTex, _vsHighestTexture, vsSamp, _vsHighestSampler);
 	hakios_metal_program *program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];
+
+	if ([_pipeline hakiosCanSpecialise]) {
+		/* (an uber shader's draw: with the program compiled for what its buffer holds, or the uber shader's own while that compiles) */
+		if (program != [_pipeline hakiosProgram]) __atomic_fetch_add(&hm_spec_used, 1, __ATOMIC_RELAXED);
+		else __atomic_fetch_add(&hm_spec_fallback, 1, __ATOMIC_RELAXED);
+	}
 
 	hm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);
 	hm_geom(hakios_metal_program_name(program), vs, _vsOffsets, _vsHighest, (unsigned)count, (unsigned)instances, (unsigned)baseInstance, &_pass);
