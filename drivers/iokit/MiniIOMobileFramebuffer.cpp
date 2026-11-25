@@ -298,6 +298,21 @@ static bool gScanoutReady, gScanoutGaveUp;
  * the pipe had before is released (use count, hold) when its replacement has latched, by a timer or the next flip, whichever is first.
  */
 static TUNABLE(uint32_t, gScanoutAsync, "fb_scanout_async", 1);
+/*
+ * Boot-arg fb_scanout_ring=0 (default 1): the display fetches not the window server's surface but a copy of it in a ring of three buffers of
+ * ours (a plain memcpy, 6 MB, instead of the CPU scaling of the copy path; the pipe's scaler scales). Real displays complete a swap when its
+ * surface is on screen, which frees the one before; a swap completed when its flip is merely issued (fb_scanout_async) lets the window
+ * server draw into the surface the panel is still fetching -- the whole screen glitched (logs/143902-run.log). With the ring no surface
+ * of the window server's is ever fetched: the swap completes as soon as the copy is made, and the next frame is copied into the buffer
+ * that is neither on the panel nor on its way there (frame k is written to buffer k mod 3: k-1 is flipping, k-2 may be fetched until k-1 latches).
+ * 0: the surface itself is fetched (zero copy), held and counted as in use until its successor has latched (nothing keeps the window server out).
+ */
+static TUNABLE(uint32_t, gScanoutRing, "fb_scanout_ring", 1);
+#define SCANOUT_RING 3
+static IOBufferMemoryDescriptor * gScanoutRingMemory[SCANOUT_RING];
+static uint32_t gScanoutRingAddress[SCANOUT_RING], gScanoutRingBytes, gScanoutRingNext;
+static bool gScanoutRingOn, gScanoutRingFailed;
+static uint64_t gScanoutCopyTime, gScanoutCopyMax;      /* stats (absolute time) */
 static MiniIOSurface * gScanoutHeld;            /* the surface the pipe fetches now (or the latest flip, not latched yet) */
 static MiniIOSurface * gScanoutPrev;            /* the surface before it, while the display may still be fetching it */
 static IOLock * gScanoutLock;                   /* around the two and the pipe's registers */
@@ -1763,6 +1778,43 @@ scanoutWhy(unsigned why, const char * what, uint32_t sid)
 	}
 }
 
+/* The ring: three contiguous buffers below 4 GB, the display's SMMU context mapping them to themselves. Once; false: not to be had. */
+static bool
+scanoutRingMake(uint32_t bytes)
+{
+	if (gScanoutRingMemory[0] != NULL && gScanoutRingBytes == bytes) {
+		return true;
+	}
+	if (gScanoutRingFailed || gScanoutRingMemory[0] != NULL) {
+		return false;
+	}
+	gScanoutRingFailed = true;
+	for (unsigned i = 0; i < SCANOUT_RING; i++) {
+		IOBufferMemoryDescriptor * memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, bytes, 0xfffff000ULL);
+		IOByteCount length = 0;
+		addr64_t phys = memory != NULL ? memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone) : 0;
+
+		if (memory == NULL || phys == 0 || length < bytes || phys + bytes > (1ULL << 32) || !hakios_display_scanout_reaches(phys, bytes)) {
+			IOLog("MiniIOMobileFramebuffer: fb_scanout: ring buffer %u of %u bytes: %s\n", i, bytes,
+			    memory == NULL ? "no contiguous memory below 4 GB" : phys == 0 ? "no address" : "not mapped to itself by the display's SMMU context");
+			OSSafeReleaseNULL(memory);
+			for (unsigned j = 0; j < i; j++) {
+				OSSafeReleaseNULL(gScanoutRingMemory[j]);
+			}
+			return false;
+		}
+		bzero(memory->getBytesNoCopy(), bytes);
+		gScanoutRingMemory[i] = memory;
+		gScanoutRingAddress[i] = (uint32_t) phys;
+	}
+	gScanoutRingBytes = bytes;
+	gScanoutRingFailed = false;
+	IOLog("MiniIOMobileFramebuffer: fb_scanout: ring of %u buffers of %u bytes at %#x %#x %#x\n", SCANOUT_RING, bytes,
+	    gScanoutRingAddress[0], gScanoutRingAddress[1], gScanoutRingAddress[2]);
+	return true;
+}
+
 bool
 IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
@@ -1802,6 +1854,8 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 		    dst[2] != (int32_t) fWidth || dst[3] != (int32_t) fHeight)))) {
 			why = "not the whole surface onto the whole display";
 			reason = 4;
+		} else if (gScanoutRing != 0) {
+			/* (the surface is only read, by the processor: any memory will do) */
 		} else if (s->scanoutAddr == 0) {
 			why = "its memory is not in one piece below 4 GB";
 			reason = 5;
@@ -1812,15 +1866,16 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 			    s->info.bytesPerRow, s->info.width, s->info.height,
 			    s->scanoutState == 1 ? "the display's SMMU context maps it to itself" : "NOT mapped to itself by the display's SMMU context");
 		}
-		if (why == NULL && s->scanoutState != 1) {
+		if (why == NULL && gScanoutRing == 0 && s->scanoutState != 1) {
 			why = "the display's SMMU context does not map it to itself";
 			reason = 6;
 		}
 	}
 	IOLockLock(gScanoutLock);
 	if (why != NULL) {
-		if (gScanoutHeld != NULL) {
+		if (gScanoutHeld != NULL || gScanoutRingOn) {
 			hakios_display_scanout_restore();
+			gScanoutRingOn = false;
 			scanoutRelease();
 			IOLog("MiniIOMobileFramebuffer: fb_scanout: back to copying (%s)\n", why);
 		}
@@ -1828,6 +1883,64 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 		scanoutWhy(reason, why, s != NULL ? s->sid : 0);
 		gScanoutCopied++;
 		return false;
+	}
+	if (gScanoutRing != 0) {
+		uint32_t bytes = s->info.bytesPerRow * s->info.height;
+		unsigned k = gScanoutRingNext;
+		uint64_t began = mach_absolute_time();
+
+		if (!scanoutRingMake(bytes)) {
+			if (gScanoutRingOn) {
+				hakios_display_scanout_restore();
+				gScanoutRingOn = false;
+			}
+			IOLockUnlock(gScanoutLock);
+			scanoutWhy(7, "no ring of buffers for the display", s->sid);
+			gScanoutCopied++;
+			return false;
+		}
+		/* the picture into buffer k (neither fetched nor flipping, see fb_scanout_ring), out of the cache for the display */
+		uint8_t * to = (uint8_t *) gScanoutRingMemory[k]->getBytesNoCopy();
+
+		memcpy(to, s->pixels(), bytes);
+		for (uintptr_t line = (uintptr_t) to & ~(uintptr_t) 63; line < (uintptr_t) to + bytes; line += 64) {
+			__asm__ volatile ("dc cvac, %0" : : "r" (line) : "memory");
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+		began = mach_absolute_time() - began;
+		gScanoutCopyTime += began;
+		gScanoutCopyMax = began > gScanoutCopyMax ? began : gScanoutCopyMax;
+		/* the flip before has latched before this one is written to the pipe (it did, by now, nearly always) */
+		uint64_t waitBegan = mach_absolute_time();
+
+		if (hakios_display_scanout_latched()) {
+			gScanoutSettled++;
+		} else {
+			gScanoutWaits++;
+		}
+		bool settled = hakios_display_scanout_settle();
+
+		waitBegan = mach_absolute_time() - waitBegan;
+		gScanoutWaited += waitBegan;
+		gScanoutWaitedMax = waitBegan > gScanoutWaitedMax ? waitBegan : gScanoutWaitedMax;
+		if (!settled || !hakios_display_scanout_show(gScanoutRingAddress[k], s->info.bytesPerRow, s->info.width, s->info.height,
+		    gScanoutAsync == 0)) {
+			gScanoutGaveUp = true;
+			gScanoutRingOn = false;
+			IOLockUnlock(gScanoutLock);
+			IOLog("MiniIOMobileFramebuffer: fb_scanout: the display did not take a frame: frames are copied from now on\n");
+			return false;
+		}
+		gScanoutRingNext = (k + 1) % SCANOUT_RING;
+		gScanoutRingOn = true;
+		if (!fGraphics) {
+			fGraphics = true;
+			PE_initialize_console(NULL, kPEGraphicsMode);
+			PE_initialize_console(NULL, kPEReleaseScreen);
+		}
+		IOLockUnlock(gScanoutLock);
+		gScanoutFrames++;
+		return true;
 	}
 	/* what the processor has drawn into the surface is in memory before the display reads it there */
 	for (uintptr_t line = (uintptr_t) s->pixels() & ~(uintptr_t) 63; line < (uintptr_t) s->pixels() + (uint64_t) s->info.bytesPerRow * s->info.height;
@@ -2213,6 +2326,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			IOLog("MiniIOMobileFramebuffer: fb_scanout%s: %u flips found the one before latched, %u waited for it, %llu us on average (%llu at most)\n",
 			    gScanoutAsync ? " (async)" : "", gScanoutSettled, gScanoutWaits,
 			    gScanoutSettled + gScanoutWaits ? micros(gScanoutWaited / (gScanoutSettled + gScanoutWaits)) : 0, micros(gScanoutWaitedMax));
+			if (gScanoutRing != 0) {
+				IOLog("MiniIOMobileFramebuffer: fb_scanout ring: the picture copied into the ring buffer in %llu us on average (%llu at most); "
+				    "no surface of the window server's is fetched\n", gScanoutFrames ? micros(gScanoutCopyTime / gScanoutFrames) : 0,
+				    micros(gScanoutCopyMax));
+				gScanoutCopyTime = gScanoutCopyMax = 0;
+			}
 			gScanoutSettled = gScanoutWaits = 0;
 			gScanoutWaited = gScanoutWaitedMax = 0;
 			gScanoutFrames = gScanoutCopied = 0;
