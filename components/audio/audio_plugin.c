@@ -424,8 +424,14 @@ static OSStatus
 device_client(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, const AudioServerPlugInClientInfo *client)
 {
 	if ((object == OBJECT_ACTUATOR || object == OBJECT_SPEAKER) && client != NULL && trace_on()) {
-		say("hakios: audio: trace: %s client pid %d id %u (add or remove)\n", object == OBJECT_ACTUATOR ? "actuator" : "speaker",
-		    (int)client->mProcessID, (unsigned)client->mClientID);
+		char bundle[96] = "?";
+
+		if (client->mBundleID != NULL) {
+			(void)CFStringGetCString(client->mBundleID, bundle, sizeof(bundle), kCFStringEncodingUTF8);
+		}
+		/* (the pid is the audio server's own proxy's, 0: the bundle identifier is what names the program) */
+		say("hakios: audio: trace: %s client %s pid %d id %u (add or remove)\n", object == OBJECT_ACTUATOR ? "actuator" : "speaker",
+		    bundle, (int)client->mProcessID, (unsigned)client->mClientID);
 	}
 	return 0;
 }

@@ -87,6 +87,8 @@ $DYN -dynamiclib -install_name /hakios/lib/libhakios-flash.dylib -framework Core
 $DYN -dynamiclib -install_name /hakios/lib/liblocationd-silo.dylib -lobjc -o "$O/liblocationd-silo.dylib" "$RN/../components/location/inject_locationd.c"
 # the brightness slider and Auto-Brightness to the kernel's hw.backlight (any device: components/brightness/inject_brightness.c)
 $DYN -dynamiclib -install_name /hakios/lib/libhakios-brightness.dylib -framework CoreFoundation -lobjc -o "$O/libhakios-brightness.dylib" "$RN/../components/brightness/inject_brightness.c"
+# UIKit's feedback generators answered on the motor (components/haptic/inject_haptic.c)
+$DYN -dynamiclib -install_name /hakios/lib/libhakios-haptic.dylib -lobjc -o "$O/libhakios-haptic.dylib" "$RN/../components/haptic/inject_haptic.c"
 for f in "$O"/*.dylib "$O/HakiosAudio"; do
 	pac_strip "$f"
 	"$LDID" -S "$f"
