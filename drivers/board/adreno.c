@@ -4584,7 +4584,7 @@ static const uint32_t scanout_regs[] = { SSPP_SRC_SIZE, SSPP_SRC_IMG_SIZE, SSPP_
 #define SCANOUT_REGS (sizeof(scanout_regs) / sizeof(scanout_regs[0]))
 
 static struct {
-	bool open, on, broken;
+	bool open, on, broken, pending;
 	struct block mdp;
 	uint32_t mode, saved[SCANOUT_REGS], panel_w, panel_h;
 	uint32_t shown;                         /* frames put on the pipe */
@@ -4602,16 +4602,30 @@ scanout_get(uint32_t offset)
 	return rd(scanout.mdp.base + DPU_VIG0 + offset);
 }
 
-/* ctl0's flush of vig0, and then the wait for the display to take it over (the bit goes when it has); false: it did not in 60 ms */
-static bool
-scanout_flush(bool may_sleep)
+/* ctl0's flush of vig0; the display takes it over at the next frame start and then clears the bit (scanout.pending: not seen yet) */
+static void
+scanout_kick(void)
 {
-	vm_offset_t flush = scanout.mdp.base + DPU_CTL0 + DPU_CTL_FLUSH;
-
 	__asm__ volatile ("dsb sy" ::: "memory");
-	wr(flush, DPU_FLUSH_VIG0);
+	wr(scanout.mdp.base + DPU_CTL0 + DPU_CTL_FLUSH, DPU_FLUSH_VIG0);
+	scanout.pending = true;
+}
+
+static bool
+scanout_latched(void)
+{
+	if (scanout.pending && !(rd(scanout.mdp.base + DPU_CTL0 + DPU_CTL_FLUSH) & DPU_FLUSH_VIG0)) {
+		scanout.pending = false;
+	}
+	return !scanout.pending;
+}
+
+/* the wait for the display to take the last flush over: false: it did not in 60 ms */
+static bool
+scanout_wait(bool may_sleep)
+{
 	for (int i = 0; i < (may_sleep ? 300 : 300000); i++) {
-		if (!(rd(flush) & DPU_FLUSH_VIG0)) {
+		if (scanout_latched()) {
 			return true;
 		}
 		if (may_sleep) {
@@ -4621,6 +4635,27 @@ scanout_flush(bool may_sleep)
 	return false;
 }
 
+static bool
+scanout_flush(bool may_sleep)
+{
+	scanout_kick();
+	return scanout_wait(may_sleep);
+}
+
+/* Has the display taken the last flush over (the surface before it is not fetched any more)? Does not wait. */
+bool
+hakios_display_scanout_latched(void)
+{
+	return !scanout.open || scanout_latched();
+}
+
+/* ... and the same, waiting for it (up to 60 ms) */
+bool
+hakios_display_scanout_settle(void)
+{
+	return !scanout.open || scanout_wait(true);
+}
+
 /* The firmware's picture again (and the scaler off): what the loader draws over. */
 static void
 scanout_restore(bool may_sleep)
@@ -4628,6 +4663,7 @@ scanout_restore(bool may_sleep)
 	if (!scanout.open || !scanout.on) {
 		return;
 	}
+	scanout_wait(may_sleep);                /* (a flip in flight lands first) */
 	for (unsigned i = 0; i < SCANOUT_REGS; i++) {
 		scanout_put(scanout_regs[i], scanout.saved[i]);
 	}
@@ -4712,12 +4748,18 @@ hakios_display_scanout_reaches(uint64_t phys, uint64_t length)
  * this way).
  */
 bool
-hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint32_t height)
+hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint32_t height, bool wait)
 {
 	uint32_t size = height << 16 | width, out = scanout.mode == 2 ? (scanout.panel_h << 16 | scanout.panel_w) : size;
 	bool first = !scanout.on;
 
 	if (!scanout.open || scanout.broken || (phys & 0xf) || (stride & 0xf)) {
+		return false;
+	}
+	if (!scanout_wait(true)) {
+		printf("adreno: scanout: the flip before frame %u was not taken in 60 ms\n", scanout.shown);
+		scanout.broken = true;
+		hakios_display_scanout_restore();
 		return false;
 	}
 	scanout.on = true;
@@ -4760,7 +4802,14 @@ hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint
 	} else {
 		scanout_put(DPU_QSEED + QSEED_OP_MODE, scanout.saved[11] & ~1u);
 	}
-	if (!scanout_flush(true)) {
+	bool taken = true;
+
+	if (wait) {
+		taken = scanout_flush(true);
+	} else {
+		scanout_kick();
+	}
+	if (!taken) {
 		printf("adreno: scanout: the display did not take frame %u (surface at %#x) in 60 ms: the firmware's picture goes back\n",
 		    scanout.shown, phys);
 		scanout.broken = true;
