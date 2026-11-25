@@ -469,6 +469,19 @@ private:
     uint64_t faultsAtCommit_ = 0;                       // the GPU's reset count then: one more by completion = given up, not run
     std::unique_ptr<Bo> commands_;
     int64_t committedAt_ = 0, completedAt_ = 0;
+    // the buffer's path, for a slow one (microsecond hops; see pathHops): when the caller asked to commit, the submission left (before
+    // and after the driver's call), the handlers began; and the kernel's own times for the fence
+    int64_t commitCalledAt_ = 0, submitCallAt_ = 0, submitReturnAt_ = 0, handlersAt_ = 0;
+    HakiosFenceTimes kernelTimes_{};
+    bool haveKernelTimes_ = false;
+public:
+    int64_t nowNs() const;   // the driver's clock, ns
+    void noteCommitCalled(int64_t ns) { if (commitCalledAt_ == 0) commitCalledAt_ = ns; }
+    // ms: commit call to the submission's entry; entry to the driver call (the stream copied); the driver call; in the kernel before
+    // the ring write (lock and cache flush); the ring write; ring to the core's start; the core's time; the core's end to the interrupt;
+    // the interrupt to the waiter's return; the waiter to the handlers. 10 numbers; false when the kernel's times are not known
+    bool pathHops(double out[10]) const;
+private:
 };
 
 class CommandQueue : public std::enable_shared_from_this<CommandQueue> {
@@ -482,6 +495,7 @@ public:
     // the number of command buffers held in quarantine: ones whose wait timed out with the GPU neither finishing nor
     // reset, their memory never reused (for tests and diagnostics)
     size_t quarantinedCount();
+    int64_t gpuClockNs() { return gpu_.transport().nowNs(); }
     Gpu& gpu() { return gpu_; }
     // the buffers kept for command streams, idle (to see that they are given back and used again)
     size_t idleCommandBuffers();

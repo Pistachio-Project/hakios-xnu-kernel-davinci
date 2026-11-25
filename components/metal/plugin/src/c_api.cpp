@@ -1796,11 +1796,17 @@ void hakios_metal_cb_fail(hakios_metal_cb* cb, const char* why) {
 }
 
 void hakios_metal_cb_commit(hakios_metal_cb* cb, void (*callback)(hakios_metal_cb*, void*), void* context) {
+    cb->cb->noteCommitCalled(cb->cb->nowNs());
     if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, callback, context] { hakios_metal_cb_commit(cb, callback, context); });
     if (callback != nullptr) {
         cb->cb->addCompletedHandler([cb, callback, context](CommandBuffer&) { callback(cb, context); });
     }
     cb->cb->commit();
+}
+
+int hakios_metal_cb_path(hakios_metal_cb* cb, double out[10]) {
+    syncOne(cb);
+    return cb->cb->pathHops(out) ? 1 : 0;
 }
 
 void hakios_metal_cb_wait(hakios_metal_cb* cb) {

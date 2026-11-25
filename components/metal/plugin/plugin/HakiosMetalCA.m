@@ -6902,6 +6902,16 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 								 "lay between them; %.0f ms of the rest is before its first pass or after its last (queued behind other work, or the commit's "
 								 "and the wake-up's own delay)\n", hm_now(), latency * 1e3, cbPasses, cbPassUs / 1e3, cbGapUs / 1e3,
 								 latency * 1e3 - cbPassUs / 1e3 - cbGapUs / 1e3);
+							{
+								double h[10];
+
+								if (hakios_metal_cb_path(cb, h)) {
+									hm_print("fps: ... SLOW CB path (ms): commit call to submission %.1f, to the driver call %.1f, the driver call %.1f "
+										 "(in the kernel: lock and flush %.1f, ring write %.1f); ring to the core's start %.1f; the core %.1f; "
+										 "its end to the interrupt %.1f; interrupt to the waiter %.1f; waiter to the handlers %.1f\n",
+										 h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9]);
+								}
+							}
 						}
 					}
 					/* (in pieces of 8 passes: the console cuts a line at 1023 bytes, and a buffer of CoreAnimation's

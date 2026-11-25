@@ -3074,12 +3074,20 @@ extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler
 extern void gic_v3_spi_mask(uint32_t intid);
 extern void hakios_gpu_irq_wake(void);
 
+bool a618_gpu_done(uint32_t fence);
 static bool gpu_irq_on;                         /* attached, and not given up */
 static uint64_t gpu_irqs, gpu_irq_spurious;
 static struct {
 	uint64_t host_ns, ticks;                /* this processor's clock (ns) and the core's always-on counter at the submission */
 	uint32_t fence;
 } gpu_sub[GPU_TIMES];
+/* The path of each of the last 64 submissions in the kernel's clock (ns): into the user client, the lock got, the ring written (the core told
+ * how far to read), and the core's interrupt taken for it; with the core's own stamps of when it began (GPU_STARTS_AT) and was through
+ * (GPU_TIMES_AT) in its always-on counter. a618_gpu_fence_times puts them together for the plug-in's SLOW CB lines. */
+#define GPU_STARTS_AT           0x600           /* in the scratch page: when the core began each of its last 64 submissions */
+static struct { uint64_t enter_ns, locked_ns, ring_ns, irq_ns; uint32_t fence; } gpu_path[GPU_TIMES];
+static uint64_t gpu_pending_enter_ns, gpu_pending_locked_ns;
+static uint32_t gpu_irq_marked;                 /* the last submission whose interrupt time is written */
 /* what the last seconds' waits that had to wait have been: noticed this long after the core was through (ns) */
 static struct {
 	uint64_t count, sum_ns, max_ns, unknown;
@@ -3093,6 +3101,22 @@ gpu_irq_handler(__unused void *context, uint32_t intid)
 	if (status & RBBM_INT_FENCE) {
 		wr(gpu.base + RBBM_INT_CLEAR_CMD, RBBM_INT_FENCE);
 		gpu_irqs++;
+		{
+			uint64_t now_ns;
+			uint32_t f = gpu_irq_marked;
+
+			absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+			if (gpu_fence - f > GPU_TIMES) {
+				f = gpu_fence - GPU_TIMES;
+			}
+			while (f != gpu_fence && a618_gpu_done(f + 1)) {
+				f++;
+				if (gpu_path[f % GPU_TIMES].fence == f && gpu_path[f % GPU_TIMES].irq_ns == 0) {
+					gpu_path[f % GPU_TIMES].irq_ns = now_ns;
+				}
+			}
+			gpu_irq_marked = f;
+		}
 		hakios_gpu_irq_wake();
 	} else {
 		/* not ours (the line is level: left alone it would be taken again at once): given up, the waits poll */
@@ -3202,6 +3226,15 @@ a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 		absolutetime_to_nanoseconds(gpu_submitted_at, &gpu_sub[slot].host_ns);
 		gpu_sub[slot].ticks = rd(gpu.base + CP_ALWAYS_ON_COUNTER) | (uint64_t)rd(gpu.base + CP_ALWAYS_ON_COUNTER + 4) << 32;
 		gpu_sub[slot].fence = gpu_fence;
+		gpu_path[slot].fence = gpu_fence;
+		gpu_path[slot].enter_ns = gpu_pending_enter_ns;
+		gpu_path[slot].locked_ns = gpu_pending_locked_ns;
+		gpu_path[slot].ring_ns = 0;
+		gpu_path[slot].irq_ns = 0;
+		*(volatile uint64_t *)(core_scratch.memory + GPU_STARTS_AT + 8 * slot) = 0;   /* (the core writes it when it gets there) */
+		*(volatile uint64_t *)(core_scratch.memory + GPU_TIMES_AT + 8 * slot) = 0;
+		to_memory(core_scratch.memory + GPU_STARTS_AT + 8 * slot, 8);
+		to_memory(core_scratch.memory + GPU_TIMES_AT + 8 * slot, 8);
 	}
 	if (gpu_irq_on) {
 		wr(gpu.base + RBBM_INT_0_MASK, RBBM_INT_FENCE);
@@ -3210,6 +3243,10 @@ a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 	ring(EVENT_INVALIDATE_DEPTH);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_COLOR);
+	ring_command(CP_REG_TO_MEM, 3);         /* when the core began this one (a618_gpu_fence_times) */
+	ring((CP_ALWAYS_ON_COUNTER >> 2) | 2u << 18 | 1u << 30);
+	ring(CORE_SCRATCH_ADDRESS + GPU_STARTS_AT + 8 * (gpu_fence % GPU_TIMES));
+	ring(0);
 	for (uint32_t i = 0; i < count; i++) {
 		ring_command(CP_INDIRECT_BUFFER, 3);
 		ring((uint32_t)addresses[i]);
@@ -3227,7 +3264,50 @@ a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 	ring(0);
 	ring(gpu_fence);
 	ring_send();
+	{
+		uint64_t ring_ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ring_ns);
+		gpu_path[gpu_fence % GPU_TIMES].ring_ns = ring_ns;
+	}
 	return gpu_fence;
+}
+
+/* The path of submission FENCE, in the kernel's clock (ns; 0: not known -- one of more than 64 ago, or not yet): into the client, the
+ * lock got, the ring written, the core's start and end by its always-on counter put on that clock (through the submission's own
+ * pair of host time and counter), and the interrupt. */
+void
+a618_gpu_fence_times(uint32_t fence, uint64_t out[6])
+{
+	uint32_t slot = fence % GPU_TIMES;
+	uint64_t start, end;
+
+	bzero(out, 6 * sizeof(uint64_t));
+	if (gpu_path[slot].fence != fence || gpu_sub[slot].fence != fence) {
+		return;
+	}
+	to_memory(core_scratch.memory + GPU_STARTS_AT + 8 * slot, 8);
+	to_memory(core_scratch.memory + GPU_TIMES_AT + 8 * slot, 8);
+	start = *(volatile uint64_t *)(core_scratch.memory + GPU_STARTS_AT + 8 * slot);
+	end = *(volatile uint64_t *)(core_scratch.memory + GPU_TIMES_AT + 8 * slot);
+	out[0] = gpu_path[slot].enter_ns;
+	out[1] = gpu_path[slot].locked_ns;
+	out[2] = gpu_path[slot].ring_ns;
+	if (start > gpu_sub[slot].ticks && start - gpu_sub[slot].ticks < 60ull * 19200000) {
+		out[3] = gpu_sub[slot].host_ns + (start - gpu_sub[slot].ticks) * 10000 / 192;
+	}
+	if (end > gpu_sub[slot].ticks && end - gpu_sub[slot].ticks < 60ull * 19200000) {
+		out[4] = gpu_sub[slot].host_ns + (end - gpu_sub[slot].ticks) * 10000 / 192;
+	}
+	out[5] = gpu_path[slot].irq_ns;
+}
+
+/* The user client's own times for the submission it is about to make (taken by the next a618_gpu_submit). */
+void
+a618_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns)
+{
+	gpu_pending_enter_ns = enter_ns;
+	gpu_pending_locked_ns = locked_ns;
 }
 
 /* A submission does not come back: what the 3D core and its SMMU context say. */

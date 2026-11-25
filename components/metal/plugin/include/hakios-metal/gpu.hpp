@@ -33,11 +33,14 @@ enum Request : uint32_t {
     kGemCpuFini = 0x45,
     kGemSubmit = 0x46,
     kWaitFence = 0x47,
+    kHakiosFenceTimes = 0x7a,   // hakios's own: the path of a submission (when it came in, the ring, the core's start and end, the interrupt)
     kSubmitQueueNew = 0x4a,
     kSubmitQueueClose = 0x4b,
     kHakiosSurface = 0x7e,   // hakios's own (hakios.gpu.cpp surfaceBuffer): an IOSurface's memory as a buffer, by the surface's ID
 };
 
+// kHakiosFenceTimes: the kernel's clock (mach_absolute_time, ns); 0: not known
+struct HakiosFenceTimes { uint32_t fence, pad; uint64_t enterNs, lockedNs, ringNs, startNs, endNs, irqNs; };
 struct MsmTimespec { int64_t seconds, nanoseconds; };
 struct MsmParam { uint32_t pipe, param; uint64_t value; uint32_t len, pad; };
 struct MsmGemNew { uint64_t size; uint32_t flags, handle; };
@@ -233,6 +236,8 @@ public:
 
     // until the fence has passed, or TIMEOUT_NS: 0, ETIMEDOUT, or another errno
     int wait(uint32_t queue, uint32_t fence, int64_t timeoutNs);
+    // the path of a submission as the kernel timed it (hakios's own request; an errno where the driver has none)
+    int fenceTimes(uint32_t fence, HakiosFenceTimes* out);
 
     // until the GPU is done with the buffer (as Metal's -waitUntilCompleted needs for a buffer the CPU reads next)
     int cpuPrep(const Bo& bo, uint32_t op, int64_t timeoutNs);

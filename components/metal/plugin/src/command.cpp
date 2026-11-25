@@ -618,6 +618,7 @@ void CommandBuffer::finish(Status s, bool recycle) {
     }
     // (when !recycle -- a wait that timed out with no reset -- kept_, slab_, slabs_ and keptAny_ stay referenced so none
     // of their memory is freed or pooled while the GPU may still be reading it; the queue quarantines the whole buffer)
+    handlersAt_ = queue_.gpuClockNs();
     for (auto& h : handlers_) {
         h(*this);
     }
@@ -900,7 +901,9 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     if (spareStreams_.size() < kSpareStreams) spareStreams_.push_back(cb->stream_.release());
     cb->status_ = CommandBuffer::kCommitted;
     cb->faultsAtCommit_ = gpu_.faults();
+    cb->submitCallAt_ = gpu_.transport().nowNs();
     int e = gpu_.submit(id_, *cb->commands_, runs, cb->uses_, &cb->fence_);
+    cb->submitReturnAt_ = gpu_.transport().nowNs();
     if (e != 0) {
         cb->error_ = std::string("the driver refused the submission: ") + strerror(e);
         idle_.push_back(std::move(cb->commands_));
@@ -926,6 +929,10 @@ void CommandQueue::waiter(const std::shared_ptr<bool>& orphaned) {
         g.unlock();
         int e = gpu_.wait(id_, cb->fence_, kPatienceNs);
         cb->completedAt_ = gpu_.transport().nowNs();
+        if (cb->completedAt_ - cb->committedAt_ > 50000000 && e == 0) {
+            // (a slow one: the kernel's account of where the time went, asked for here, off the handlers' path)
+            cb->haveKernelTimes_ = gpu_.fenceTimes(cb->fence_, &cb->kernelTimes_) == 0;
+        }
         // A fence that passed is not yet a submission that ran. When the kernel resets a hung GPU (gpu_recover=1) it
         // gives up everything the GPU had been given, the hung submission and those behind it in the ring, by setting
         // the fence word to the last submission's number -- so their waits end as if they had run (hakios_gpu_recover:
@@ -972,5 +979,25 @@ void CommandQueue::waiter(const std::shared_ptr<bool>& orphaned) {
         g.lock();
     }
 }
+
+bool CommandBuffer::pathHops(double out[10]) const {
+    auto ms = [](int64_t a, int64_t b) { return a != 0 && b != 0 ? double(b - a) / 1e6 : -1.0; };
+    const HakiosFenceTimes& k = kernelTimes_;
+    auto kms = [](uint64_t a, uint64_t b) { return a != 0 && b != 0 && b >= a ? double(b - a) / 1e6 : -1.0; };
+    out[0] = ms(commitCalledAt_, committedAt_);
+    out[1] = ms(committedAt_, submitCallAt_);
+    out[2] = ms(submitCallAt_, submitReturnAt_);
+    out[3] = haveKernelTimes_ ? kms(k.enterNs, k.lockedNs) : -1.0;
+    out[4] = haveKernelTimes_ ? kms(k.lockedNs, k.ringNs) : -1.0;
+    out[5] = haveKernelTimes_ ? kms(k.ringNs, k.startNs) : -1.0;
+    out[6] = haveKernelTimes_ ? kms(k.startNs, k.endNs) : -1.0;
+    out[7] = haveKernelTimes_ ? kms(k.endNs, k.irqNs) : -1.0;
+    // (the kernel's clock and this one are the same while the machine has not slept)
+    out[8] = haveKernelTimes_ && k.irqNs != 0 ? ms(int64_t(k.irqNs), completedAt_) : -1.0;
+    out[9] = ms(completedAt_, handlersAt_);
+    return haveKernelTimes_;
+}
+
+int64_t CommandBuffer::nowNs() const { return queue_.gpuClockNs(); }
 
 }  // namespace hakios::metal

@@ -328,6 +328,12 @@ int Gpu::wait(uint32_t queue, uint32_t fence, int64_t timeoutNs) {
     return t_->call(kWaitFence, &w, sizeof(w));
 }
 
+int Gpu::fenceTimes(uint32_t fence, HakiosFenceTimes* out) {
+    *out = HakiosFenceTimes{};
+    out->fence = fence;
+    return t_->call(kHakiosFenceTimes, out, sizeof(*out));
+}
+
 int Gpu::cpuPrep(const Bo& bo, uint32_t op, int64_t timeoutNs) {
     MsmGemCpuPrep p{bo.handle(), op, deadline(*t_, timeoutNs)};
     return t_->call(kGemCpuPrep, &p, sizeof(p));

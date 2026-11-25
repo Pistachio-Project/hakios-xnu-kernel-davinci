@@ -64,6 +64,8 @@ void hakios_gpu_mapped(void);
 bool hakios_gpu_unmap(uint64_t address, uint64_t size);
 void hakios_gpu_to_memory(void * start, uint64_t size);
 uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+void hakios_gpu_fence_times(uint32_t fence, uint64_t out[6]);
+void hakios_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns);
 extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
 bool hakios_gpu_irq_on(void);
@@ -97,6 +99,7 @@ enum {
 	kMsmSubmitQueueClose    = 0x4b,
 	kMsmSubmitQueueQuery    = 0x4c,
 	kHakiosUserMemory      = 0x7b,         /* ours: pages of the caller's own as a buffer (Linux's userptr: hakios-metal, Turnip) */
+	kHakiosFenceTimes      = 0x7a,         /* ours: the path of a submission (when it came in, the ring, the core's start and end, the interrupt) */
 	kHakiosHost            = 0x7c,         /* ours: pages of the caller's own memory as a buffer (Metal's no-copy buffers) */
 	kHakiosGPUWorked       = 0x7d,         /* ours: how long the 3D core itself has worked, and on how many */
 	kHakiosSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
@@ -205,6 +208,10 @@ struct hakios_show {
  * five-second report in submit() below shares the same counters -- so a boot that reads this
  * will see gaps in those lines, and that is expected rather than a fault.
  */
+struct hakios_fence_times {
+	uint32_t fence, pad;
+	uint64_t enter_ns, locked_ns, ring_ns, start_ns, end_ns, irq_ns;       /* the kernel's clock (mach_absolute_time, ns); 0: not known */
+};
 struct hakios_worked {
 	uint64_t microseconds;                  /* the core's own time on the submissions counted here */
 	uint32_t submissions;                   /* how many of them it timed; 0 means nothing finished since */
@@ -1454,9 +1461,10 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 	struct msm_gem_submit_cmd * cmds = NULL;
 	uint64_t addresses[GPU_SUBMIT_CMDS];
 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
-	uint64_t began, nanos, again;
+	uint64_t began, nanos, again, enteredNs;
 	IOReturn ret = kIOReturnBadArgument;
 
+	absolutetime_to_nanoseconds(mach_absolute_time(), &enteredNs);
 	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
 		if (gpuRefusalSaid()) {
 			IOLog("HakiosGPU: a submission of %u command buffers in %u buffers: not taken\n", request->nr_cmds, request->nr_bos);
@@ -1611,6 +1619,12 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		}
 		IOLockUnlock(gGPULock);
 		goto out;
+	}
+	{
+		uint64_t lockedNs;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &lockedNs);
+		hakios_gpu_note_enter(enteredNs, lockedNs);   /* (lockedNs: when the work before the ring was done under the lock, the lock itself got earlier) */
 	}
 	request->fence = hakios_gpu_submit(addresses, words, count);
 	/*
@@ -1846,6 +1860,7 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		struct hakios_user_memory user;
 		struct hakios_show show;
 		struct hakios_worked worked;
+		struct hakios_fence_times times;
 	} r;
 	size_t size = args->structureInputSize;
 	struct gpu_buffer * b;
@@ -1979,6 +1994,16 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 			    (char) (r.surface.pixelFormat >> 8), (char) r.surface.pixelFormat, r.surface.rowBytes,
 			    r.surface.offset, r.surface.size);
 		}
+		break;
+	}
+	case kHakiosFenceTimes: {
+		uint64_t t[6];
+
+		IOLockLock(gGPULock);
+		hakios_gpu_fence_times(r.times.fence, t);
+		IOLockUnlock(gGPULock);
+		r.times.enter_ns = t[0], r.times.locked_ns = t[1], r.times.ring_ns = t[2];
+		r.times.start_ns = t[3], r.times.end_ns = t[4], r.times.irq_ns = t[5];
 		break;
 	}
 	case kHakiosShow:
