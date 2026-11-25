@@ -464,6 +464,7 @@ llcc_quiesce(void)
  */
 #define PARK_MS                 8               /* how often the big cores' load is looked at */
 #define PARK_BUSY               85              /* % busy of the least busy big core: every big core is taken */
+static uint32_t park_busy = PARK_BUSY;
 #define PARK_CALM               60              /* % busy of the least busy big core under which the small ones go again */
 #define PARK_CALM_TIMES         8               /* ... that many looks in a row (64 ms) */
 extern void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);
@@ -661,7 +662,7 @@ park_thread(void *arg __unused, wait_result_t wr __unused)
 		}
 		if (!parking) {
 			/* (no parking: the governor alone) */
-		} else if (parked && least >= PARK_BUSY) {
+		} else if (parked && least >= park_busy) {
 			sched_perfcontrol_update_recommended_cores(all);
 			parked = false;
 			calm = 0;
@@ -702,6 +703,13 @@ park_thread(void *arg __unused, wait_result_t wr __unused)
 static void
 park_start(void)
 {
+	/*
+	 * boot-arg park_busy=N: how busy (%) the least busy big core must be for the small ones to be given back (default
+	 * PARK_BUSY; 101: never, but for the scheduler's failsafe for a real-time thread). A phone with two big cores only
+	 * (the Mi 9T's two A76) has both past 85% in every gesture, and the window server's draws then cost three to four
+	 * times as much on an A55 (logs/113203-run.log: 28 us a draw on an A76, 80 to 110 on an A55).
+	 */
+	PE_parse_boot_argn("park_busy", &park_busy, sizeof(park_busy));
 	uint32_t on = 1;
 	thread_t thread;
 
