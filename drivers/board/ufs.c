@@ -202,7 +202,8 @@ static LCK_MTX_DECLARE(ufs_write_mtx, &ufs_lck_grp);
 #define VAR_SAVE_IDLE      1
 #define VAR_SAVE_WANTED    2
 #define VAR_SAVE_DONE      3
-#define VAR_SAVE_MS        20000        /* at most this long on the way out (var_save_ms=N) */
+#define VAR_SAVE_MS        20000        /* ... without the flash moving by a byte (var_save_ms=N) */
+#define VAR_SAVE_MAX_MS    70000        /* and in all, however it moves (var_save_max_ms=N): the host waits 100 s past the run */
 
 static volatile int ufs_var_save = VAR_SAVE_NONE;
 static int ufs_var_busy_pid;
@@ -1052,32 +1053,55 @@ static const struct cdevsw ufs_cdevsw = {
 /*
  * The orderly end of a run, from osfmk/arm64/loader_return.c, in the thread that is about to hand
  * control back: ask the saver for the data volume and wait for it, so that a run need not have
- * been told to save. Bounded, and only when a saver registered -- the loader goes on feeding the
- * watchdog for a minute past the run's own budget, and the host waits a hundred seconds past it,
- * so twenty seconds here is well inside both. Nothing else of the way out has happened yet: the
- * GPU, the DSPs and this kernel's transfer list are still as the run had them.
+ * been told to save. Only when a saver registered. The wait is by progress, not by the clock alone:
+ * a volume of 322 MB takes 15 to 20 s to write through the loader (a fixed 20 s gave up on a
+ * saver that was writing all the while, and the slot it had zeroed stayed the older generation), so
+ * the saver is given up on after VAR_SAVE_MS in which neither a byte was written nor read (reads
+ * count: it compares with what the slot holds), or after VAR_SAVE_MAX_MS in all. The hypervisor's
+ * watchdog is fed by a timer meanwhile. Nothing else of the way out has happened yet: the GPU,
+ * the DSPs and this kernel's transfer list are still as the run had them.
  */
 void
 hakios_var_save_on_return(void)
 {
-	uint32_t ms = VAR_SAVE_MS;
-	uint64_t waited = 0;
+	uint32_t ms = VAR_SAVE_MS, max_ms = VAR_SAVE_MAX_MS;
+	uint64_t waited = 0, quiet = 0, seen;
 
 	if (!ufs_ready || ufs_write_part < 0 || ufs_var_save != VAR_SAVE_IDLE) {
 		return;
 	}
 	PE_parse_boot_argn("var_save_ms", &ms, sizeof(ms));
+	PE_parse_boot_argn("var_save_max_ms", &max_ms, sizeof(max_ms));
+	if (max_ms < ms) {
+		max_ms = ms;
+	}
 	printf("var_store: the run is ending: the data volume is asked for\n");
+	seen = ufs_write_bytes + ufs_bytes;
 	ufs_var_save = VAR_SAVE_WANTED;
-	while (ufs_var_save != VAR_SAVE_DONE && waited < ms) {
+	while (ufs_var_save != VAR_SAVE_DONE && quiet < ms && waited < max_ms) {
+		uint64_t now;
+
 		IOSleep(20);
 		waited += 20;
+		now = ufs_write_bytes + ufs_bytes;
+		if (now != seen) {
+			seen = now;
+			quiet = 0;
+		} else {
+			quiet += 20;
+		}
+		if (waited % 10000 == 0 && ufs_var_save != VAR_SAVE_DONE) {
+			printf("var_store: the saver is at work: %llu s, %llu MB written so far\n",
+			    waited / 1000, (unsigned long long)(ufs_write_bytes >> 20));
+		}
 	}
 	if (ufs_var_save == VAR_SAVE_DONE) {
 		/* what it made of it is in its own lines: this only says it answered */
 		printf("var_store: the saver has finished after %llu ms\n", waited);
-	} else {
+	} else if (quiet >= ms) {
 		printf("var_store: the saver did not answer in %u ms: the store keeps what it had\n", ms);
+	} else {
+		printf("var_store: the saver did not finish in %u ms (still at work): the store keeps what it had\n", max_ms);
 	}
 }
 
