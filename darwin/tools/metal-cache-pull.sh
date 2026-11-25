@@ -23,8 +23,9 @@ mkdir -p "$NEW" "$OUT"
 # made from ../ssh/ssh_host_ed25519_key)
 # (HM_CACHE_DIR, or /var/tmp/hakios-metal-cache where the plug-in could not make that one: the window server's
 # sandbox; whichever has them)
-for dir in /private/var/db/hakios-metal-cache /private/var/tmp/hakios-metal-cache; do
-	scp -O -q -i "$KEY" -o StrictHostKeyChecking=accept-new "root@$1:$dir/*.stage" "$NEW/" 2> /dev/null && break
+# (and the per-user ones, /private/var/db/hakios-metal-caches/UID, where backboardd keeps its own: all of them, not the first)
+for dir in /private/var/db/hakios-metal-cache /private/var/tmp/hakios-metal-cache /private/var/db/hakios-metal-caches/* /private/var/tmp/hakios-metal-cache-*; do
+	scp -O -q -i "$KEY" -o StrictHostKeyChecking=accept-new "root@$1:$dir/*.stage" "$NEW/" 2> /dev/null || true
 done
 stages=("$NEW"/*.stage)
 n=0

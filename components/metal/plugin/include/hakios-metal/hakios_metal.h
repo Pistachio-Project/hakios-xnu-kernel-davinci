@@ -79,7 +79,8 @@ int hakios_metal_has_compiler(void);
 /* the buffer pool's tally since the last call: given back, refused as still held, refused as the pool was full, and the 1 MB+ made */
 void hakios_metal_pool_counts(unsigned *given, unsigned *shared, unsigned *full, unsigned *big);
 void hakios_metal_compile_stats(unsigned long long *hits, unsigned long long *seed_hits, unsigned long long *misses,
-				unsigned long long *compile_ms, unsigned long long *load_ms, unsigned long long *no_cache);
+				unsigned long long *compile_ms, unsigned long long *load_ms, unsigned long long *no_cache,
+				unsigned long long *save_failed);
 
 hakios_metal_buffer *hakios_metal_buffer_new(hakios_metal_device *device, uint64_t length);
 void hakios_metal_buffer_free(hakios_metal_buffer *buffer);

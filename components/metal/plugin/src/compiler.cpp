@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <condition_variable>
 #include <mutex>
@@ -1433,11 +1434,24 @@ void stageCacheSave(const std::string& path, const CompiledStage& s) {
     w.str(s.listing);
     // (a name of this thread's own: two threads may compile the same stage at once, and each renames whole files)
     const std::string tmp = path + "." + std::to_string(std::hash<std::thread::id>()(std::this_thread::get_id())) + ".tmp";
+    // (a write that fails is counted, and the first few said with errno: a cache that is never written looks like
+    // stages compiled again at every boot)
+    auto failed = [&](const char* what) {
+        static std::atomic<unsigned> told{0};
+        compileStats().saveFailed++;
+        if (told++ < 5) fprintf(stderr, "HakiosMetal: stage cache: %s %s failed: %s\n", what, path.c_str(), strerror(errno));
+    };
     FILE* f = fopen(tmp.c_str(), "wb");
-    if (f == nullptr) return;
+    if (f == nullptr) return failed("open of");
     const bool written = fwrite(w.out.data(), 1, w.out.size(), f) == w.out.size();
-    fclose(f);
-    if (!written || rename(tmp.c_str(), path.c_str()) != 0) remove(tmp.c_str());
+    const bool closed = fclose(f) == 0;
+    if (!written || !closed) {
+        failed("write of");
+        remove(tmp.c_str());
+    } else if (rename(tmp.c_str(), path.c_str()) != 0) {
+        failed("rename to");
+        remove(tmp.c_str());
+    }
 }
 
 // whether a stage read back holds to what compileStage's own fills refuse past (fillKernel, fillStage) and to what

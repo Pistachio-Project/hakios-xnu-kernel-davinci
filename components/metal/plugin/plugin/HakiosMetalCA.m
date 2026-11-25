@@ -3489,6 +3489,21 @@ hm_linked_of(MTLRenderPipelineDescriptor *d, NSString *label, hakios_metal_linke
  * pipelines, how long they took to build all told, and what the cache did -- stages read back from /var/db (a hit, a load of
  * microseconds) against stages compiled (a miss: AIR to NIR to ir3, ms each). A cache that is kept across boots shows
  * misses near 0 on the second boot. */
+/* boot-arg metal_pipeline_async=0 turns the handler forms back into synchronous ones (default on) */
+static BOOL
+hm_async_pipelines(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+
+		on = !(sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_pipeline_async=0") != NULL);
+	}
+	return on != 0;
+}
+
 static void
 hm_pipeline_note(double ms)
 {
@@ -3497,7 +3512,7 @@ hm_pipeline_note(double ms)
 	static struct timespec last;
 	static unsigned long long lastMiss, lastHit;
 	struct timespec now;
-	unsigned long long hits, seed, misses, compileMs, loadMs, noCache;
+	unsigned long long hits, seed, misses, compileMs, loadMs, noCache, saveFailed;
 	double at;
 
 	pipelines++;
@@ -3510,10 +3525,10 @@ hm_pipeline_note(double ms)
 		return;
 	}
 	last = now;
-	hakios_metal_compile_stats(&hits, &seed, &misses, &compileMs, &loadMs, &noCache);
+	hakios_metal_compile_stats(&hits, &seed, &misses, &compileMs, &loadMs, &noCache, &saveFailed);
 	hm_print("shader cache: %u pipelines built so far (%.0f ms in all, %.1f ms the slowest); stages: %llu from the cache dir, %llu from the "
-		 "seed, %llu compiled (%llu ms), %llu loads took %llu ms, %llu with no cache dir; since the last line: %llu hits, %llu compiles, "
-		 "%.0f ms in pipelines\n", pipelines, totalMs, worstMs, hits, seed, misses, compileMs, hits + seed, loadMs, noCache,
+		 "seed, %llu compiled (%llu ms), %llu loads took %llu ms, %llu with no cache dir, %llu cache writes failed; since the last line: %llu hits, %llu compiles, "
+		 "%.0f ms in pipelines\n", pipelines, totalMs, worstMs, hits, seed, misses, compileMs, hits + seed, loadMs, noCache, saveFailed,
 		 hits + seed - lastHit, misses - lastMiss, sinceMs);
 	lastHit = hits + seed;
 	lastMiss = misses;
@@ -3725,6 +3740,27 @@ hm_pipeline_note(double ms)
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
 			   completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler
 {
+	if (handler != NULL && hm_async_pipelines()) {
+		/* off the caller's thread: a miss is a compile of seconds (shader cache line: 280 compiles, 103 s in a boot), which the
+		 * window server's frame must not wait for when it asked for the pipeline asynchronously. A serial queue (the compiler
+		 * is one); the descriptor is copied, the caller may change its own once this returns. */
+		static dispatch_queue_t queue;
+		static dispatch_once_t once;
+		MTLRenderPipelineDescriptor *copy = [descriptor copy];
+		MTLNewRenderPipelineStateCompletionHandler h = [handler copy];
+
+		dispatch_once(&once, ^{ queue = dispatch_queue_create("hakios-metal.pipelines", DISPATCH_QUEUE_SERIAL); });
+		dispatch_async(queue, ^{
+			NSError *e = nil;
+			id st = [self newRenderPipelineStateWithDescriptor:copy error:&e];
+
+			h(st, e);
+			[st release];
+			[copy release];
+			[h release];
+		});
+		return;
+	}
 	NSError *error = nil;
 	id state = [self newRenderPipelineStateWithDescriptor:descriptor error:&error];
 
@@ -3737,6 +3773,24 @@ hm_pipeline_note(double ms)
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor options:(MTLPipelineOption)options
 			   completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler
 {
+	if (handler != NULL && hm_async_pipelines()) {
+		static dispatch_queue_t queue;
+		static dispatch_once_t once;
+		MTLRenderPipelineDescriptor *copy = [descriptor copy];
+		MTLNewRenderPipelineStateWithReflectionCompletionHandler h = [handler copy];
+
+		dispatch_once(&once, ^{ queue = dispatch_queue_create("hakios-metal.pipelines.r", DISPATCH_QUEUE_SERIAL); });
+		dispatch_async(queue, ^{
+			NSError *e = nil;
+			id st = [self newRenderPipelineStateWithDescriptor:copy options:options reflection:NULL error:&e];
+
+			h(st, nil, e);
+			[st release];
+			[copy release];
+			[h release];
+		});
+		return;
+	}
 	NSError *error = nil;
 	id state = [self newRenderPipelineStateWithDescriptor:descriptor options:options reflection:NULL error:&error];
 

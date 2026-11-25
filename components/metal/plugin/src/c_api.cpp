@@ -281,7 +281,8 @@ uint64_t hakios_metal_gpu_id(hakios_metal_device* d) { return d->gpu->chipId(); 
 int hakios_metal_has_compiler(void) { return hasCompiler() ? 1 : 0; }
 
 void hakios_metal_compile_stats(unsigned long long* hits, unsigned long long* seedHits, unsigned long long* misses, unsigned long long* compileMs,
-                                unsigned long long* loadMs, unsigned long long* noCache) {
+                                unsigned long long* loadMs, unsigned long long* noCache, unsigned long long* saveFailed) {
+    *saveFailed = compileStats().saveFailed.load();
     CompileStats& s = compileStats();
     *hits = s.hitsCache.load();
     *seedHits = s.hitsSeed.load();
