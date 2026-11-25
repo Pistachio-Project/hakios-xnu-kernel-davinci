@@ -2335,11 +2335,12 @@ const std::vector<uint32_t>& GroupCache::delta(G& grp, int from, int to) {
     for (const Delta& d : dst.deltas) {
         if (d.from == from) return d.wire;
     }
-    // the registers the last key's words left, then the new key's, each written only if it differs
-    std::unordered_map<uint32_t, uint32_t> held;
+    // the registers the last key's words left, then the new key's, each written only if it differs (a thread's own shadow, emptied
+    // after: a pass makes a few dozen of these, and a hash map of them was most of the draws' time)
+    thread_local CommandBuffer::RegShadow held;
     const std::vector<uint32_t>& before = grp.entries[size_t(from)].words;
     for (size_t i = 0; i < before.size(); i += 2 + before[i + 1]) {
-        for (uint32_t k = 0; k < before[i + 1]; k++) held[before[i] + k] = before[i + 2 + k];
+        for (uint32_t k = 0; k < before[i + 1]; k++) held.hold(before[i] + k, before[i + 2 + k]);
     }
     pm4::Stream out;
     const std::vector<uint32_t>& now = dst.words;
@@ -2351,11 +2352,7 @@ const std::vector<uint32_t>& GroupCache::delta(G& grp, int from, int to) {
             runLen = 0;
         };
         for (uint32_t k = 0; k < now[i + 1]; k++) {
-            const uint32_t reg = now[i] + k, value = now[i + 2 + k];
-            auto it = held.find(reg);
-            const bool same = it != held.end() && it->second == value;
-            held[reg] = value;
-            if (!same) {
+            if (!held.hold(now[i] + k, now[i + 2 + k])) {
                 if (runLen == 0) runStart = k;
                 runLen++;
             } else {
@@ -2364,6 +2361,7 @@ const std::vector<uint32_t>& GroupCache::delta(G& grp, int from, int to) {
         }
         flush();
     }
+    held.clear();
     dst.deltas.push_back(Delta{from, out.release()});
     return dst.deltas.back().wire;
 }
