@@ -4112,6 +4112,7 @@ struct display_layout {
 /* the board's (board/board.h: clocks { } and display { } of its SoC's file), once display_layout_known() has said yes */
 static struct display_layout display_of_board;
 static const struct display_layout *display = &display_of_board;
+static bool display_block_up(void);        /* (below, beside hakios_display_scan_start) */
 
 static bool
 display_layout_known(void)
@@ -4660,7 +4661,7 @@ hakios_display_scanout_open(uint32_t mode, uint32_t panel_w, uint32_t panel_h, u
 		return scanout.open;
 	}
 	scanout.broken = true;
-	if (!hakios_board_has(HAKIOS_HAS_DISPLAY_SCAN) || !hakios_display_scan_start() || board->display.intf < DPU_SDE_OFF) {
+	if (!display_block_up() || board->display.intf < DPU_SDE_OFF) {
 		return false;                   /* (the clocks and the registers: scan_start has them, and the layout is the board's) */
 	}
 	if (rd(dispcc.base + DISPCC_MDSS_MDP_CBCR) & CBCR_OFF) {
@@ -4887,15 +4888,18 @@ hakios_display_scan_video(void)
 	return scan_ready && scan_video;
 }
 
-bool
-hakios_display_scan_start(void)
+/*
+ * The display block's registers reachable: its bus clocks on and its power switch found on (both checked, the clocks
+ * turned on where off). For the panel's scan (the feature display-scan) and for scan-out (fb_scanout=, which needs
+ * the registers but not the INTF's counters: on the Mi 9T's command-mode panel those stand still, so display-scan is not
+ * listed there while scan-out works).
+ */
+static bool
+display_block_up(void)
 {
 	uint32_t clock;
 
-	if (scan_ready) {
-		return true;
-	}
-	if (!hakios_board_has(HAKIOS_HAS_DISPLAY_SCAN) || !display_layout_known()) {
+	if (!display_layout_known()) {
 		return false;                   /* (the board does not say where) */
 	}
 	need(&gcc);
@@ -4921,6 +4925,18 @@ hakios_display_scan_start(void)
 		if (rd(dispcc.base + DISPCC_MDSS_AHB_CBCR) & CBCR_OFF) {
 			return false;
 		}
+	}
+	return true;
+}
+
+bool
+hakios_display_scan_start(void)
+{
+	if (scan_ready) {
+		return true;
+	}
+	if (!hakios_board_has(HAKIOS_HAS_DISPLAY_SCAN) || !display_block_up()) {
+		return false;
 	}
 	disp_intf = (struct block){ "intf1", display->intf_page, 0x1000 };
 	need(&disp_intf);
