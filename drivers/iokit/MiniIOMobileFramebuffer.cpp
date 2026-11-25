@@ -273,6 +273,24 @@ static TUNABLE(uint32_t, gScan, "fb_scan", 1);
 /* fb_scan_lead=US: the first lead from a frame's start to its target, 1000 to 8000 microseconds (default 2000) */
 static TUNABLE(uint32_t, gScanLeadUs, "fb_scan_lead", 2000);
 
+/*
+ * Boot-arg fb_scanout=1 or 2 (default 0): the display block fetches the window server's surface itself instead of this driver
+ * copying it to the panel's memory (the 828 x 1792 surfaces are made of memory in one piece below 4 GB, MiniIOSurface.cpp; the pipe
+ * that the firmware has pointed at the loader's framebuffer is pointed at the surface and flushed, board/adreno.c). 1: as it
+ * is, at the panel's top left (shows whether the fetch works; no scaler); 2: scaled to the panel by the pipe's scaler. A frame
+ * that does not qualify (another layer, a rectangle that is not the whole, a surface of other memory or one that the display's
+ * SMMU context does not map to itself, the panel's light made here, a backbuffer) is copied as ever, the firmware's picture put back
+ * first; if the display takes no flush, scan-out is off for the rest of the run. The surface on the pipe is held until the next is.
+ */
+extern "C" bool hakios_display_scanout_open(uint32_t mode, uint32_t panel_w, uint32_t panel_h, uint32_t row_bytes);
+extern "C" bool hakios_display_scanout_reaches(uint64_t phys, uint64_t length);
+extern "C" bool hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint32_t height);
+extern "C" void hakios_display_scanout_restore(void);
+static TUNABLE(uint32_t, gScanout, "fb_scanout", 0);
+static bool gScanoutReady, gScanoutGaveUp;
+static MiniIOSurface * gScanoutHeld;            /* the surface the pipe fetches now */
+static uint32_t gScanoutFrames, gScanoutCopied, gScanoutWhy[8];
+
 struct panel_scan {
 	bool            ok;
 	uint32_t        lines;          /* lines a readout */
@@ -505,6 +523,7 @@ public:
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	bool scanoutFrame(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -779,6 +798,15 @@ IOMobileFramebuffer::start(IOService * provider)
 	fScanLead = usToAbs(gScanLeadUs >= 1000 && gScanLeadUs <= 8000 ? gScanLeadUs : 2000);
 	if (gScan) {
 		scanCalibrate();
+	}
+	if (gScanout >= 1 && gScanout <= 2 && !gScanoutGaveUp) {
+		gScanoutReady = hakios_display_scanout_open(gScanout, fPanelWidth, fPanelHeight, fRowBytes);
+		if (gScanoutReady) {
+			MiniIOSurfaceScanoutSize(fWidth, fHeight);
+		}
+		IOLog("MiniIOMobileFramebuffer: fb_scanout=%u: %s (surfaces of %ux%u made in one piece below 4 GB)\n", gScanout,
+		    gScanoutReady ? "the display block can fetch from surfaces" : "not possible on this board, frames are copied", fWidth,
+		    fHeight);
 	}
 	if (gDoubleBuffer || hakios_backlight_soft()) {
 		vm_size_t backBufferSize = (vm_size_t) fPanelHeight * fRowBytes;
@@ -1655,6 +1683,122 @@ IOMobileFramebuffer::presenter(void)
 	}
 }
 
+/*
+ * fb_scanout: the swap's surface onto the panel without a copy. True: the display block is fetching it (the frame is on the
+ * panel at the next refresh and all of the frame is done as far as this driver is concerned); false: the caller copies the frame
+ * as ever (the pipe is back on the loader's framebuffer first if it was on a surface).
+ */
+static void
+scanoutRelease(void)
+{
+	MiniIOSurface * held = gScanoutHeld;
+
+	gScanoutHeld = NULL;
+	if (held != NULL) {
+		MiniIOSurfaceDrop(held);
+	}
+}
+
+static void
+scanoutWhy(unsigned why, const char * what, uint32_t sid)
+{
+	if (why < 8 && gScanoutWhy[why]++ < 2) {
+		IOLog("MiniIOMobileFramebuffer: fb_scanout: surface %u is copied: %s\n", sid, what);
+	}
+}
+
+bool
+IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surfaces)
+{
+	MiniIOSurface * s = surfaces[0];
+	bool fit = gScanoutReady && !gScanoutGaveUp;
+	const char * why = NULL;
+	unsigned reason = 0;
+
+	if (!fit) {
+		return false;
+	}
+	if (s == NULL || (swapWord(swap, SWAP_LAYERS_SET) & 1) == 0) {
+		why = "no surface in the bottom layer";
+		reason = 0;
+	}
+	for (unsigned layer = 1; why == NULL && layer < SWAP_LAYERS; layer++) {
+		if (surfaces[layer] != NULL || swapWord(swap, SWAP_SURFACE(layer)) != 0) {
+			why = "another layer";
+			reason = 1;
+		}
+	}
+	if (why == NULL && (fBackBuffer != NULL || hakios_backlight_dim() < 256)) {
+		why = "the panel's light is made here or there is a backbuffer";
+		reason = 2;
+	}
+	if (why == NULL) {
+		int32_t src[4], dst[4];
+
+		memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
+		memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
+		if (s->info.width != fWidth || s->info.height != fHeight || s->info.bytesPerElement != 4 || s->info.planeCount != 0 ||
+		    !s->holds(0, (uint64_t) s->info.bytesPerRow * s->info.height)) {
+			why = "not a plain surface of the display's size";
+			reason = 3;
+		} else if (((src[2] > 0 && src[3] > 0 && (src[0] != 0 || src[1] != 0 || src[2] != (int32_t) fWidth ||
+		    src[3] != (int32_t) fHeight)) || (dst[2] > 0 && dst[3] > 0 && (dst[0] != 0 || dst[1] != 0 ||
+		    dst[2] != (int32_t) fWidth || dst[3] != (int32_t) fHeight)))) {
+			why = "not the whole surface onto the whole display";
+			reason = 4;
+		} else if (s->scanoutAddr == 0) {
+			why = "its memory is not in one piece below 4 GB";
+			reason = 5;
+		} else if (s->scanoutState == 0) {
+			s->scanoutState = hakios_display_scanout_reaches(s->scanoutAddr,
+			    (uint64_t) s->info.bytesPerRow * s->info.height) ? 1 : 2;
+			IOLog("MiniIOMobileFramebuffer: fb_scanout: surface %u at %#x (%u bytes a row, %ux%u): %s\n", s->sid, s->scanoutAddr,
+			    s->info.bytesPerRow, s->info.width, s->info.height,
+			    s->scanoutState == 1 ? "the display's SMMU context maps it to itself" : "NOT mapped to itself by the display's SMMU context");
+		}
+		if (why == NULL && s->scanoutState != 1) {
+			why = "the display's SMMU context does not map it to itself";
+			reason = 6;
+		}
+	}
+	if (why != NULL) {
+		if (gScanoutHeld != NULL) {
+			hakios_display_scanout_restore();
+			scanoutRelease();
+			IOLog("MiniIOMobileFramebuffer: fb_scanout: back to copying (%s)\n", why);
+		}
+		scanoutWhy(reason, why, s != NULL ? s->sid : 0);
+		gScanoutCopied++;
+		return false;
+	}
+	/* what the processor has drawn into the surface is in memory before the display reads it there */
+	for (uintptr_t line = (uintptr_t) s->pixels() & ~(uintptr_t) 63; line < (uintptr_t) s->pixels() + (uint64_t) s->info.bytesPerRow * s->info.height;
+	    line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!hakios_display_scanout_show(s->scanoutAddr, s->info.bytesPerRow, s->info.width, s->info.height)) {
+		gScanoutGaveUp = true;
+		scanoutRelease();
+		IOLog("MiniIOMobileFramebuffer: fb_scanout: the display did not take a frame: frames are copied from now on\n");
+		return false;
+	}
+	if (!fGraphics) {
+		/* the first picture: the kernel's text console must stop drawing over it */
+		fGraphics = true;
+		PE_initialize_console(NULL, kPEGraphicsMode);
+		PE_initialize_console(NULL, kPEReleaseScreen);
+	}
+	/* held until the next surface is on the pipe (taken before the old one is let go: the same surface twice is fine) */
+	MiniIOSurface * previous = gScanoutHeld;
+	gScanoutHeld = MiniIOSurfaceCopy(s->sid);
+	if (previous != NULL) {
+		MiniIOSurfaceDrop(previous);
+	}
+	gScanoutFrames++;
+	return true;
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
@@ -1746,6 +1890,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			began = mach_absolute_time();
 		}
 	}
+	bool direct = gScanout != 0 && scanoutFrame(swap, surfaces);
 	shown = began;
 	/*
 	 * The panel's readout this frame is for: the first that begins a lead after now. The lead grows
@@ -1757,7 +1902,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 */
 	fScanTarget = 0;
 	fScanLate = 0;
-	if (gPanel.ok && fGraphics) {
+	if (gPanel.ok && fGraphics && !direct) {
 		scanObserve();
 		if (gPanel.ok) {
 			uint64_t target = scanNextStart(began + fScanLead);
@@ -1792,8 +1937,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    swapWord(swap, SWAP_SURFACE(2)), swapWord(swap, SWAP_SURFACE(3)), set, swapWord(swap, SWAP_LAYERS_CLEARED));
 	}
 	fOver = false;
+	if (direct && gScanoutFrames <= 3) {
+		printf("MiniIOMobileFramebuffer: swap %u: surface %u goes to the panel without a copy (fb_scanout, frame %u)\n",
+		    swapWord(swap, SWAP_ID), surfaces[0]->sid, gScanoutFrames);
+	}
+	recorded = direct ? surfaces[0] : NULL;
 	/* fb_yuv: the video layers first, under the rest (see gYUV) */
-	for (unsigned layer = 0; gYUV != 0 && layer < SWAP_LAYERS; layer++) {
+	for (unsigned layer = 0; !direct && gYUV != 0 && layer < SWAP_LAYERS; layer++) {
 		MiniIOSurface * s = surfaces[layer];
 		int32_t src[4], dst[4];
 
@@ -1814,6 +1964,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		MiniIOSurface * s;
 
 		layers |= sid != 0 ? 1u << layer : 0;
+		if (direct) {
+			continue;
+		}
 		/* the frames' surfaces: is it a few, in turn? */
 		for (unsigned i = 0; layer == 0 && sid != 0 && i < 8; i++) {
 			if (fStatSurfaces[i] == 0 || fStatSurfaces[i] == sid) {
@@ -1898,7 +2051,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	composed = mach_absolute_time();
-	copyBackBuffer();
+	if (!direct) {
+		copyBackBuffer();
+	}
 	if (fScanTarget != 0) {
 		uint64_t up = usToAbs(500), down = usToAbs(100), floor = usToAbs(1000), ceiling = usToAbs(8000);
 
@@ -1964,6 +2119,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		if (surfaces[0] != NULL) {
 			IOLog("MiniIOMobileFramebuffer: the last swap's surface %u: its last GPU submission %u (0: none ever named it)\n",
 			    surfaces[0]->sid, surfaces[0]->drawn);
+		}
+		if (gScanout != 0) {
+			IOLog("MiniIOMobileFramebuffer: fb_scanout=%u: %u frames fetched by the display itself, %u copied%s\n", gScanout,
+			    gScanoutFrames, gScanoutCopied, gScanoutGaveUp ? " (the display did not take a frame: off)" : "");
+			gScanoutFrames = gScanoutCopied = 0;
 		}
 		fStatSwapsLate = fStatStale = fStatStaleShown = 0;
 		/*

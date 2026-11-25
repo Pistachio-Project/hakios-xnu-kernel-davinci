@@ -153,6 +153,12 @@ public:
 	uint32_t                        kernelHolds;
 	uint64_t                        touched;
 	bool                            traced;         /* made by a program of boot-arg surftrace_of: its ports are said too */
+	/*
+	 * For the display block to fetch (boot-arg fb_scanout): the physical address of the first byte of the pixels if the memory
+	 * is one piece below 4 GB, else 0; and what the display driver has found: 0 not looked at, 1 the display reaches it, 2 not.
+	 */
+	uint32_t                        scanoutAddr;
+	uint8_t                         scanoutState;
 
 	virtual bool
 	init(void) APPLE_KEXT_OVERRIDE
@@ -208,6 +214,8 @@ void            MiniIOSurfaceCost(uint32_t * made, uint64_t * making, uint32_t *
  * Only counted: nothing is taken from them (see the comment above it in MiniIOSurface.cpp).
  */
 extern "C" void MiniIOSurfaceVolatile(uint32_t * idle, uint64_t * idleBytes, uint32_t * marked, uint64_t * markedBytes);
+/* Surfaces of this size (four bytes a pixel) get memory the display block can fetch from, one piece below 4 GB (0: none do). */
+void            MiniIOSurfaceScanoutSize(uint32_t width, uint32_t height);
 /* Clear the memory that is kept of surfaces that are gone, for the next ones: when the caller has a moment. */
 void            MiniIOSurfaceClearKept(void);
 /* Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels (BoardGPU.cpp). */

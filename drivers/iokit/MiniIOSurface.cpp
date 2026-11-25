@@ -212,9 +212,37 @@ surfaceMemoryClear(thread_call_param_t unused0 __unused, thread_call_param_t unu
 	MiniIOSurfaceClearKept();
 }
 
-/* Memory for a surface: the state page and `bytes` after it, all zeroes. */
+/*
+ * Boot-arg fb_scanout (the display's driver, MiniIOMobileFramebuffer.cpp): the display block fetches the window server's surfaces
+ * itself, which it can only from one piece of memory below 4 GB. Surfaces of the display's size (and four bytes a pixel) are
+ * made of such memory, as many as SCANOUT_SURFACES alive at once (a piece is 6 MB of the scarce contiguous kind); the others
+ * are as ever, and so is any that cannot be had in one piece -- those are copied to the panel.
+ */
+#define SCANOUT_SURFACES        3
+static uint32_t gScanoutWidth, gScanoutHeight;
+static volatile SInt32 gScanoutLive;
+static uint32_t gScanoutRefused;
+
+void
+MiniIOSurfaceScanoutSize(uint32_t width, uint32_t height)
+{
+	gScanoutWidth = width;
+	gScanoutHeight = height;
+}
+
+/* The memory is one piece below 4 GB (its state page, then the pixels). */
+static bool
+memoryOnePiece(IOBufferMemoryDescriptor * memory)
+{
+	IOByteCount length = 0;
+	addr64_t phys = memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
+
+	return phys != 0 && length >= memory->getCapacity() && phys + memory->getCapacity() <= (1ULL << 32);
+}
+
+/* Memory for a surface: the state page and `bytes` after it, all zeroes. `contiguous`: in one piece, below 4 GB. */
 static IOBufferMemoryDescriptor *
-surfaceMemory(vm_size_t bytes)
+surfaceMemory(vm_size_t bytes, bool contiguous)
 {
 	IOBufferMemoryDescriptor * memory = NULL;
 	bool clear = false;
@@ -225,7 +253,8 @@ surfaceMemory(vm_size_t bytes)
 			/* one that is clear already, if there is one */
 			for (unsigned i = 0; i < SURFACE_KEPT && memory == NULL; i++) {
 				if (gSurfaceKept[i].memory != NULL && !gSurfaceKept[i].busy && (pass == 1 || gSurfaceKept[i].clear) &&
-				    gSurfaceKept[i].memory->getCapacity() == bytes) {
+				    gSurfaceKept[i].memory->getCapacity() == bytes &&
+				    (!contiguous || memoryOnePiece(gSurfaceKept[i].memory))) {
 					memory = gSurfaceKept[i].memory;
 					clear = gSurfaceKept[i].clear;
 					gSurfaceKept[i].memory = NULL;
@@ -237,6 +266,21 @@ surfaceMemory(vm_size_t bytes)
 		if (memory != NULL && !clear) {
 			bzero(memory->getBytesNoCopy(), gSurfaceClear ? bytes : PAGE_SIZE);
 			surfaceMemoryWriteBack(memory->getBytesNoCopy(), gSurfaceClear ? bytes : PAGE_SIZE);
+		}
+	}
+	if (memory == NULL && contiguous) {
+		memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, bytes, 0xfffff000ULL);
+		if (memory != NULL && !memoryOnePiece(memory)) {
+			memory->release();
+			memory = NULL;
+		}
+		if (memory != NULL) {
+			surfaceMemoryWriteBack(memory->getBytesNoCopy(), memory->getCapacity());
+		}
+		if (memory == NULL && gScanoutRefused++ < 4) {
+			IOLog("MiniIOSurface: no contiguous memory for a surface of %lu bytes below 4 GB: copied to the panel instead\n",
+			    (unsigned long) bytes);
 		}
 	}
 	if (memory == NULL) {
@@ -326,6 +370,9 @@ MiniIOSurface::free(void)
 		client->complete();
 		client->release();
 		client = NULL;
+	}
+	if (scanoutAddr != 0) {
+		OSDecrementAtomic(&gScanoutLive);
 	}
 	if (memory != NULL) {
 		surfaceMemoryBack(memory);
@@ -703,7 +750,11 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		}
 	}
 
-	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
+	/* (a surface of the display's size, to be fetched by the display block: see SCANOUT_SURFACES) */
+	bool scanout = gScanoutWidth != 0 && width == gScanoutWidth && height == gScanoutHeight && bpe == 4 && planeCount == 0 &&
+	    wrapped == NULL && gScanoutLive < SCANOUT_SURFACES;
+
+	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc), scanout);
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);
@@ -714,6 +765,17 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	s->kbase = (uint8_t *) s->memory->getBytesNoCopy();
 	s->values = OSDictionary::withCapacity(4);
 	s->kpixels = s->kbase + PAGE_SIZE;
+	s->scanoutAddr = 0;
+	s->scanoutState = 0;
+	if (scanout) {
+		IOByteCount length = 0;
+		addr64_t phys = s->memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
+
+		if (phys != 0 && length >= s->memory->getCapacity() && phys + s->memory->getCapacity() <= (1ULL << 32)) {
+			s->scanoutAddr = (uint32_t) (phys + PAGE_SIZE + offset);
+			OSIncrementAtomic(&gScanoutLive);
+		}
+	}
 	if (wrapped != NULL) {
 		s->clientTask = current_task();
 		s->clientAddress = wrapped->unsigned64BitValue();

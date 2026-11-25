@@ -3173,9 +3173,12 @@ gpu_block_stop(void)
  * end of a run, a panic). Only the two writes that keep the GMU out of memory that is no longer
  * its to use.
  */
+void hakios_display_scanout_quiesce(void);
+
 void
 hakios_adreno_quiesce(void)
 {
+	hakios_display_scanout_quiesce();      /* the display fetches the loader's framebuffer again, if a surface of ours was shown */
 	if (gpu_is_a618()) {
 		a618_adreno_quiesce();
 		return;
@@ -4169,6 +4172,219 @@ dpu_dump(const char *name, uint32_t offset, uint32_t length)
 	}
 }
 
+/*
+ * The display's stream in the apps SMMU (phone.dts: iommus <&apps_smmu 0x800 0x440>): the firmware's context bank for it, and a
+ * walk through that context's stage 1 tables (4K granule; the tables are in RAM, read through a mapping of their page). What the
+ * display block may fetch is what these map: the scan-out below only points a pipe at memory that they map to itself
+ * (virtual == physical, which is what a pipe's address is: the firmware gave it 0x9c000000 for its own framebuffer).
+ */
+static struct {
+	bool known, bypass;                     /* found; the context passes addresses through (no stage 1) */
+	vm_offset_t base;                       /* the SMMU's registers (all of its megabyte) */
+	uint32_t context, sctlr, tcr, tcr2, cbar, s2cr, fsr;
+	uint64_t ttbr0;
+	uint64_t mapped_phys;                   /* the table page mapped now ... */
+	vm_offset_t mapped;                     /* ... and where */
+} dpu_cb;
+
+static bool
+dpu_smmu_open(void)
+{
+	const struct hakios_board *board = hakios_board();
+	struct block smmu = { "apps smmu", board->smmu.apps, 0x100000 };
+	uint32_t idr0, idr1, page, pages, matches, cb;
+	vm_offset_t context;
+
+	if (dpu_cb.known) {
+		return true;
+	}
+	if (board->smmu.apps == 0) {
+		return false;
+	}
+	need(&smmu);
+	if (smmu.base == 0) {
+		return false;
+	}
+	idr0 = rd(smmu.base + SMMU_IDR0);
+	idr1 = rd(smmu.base + SMMU_IDR1);
+	page = idr1 >> 31 ? 0x10000 : 0x1000;
+	pages = 2u << (idr1 >> 28 & 7);
+	matches = idr0 & 0xff;
+	if (2 * pages * page != 0x100000 || (rd(smmu.base + SMMU_SCR0) & 1u << 3)) {
+		return false;                   /* (the layout is not the one read here) */
+	}
+	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
+		uint32_t smr = rd(smmu.base + SMMU_SMR(n)), s2cr = rd(smmu.base + SMMU_S2CR(n));
+
+		if (!(smr >> 31) || ((smr & 0x7fff) ^ DPU_STREAM) & ~(smr >> 16 & 0x7fff) & 0x7fff) {
+			continue;
+		}
+		dpu_cb.s2cr = s2cr;
+		dpu_cb.bypass = (s2cr >> 16 & 3) == 1;
+		if ((s2cr >> 16 & 3) == 2) {
+			return false;           /* (faults: the display gets nothing) */
+		}
+		if (dpu_cb.bypass) {
+			dpu_cb.known = true;
+			return true;
+		}
+		cb = s2cr & 0xff;
+		dpu_cb.context = cb;
+		dpu_cb.base = smmu.base;
+		dpu_cb.cbar = rd(smmu.base + page + 4 * cb);
+		context = smmu.base + pages * page + cb * page;
+		dpu_cb.sctlr = rd(context + SMMU_CB_SCTLR);
+		dpu_cb.ttbr0 = (uint64_t)rd(context + SMMU_CB_TTBR0 + 4) << 32 | rd(context + SMMU_CB_TTBR0);
+		dpu_cb.tcr = rd(context + SMMU_CB_TCR);
+		dpu_cb.tcr2 = rd(context + SMMU_CB_TCR2);
+		dpu_cb.fsr = rd(context + SMMU_CB_FSR);
+		printf("adreno: dpu: smmu context %u (page %#x): cbar %#x sctlr %#x (bit 0: stage 1 %s) tcr %#x tcr2 %#x ttbr0 %#llx "
+		    "mair %#x/%#x fsr %#x\n", cb, page, dpu_cb.cbar, dpu_cb.sctlr, dpu_cb.sctlr & 1 ? "on" : "OFF: bypass", dpu_cb.tcr,
+		    dpu_cb.tcr2, dpu_cb.ttbr0, rd(context + SMMU_CB_MAIR0), rd(context + SMMU_CB_MAIR1), dpu_cb.fsr);
+		/* stage 1 off: what comes in goes out; otherwise the tables decide */
+		dpu_cb.bypass = !(dpu_cb.sctlr & 1);
+		dpu_cb.known = true;
+		return true;
+	}
+	return false;
+}
+
+static uint64_t
+dpu_table_word(uint64_t phys)
+{
+	if (dpu_cb.mapped == 0 || dpu_cb.mapped_phys != (phys & ~0xfffull)) {
+		dpu_cb.mapped = ml_io_map((vm_offset_t)(phys & ~0xfffull), 0x1000);
+		dpu_cb.mapped_phys = phys & ~0xfffull;
+	}
+	if (dpu_cb.mapped == 0) {
+		return 0;
+	}
+	return (uint64_t)rd(dpu_cb.mapped + (phys & 0xffc) + 4) << 32 | rd(dpu_cb.mapped + (phys & 0xffc));
+}
+
+/*
+ * One address through the tables (4K granule, TTBR0): whether it is mapped and, if so, where to (*pa), and in either case how
+ * many bytes from it the same descriptor goes on (*span: a page, a 2 MB or 1 GB block, or the hole of an invalid entry).
+ * *attr: the descriptor's attribute bits (access flag, shareability, access permission, XN, the memory type index).
+ */
+static bool
+dpu_lookup(uint64_t va, uint64_t *pa, uint64_t *span, uint64_t *attr)
+{
+	uint32_t bits = 64 - (dpu_cb.tcr & 63);
+	int level = bits > 39 ? 0 : bits > 30 ? 1 : 2;
+	uint64_t table = dpu_cb.ttbr0 & 0xffffffffffe0ull;
+
+	*span = 0x1000;
+	if ((dpu_cb.tcr >> 14 & 3) != 0 || va >> bits != 0) {
+		*span = 1ull << 30;
+		return false;                   /* (a granule that is not read here, or outside the range of TTBR0) */
+	}
+	for (;; level++) {
+		uint32_t shift = 12 + 9 * (3 - level);
+		uint64_t unit = 1ull << shift, d = dpu_table_word(table + 8 * ((va >> shift) & 0x1ff));
+
+		*span = unit - (va & (unit - 1));
+		if (!(d & 1) || (level == 0 && !(d & 2)) || (level == 3 && !(d & 2))) {
+			return false;
+		}
+		if (level < 3 && (d & 2)) {
+			table = d & 0xfffffffff000ull;
+			continue;
+		}
+		*pa = (d & 0xfffffffff000ull & ~(unit - 1)) + (va & (unit - 1));
+		*attr = d & ~0xfffffffff000ull;
+		return true;
+	}
+}
+
+/* every page of [phys, phys + length) maps to itself in the display's context (or the context lets everything through) */
+static bool
+dpu_identity(uint64_t phys, uint64_t length)
+{
+	if (!dpu_smmu_open()) {
+		return false;
+	}
+	if (dpu_cb.bypass) {
+		return true;
+	}
+	for (uint64_t va = phys & ~0xfffull; va < phys + length;) {
+		uint64_t pa, span, attr;
+
+		if (!dpu_lookup(va, &pa, &span, &attr) || pa != va) {
+			return false;
+		}
+		va += span;
+	}
+	return true;
+}
+
+static void
+dpu_run_line(const char *what, uint64_t from, uint64_t to, bool mapped, uint64_t pa, uint64_t attr)
+{
+	if (mapped) {
+		printf("adreno: dpu: smmu %s: %#llx..%#llx -> %#llx%s attr %#llx\n", what, from, to, pa, pa == from ? " (identity)" : "", attr);
+	} else {
+		printf("adreno: dpu: smmu %s: %#llx..%#llx UNMAPPED\n", what, from, to);
+	}
+}
+
+/* [from, to) in runs of one kind (mapped to itself, to somewhere else with the same offset, or not at all), at most `max` lines */
+static void
+dpu_walk_report(const char *what, uint64_t from, uint64_t to, unsigned max)
+{
+	uint64_t va = from, start = from, start_pa = 0, start_attr = 0, identity = 0, mapped = 0;
+	bool start_mapped = false, have = false;
+	unsigned runs = 0;
+
+	while (va < to) {
+		uint64_t pa = 0, span = 0, attr = 0;
+		bool ok = dpu_lookup(va, &pa, &span, &attr);
+
+		if (!have || ok != start_mapped || (ok && (pa - va != start_pa - start || attr != start_attr))) {
+			if (have && runs++ < max) {
+				dpu_run_line(what, start, va, start_mapped, start_pa, start_attr);
+			}
+			start = va;
+			start_pa = pa;
+			start_attr = attr;
+			start_mapped = ok;
+			have = true;
+		}
+		if (span > to - va) {
+			span = to - va;
+		}
+		if (ok) {
+			mapped += span;
+			identity += pa == va ? span : 0;
+		}
+		va += span;
+	}
+	if (have && runs++ < max) {
+		dpu_run_line(what, start, to, start_mapped, start_pa, start_attr);
+	}
+	printf("adreno: dpu: smmu %s: %llu of %llu KB mapped, %llu KB of them to themselves, %u runs%s\n", what, mapped >> 10,
+	    (to - from) >> 10, identity >> 10, runs, runs > max ? " (more than shown)" : "");
+}
+
+/* display_probe=2: the context, the framebuffer's range, and where in the address space anything is mapped */
+static void
+dpu_smmu_report(void)
+{
+	if (!dpu_smmu_open()) {
+		printf("adreno: dpu: smmu: the display's stream has no usable context here\n");
+		return;
+	}
+	if (dpu_cb.bypass) {
+		printf("adreno: dpu: smmu: the display's stream passes addresses through (s2cr %#x, stage 1 off or bypass)\n", dpu_cb.s2cr);
+		return;
+	}
+	printf("adreno: dpu: smmu: tcr says %u bits of address, granule code %u (0: 4K), first level %d\n", 64 - (dpu_cb.tcr & 63),
+	    dpu_cb.tcr >> 14 & 3, 64 - (int)(dpu_cb.tcr & 63) > 39 ? 0 : 64 - (int)(dpu_cb.tcr & 63) > 30 ? 1 : 2);
+	dpu_walk_report("fb range", DPU_FB_BASE, DPU_FB_BASE + 0x01800000u, 12);
+	dpu_walk_report("0..4G", 0, 0x100000000ull, 40);
+	dpu_walk_report("4G..64G", 0x100000000ull, 0x1000000000ull, 12);
+}
+
 #define R(block, off) rd(dpu_at + (block) + (off))
 
 static void
@@ -4250,6 +4466,7 @@ dpu_pipeline(void)
 			}
 			printf("adreno: dpu: apps smmu: %u match registers cover stream %#x (none: the display's accesses are not "
 			    "matched: scr0 bit 10 or a default decides)\n", found, DPU_STREAM);
+			dpu_smmu_report();
 		}
 	}
 	/* the pipes, last. src_size/img_size are height << 16 | width, xy y << 16 | x; stride0 [15:0], stride1 [31:16] */
@@ -4286,6 +4503,235 @@ dpu_pipeline(void)
 	printf("adreno: dpu: done: nothing was written\n");
 }
 #undef R
+
+/*
+ * ---- the scan-out: the display block fetches a surface of ours itself (boot-arg fb_scanout, iokit/MiniIOMobileFramebuffer.cpp) ----
+ *
+ * display_probe=2 on the Mi 9T (logs/115021-run.log) found the firmware's pipeline: vig0 fetches 1080 x 2340 from 0x9c000000 (the
+ * loader's framebuffer, stride 4320, format 0x237ff: ARGB8888, tight) into mixer 0 stage 0 (ctl0 layer lm0 0x1000005), ctl0 feeds
+ * intf1, ping-pong 0 does the tear check and (ours: panel_autorefresh=2) the autorefresh. A frame goes out when ctl0's flush has
+ * been taken over at a frame start. So a surface is shown by writing vig0's source registers and the address and flushing vig0
+ * (bit 0 of CTL_FLUSH, "SDE_CTL_FLUSH_VIG0"), nothing else: the registers latch together at the next frame; the pipe goes on
+ * fetching the old surface until then.
+ *
+ * Mode 1 (fb_scanout=1): the surface, as it is (828 x 1792), at the panel's top left, the rest of the mixer black: no scaler is
+ * used, so this shows whether the fetch, the SMMU and the flush work. Mode 2: the scaler of vig0 (QSEED3 lite at +0xa00) scales it
+ * to the panel. Its registers are laid out here from the reset values the probe read, not from a source (Linux's QSEED3 layout has
+ * other offsets for the other QSEED3), and the coefficient tables are not loaded (the firmware never used the scaler): expect
+ * to iterate on mode 2 with what it logs.
+ *
+ * Nothing here is entered before hakios_display_scanout_open() has checked that vig0 is as the probe saw it.
+ */
+#define DPU_CTL0                0x2000u
+#define DPU_CTL_FLUSH           0x018u
+#define DPU_FLUSH_VIG0          (1u << 0)
+#define DPU_VIG0                0x5000u
+#define SSPP_SRC_SIZE           0x000u
+#define SSPP_SRC_IMG_SIZE       0x004u
+#define SSPP_SRC_XY             0x008u
+#define SSPP_OUT_SIZE           0x00cu
+#define SSPP_OUT_XY             0x010u
+#define SSPP_SRC0_ADDR          0x014u
+#define SSPP_SRC_YSTRIDE0       0x024u
+#define SSPP_SRC_FORMAT         0x030u
+#define SSPP_REQ_PIXELS_C0      0x108u          /* the pixel extension's request: what is read, height << 16 | width */
+#define SSPP_REQ_PIXELS_C12     0x118u
+#define SSPP_REQ_PIXELS_C3      0x128u
+#define SRC_FORMAT_ALPHA        (1u << 8)
+#define DPU_QSEED               0xa00u
+#define QSEED_OP_MODE           0x004u
+#define QSEED_STEP(n)           (0x010u + 4 * (n))      /* Y h, Y v, UV h, UV v: 1 << 21 is 1:1 (the reset value) */
+#define QSEED_WORDS             28u                     /* of the scaler's registers, from +0, said back after it is programmed */
+
+bool hakios_display_scan_start(void);   /* (below) */
+
+static const uint32_t scanout_regs[] = { SSPP_SRC_SIZE, SSPP_SRC_IMG_SIZE, SSPP_SRC_XY, SSPP_OUT_SIZE, SSPP_OUT_XY, SSPP_SRC0_ADDR,
+	SSPP_SRC_YSTRIDE0, SSPP_SRC_FORMAT, SSPP_REQ_PIXELS_C0, SSPP_REQ_PIXELS_C12, SSPP_REQ_PIXELS_C3, DPU_QSEED + QSEED_OP_MODE,
+	DPU_QSEED + QSEED_STEP(0), DPU_QSEED + QSEED_STEP(1), DPU_QSEED + QSEED_STEP(2), DPU_QSEED + QSEED_STEP(3) };
+#define SCANOUT_REGS (sizeof(scanout_regs) / sizeof(scanout_regs[0]))
+
+static struct {
+	bool open, on, broken;
+	struct block mdp;
+	uint32_t mode, saved[SCANOUT_REGS], panel_w, panel_h;
+	uint32_t shown;                         /* frames put on the pipe */
+} scanout;
+
+static void
+scanout_put(uint32_t offset, uint32_t value)
+{
+	wr(scanout.mdp.base + DPU_VIG0 + offset, value);
+}
+
+static uint32_t
+scanout_get(uint32_t offset)
+{
+	return rd(scanout.mdp.base + DPU_VIG0 + offset);
+}
+
+/* ctl0's flush of vig0, and then the wait for the display to take it over (the bit goes when it has); false: it did not in 60 ms */
+static bool
+scanout_flush(bool may_sleep)
+{
+	vm_offset_t flush = scanout.mdp.base + DPU_CTL0 + DPU_CTL_FLUSH;
+
+	__asm__ volatile ("dsb sy" ::: "memory");
+	wr(flush, DPU_FLUSH_VIG0);
+	for (int i = 0; i < (may_sleep ? 300 : 300000); i++) {
+		if (!(rd(flush) & DPU_FLUSH_VIG0)) {
+			return true;
+		}
+		if (may_sleep) {
+			sleep_us(200);
+		}
+	}
+	return false;
+}
+
+/* The firmware's picture again (and the scaler off): what the loader draws over. */
+static void
+scanout_restore(bool may_sleep)
+{
+	if (!scanout.open || !scanout.on) {
+		return;
+	}
+	for (unsigned i = 0; i < SCANOUT_REGS; i++) {
+		scanout_put(scanout_regs[i], scanout.saved[i]);
+	}
+	scanout.on = false;
+	if (!scanout_flush(may_sleep)) {
+		printf("adreno: scanout: the display did not take the firmware's picture back in time\n");
+	} else if (!may_sleep) {
+		printf("adreno: scanout: the display shows the firmware's picture again\n");
+	}
+}
+
+void
+hakios_display_scanout_restore(void)
+{
+	scanout_restore(true);
+}
+
+/* On the way back to the loader (interrupts off, nothing sleeps): hakios_adreno_quiesce() */
+void
+hakios_display_scanout_quiesce(void)
+{
+	scanout_restore(false);
+}
+
+/*
+ * Whether vig0 is as the firmware left it for a panel of this size and row length, and the registers are ours to write.
+ * `mode` 1 or 2 (see above). Once, true or false.
+ */
+bool
+hakios_display_scanout_open(uint32_t mode, uint32_t panel_w, uint32_t panel_h, uint32_t row_bytes)
+{
+	const struct hakios_board *board = hakios_board();
+	uint32_t size = panel_h << 16 | panel_w;
+
+	if (scanout.open || scanout.broken) {
+		return scanout.open;
+	}
+	scanout.broken = true;
+	if (!hakios_board_has(HAKIOS_HAS_DISPLAY_SCAN) || !hakios_display_scan_start() || board->display.intf < DPU_SDE_OFF) {
+		return false;                   /* (the clocks and the registers: scan_start has them, and the layout is the board's) */
+	}
+	if (rd(dispcc.base + DISPCC_MDSS_MDP_CBCR) & CBCR_OFF) {
+		printf("adreno: scanout: the display block's own clock is off\n");
+		return false;
+	}
+	scanout.mdp = (struct block){ "mdp", board->display.intf - DPU_SDE_OFF, DPU_SIZE };
+	need(&scanout.mdp);
+	if (scanout.mdp.base == 0) {
+		return false;
+	}
+	if (scanout_get(SSPP_SRC_SIZE) != size || scanout_get(SSPP_OUT_SIZE) != size || scanout_get(SSPP_OUT_XY) != 0 ||
+	    scanout_get(SSPP_SRC0_ADDR) != DPU_FB_BASE || scanout_get(SSPP_SRC_YSTRIDE0) != row_bytes ||
+	    rd(scanout.mdp.base + DPU_CTL0) == 0) {
+		printf("adreno: scanout: vig0 is not as the probe saw it (src %#x out %#x at %#x addr %#x stride %u, ctl0 layer %#x): "
+		    "nothing is written\n", scanout_get(SSPP_SRC_SIZE), scanout_get(SSPP_OUT_SIZE), scanout_get(SSPP_OUT_XY),
+		    scanout_get(SSPP_SRC0_ADDR), scanout_get(SSPP_SRC_YSTRIDE0), rd(scanout.mdp.base + DPU_CTL0));
+		return false;
+	}
+	for (unsigned i = 0; i < SCANOUT_REGS; i++) {
+		scanout.saved[i] = scanout_get(scanout_regs[i]);
+	}
+	scanout.mode = mode;
+	scanout.panel_w = panel_w;
+	scanout.panel_h = panel_h;
+	scanout.open = true;
+	scanout.broken = false;
+	printf("adreno: scanout: vig0 is the firmware's (1080x2340 from %#x, format %#x): mode %u\n", DPU_FB_BASE,
+	    scanout.saved[7], mode);
+	return true;
+}
+
+/* Memory the display may fetch from: below 4 GB (the pipe's address has 32 bits) and mapped to itself by the display's SMMU context */
+bool
+hakios_display_scanout_reaches(uint64_t phys, uint64_t length)
+{
+	return phys != 0 && length != 0 && phys + length <= 0x100000000ull && dpu_identity(phys, length);
+}
+
+/*
+ * The surface at `phys` (width x height, `stride` bytes a row, 4 bytes a pixel) becomes vig0's picture, to be on the panel at the
+ * next frame; waits for that. False: the display did not take it (the firmware's picture is put back, and nothing more is shown
+ * this way).
+ */
+bool
+hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint32_t height)
+{
+	uint32_t size = height << 16 | width, out = scanout.mode == 2 ? (scanout.panel_h << 16 | scanout.panel_w) : size;
+	bool first = !scanout.on;
+
+	if (!scanout.open || scanout.broken || (phys & 0xf) || (stride & 0xf)) {
+		return false;
+	}
+	scanout.on = true;
+	scanout_put(SSPP_SRC_SIZE, size);
+	scanout_put(SSPP_SRC_IMG_SIZE, size);
+	scanout_put(SSPP_SRC_XY, 0);
+	scanout_put(SSPP_OUT_SIZE, out);
+	scanout_put(SSPP_OUT_XY, 0);
+	scanout_put(SSPP_SRC0_ADDR, phys);
+	scanout_put(SSPP_SRC_YSTRIDE0, stride);
+	scanout_put(SSPP_SRC_FORMAT, scanout.saved[7] & ~SRC_FORMAT_ALPHA);        /* (the surface's alpha is not the display's business) */
+	scanout_put(SSPP_REQ_PIXELS_C0, size);
+	scanout_put(SSPP_REQ_PIXELS_C12, size);
+	scanout_put(SSPP_REQ_PIXELS_C3, size);
+	if (scanout.mode == 2) {
+		uint32_t h = (uint32_t)(((uint64_t)width << 21) / scanout.panel_w), v = (uint32_t)(((uint64_t)height << 21) / scanout.panel_h);
+
+		scanout_put(DPU_QSEED + QSEED_STEP(0), h);
+		scanout_put(DPU_QSEED + QSEED_STEP(1), v);
+		scanout_put(DPU_QSEED + QSEED_STEP(2), h);
+		scanout_put(DPU_QSEED + QSEED_STEP(3), v);
+		scanout_put(DPU_QSEED + QSEED_OP_MODE, scanout.saved[11] | 1u);
+	} else {
+		scanout_put(DPU_QSEED + QSEED_OP_MODE, scanout.saved[11] & ~1u);
+	}
+	if (!scanout_flush(true)) {
+		printf("adreno: scanout: the display did not take frame %u (surface at %#x) in 60 ms: the firmware's picture goes back\n",
+		    scanout.shown, phys);
+		scanout.broken = true;
+		hakios_display_scanout_restore();
+		return false;
+	}
+	if (first || scanout.shown < 3) {
+		printf("adreno: scanout: frame %u: vig0 reads %ux%u from %#x stride %u to %ux%u (src %#x addr %#x stride %u format %#x scaler "
+		    "op %#x steps %#x %#x)\n", scanout.shown, width, height, phys, stride, out & 0xffff, out >> 16,
+		    scanout_get(SSPP_SRC_SIZE), scanout_get(SSPP_SRC0_ADDR), scanout_get(SSPP_SRC_YSTRIDE0), scanout_get(SSPP_SRC_FORMAT),
+		    scanout_get(DPU_QSEED + QSEED_OP_MODE), scanout_get(DPU_QSEED + QSEED_STEP(0)), scanout_get(DPU_QSEED + QSEED_STEP(1)));
+		if (scanout.mode == 2 && scanout.shown == 0) {
+			for (uint32_t at = 0; at < QSEED_WORDS * 4; at += 16) {
+				printf("adreno: scanout: scaler +%02x: %08x %08x %08x %08x\n", at, scanout_get(DPU_QSEED + at),
+				    scanout_get(DPU_QSEED + at + 4), scanout_get(DPU_QSEED + at + 8), scanout_get(DPU_QSEED + at + 12));
+			}
+		}
+	}
+	scanout.shown++;
+	return true;
+}
 
 static void
 display_probe(uint32_t level)
