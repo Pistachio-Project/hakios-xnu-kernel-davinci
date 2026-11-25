@@ -223,11 +223,95 @@ static uint32_t gScanoutWidth, gScanoutHeight;
 static volatile SInt32 gScanoutLive;
 static uint32_t gScanoutRefused;
 
+/*
+ * The pieces for scan-out, taken once while memory is still in large free runs (the framebuffer's start, at boot): asked
+ * for one by one when the window server makes its surfaces, half a minute later, a third of them came in pieces and
+ * every third frame was copied (whole screen) between two fetched ones (small at the corner): flicker.
+ */
+static bool memoryOnePiece(IOBufferMemoryDescriptor * memory);
+#define SCANOUT_PIECE           (6u << 20)      /* the state page and 828x1792 a row of 3328 bytes, with room */
+static struct {
+	IOBufferMemoryDescriptor * memory;
+	bool busy;
+} gScanoutPool[SCANOUT_SURFACES];
+static IOLock * gScanoutPoolLock;
+
 void
 MiniIOSurfaceScanoutSize(uint32_t width, uint32_t height)
 {
+	unsigned made = 0;
+
 	gScanoutWidth = width;
 	gScanoutHeight = height;
+	if (gScanoutPoolLock == NULL) {
+		gScanoutPoolLock = IOLockAlloc();
+	}
+	for (unsigned i = 0; i < SCANOUT_SURFACES && gScanoutPoolLock != NULL; i++) {
+		if (gScanoutPool[i].memory != NULL) {
+			made++;
+			continue;
+		}
+		IOBufferMemoryDescriptor * memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, SCANOUT_PIECE, 0xfffff000ULL);
+
+		if (memory != NULL && !memoryOnePiece(memory)) {
+			memory->release();
+			memory = NULL;
+		}
+		gScanoutPool[i].memory = memory;
+		gScanoutPool[i].busy = false;
+		made += memory != NULL;
+	}
+	IOLog("MiniIOSurface: scan-out: %u of %u pieces of %u KB in one piece below 4 GB, taken at the start\n", made,
+	    SCANOUT_SURFACES, SCANOUT_PIECE >> 10);
+}
+
+/* A piece of the pool for a surface of `bytes` (with its state page), or NULL; zeroed, as new memory is. */
+static IOBufferMemoryDescriptor *
+scanoutPieceTake(vm_size_t bytes)
+{
+	IOBufferMemoryDescriptor * memory = NULL;
+
+	if (gScanoutPoolLock == NULL || bytes > SCANOUT_PIECE) {
+		return NULL;
+	}
+	IOLockLock(gScanoutPoolLock);
+	for (unsigned i = 0; i < SCANOUT_SURFACES && memory == NULL; i++) {
+		if (gScanoutPool[i].memory != NULL && !gScanoutPool[i].busy) {
+			gScanoutPool[i].busy = true;
+			memory = gScanoutPool[i].memory;
+			memory->retain();
+		}
+	}
+	IOLockUnlock(gScanoutPoolLock);
+	if (memory != NULL) {
+		bzero(memory->getBytesNoCopy(), bytes);
+		surfaceMemoryWriteBack(memory->getBytesNoCopy(), bytes);
+	}
+	return memory;
+}
+
+/* true if `memory` is a piece of the pool: then it is given back to it (the surface's reference dropped) */
+static bool
+scanoutPieceBack(IOBufferMemoryDescriptor * memory)
+{
+	bool ours = false;
+
+	if (gScanoutPoolLock == NULL) {
+		return false;
+	}
+	IOLockLock(gScanoutPoolLock);
+	for (unsigned i = 0; i < SCANOUT_SURFACES; i++) {
+		if (gScanoutPool[i].memory == memory) {
+			gScanoutPool[i].busy = false;
+			ours = true;
+		}
+	}
+	IOLockUnlock(gScanoutPoolLock);
+	if (ours) {
+		memory->release();
+	}
+	return ours;
 }
 
 /* The memory is one piece below 4 GB (its state page, then the pixels). */
@@ -269,6 +353,9 @@ surfaceMemory(vm_size_t bytes, bool contiguous)
 		}
 	}
 	if (memory == NULL && contiguous) {
+		memory = scanoutPieceTake(bytes);
+	}
+	if (memory == NULL && contiguous) {
 		memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
 		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, bytes, 0xfffff000ULL);
 		if (memory != NULL && !memoryOnePiece(memory)) {
@@ -304,6 +391,10 @@ static void
 surfaceMemoryBack(IOBufferMemoryDescriptor * memory)
 {
 	IOBufferMemoryDescriptor * evicted = NULL;
+
+	if (scanoutPieceBack(memory)) {
+		return;                 /* (back to the pool: never into the kept places, whose pieces anybody may take) */
+	}
 
 	if (memory->getCapacity() >= SURFACE_KEEP_FROM && memory->getRetainCount() != 1) {
 		OSIncrementAtomic(&gSurfacesNotKept[0]);
