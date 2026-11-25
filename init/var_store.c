@@ -89,6 +89,10 @@ static const char *const SKIP[] = {
 	"log", "logs",          /* what the last boot said */
 	"db/diagnostics", "db/uuidtext",        /* logd's archive: tens of MB a boot, and remade */
 	"jb",                   /* the package prefix, grafted from the read-only image at every boot */
+	/* dirs_cleaner's per-boot temporary roots (DARWIN_USER_TEMP/CACHE): a boot makes one under a new random name and
+	 * never looks into an earlier one, which dirs_cleaner would have emptied; kept, they piled up ~21 MB a boot
+	 * (23 of them, 485 MB of an 817 MB archive, run 213754) */
+	"dirs_cleaner", "mobile/dirs_cleaner",
 	/* chronod's state (ChronoKit, the widgets' timelines): restored into a new boot under iOS 27 it had SpringBoard
 	 * stand at the boot logo, no frame drawn (found by halves with var_store_skip: everything else of the volume
 	 * restored, the boot came up); the widgets are made again instead */
