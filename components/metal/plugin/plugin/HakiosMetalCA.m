@@ -2557,6 +2557,7 @@ hm_own_cache_dir(const char *dir)
 			setenv("HAKIOS_METAL_INFLIGHT", at + strlen("metal_inflight=") , 1);   /* (to the next space, atoi-style: strtoul stops there) */
 		}
 		if (hm_boot_arg_set("metal_waiter_qos=0")) setenv("HAKIOS_METAL_WAITER_QOS", "0", 1);
+		if (hm_boot_arg_set("metal_cache_read=0")) setenv("HAKIOS_METAL_CACHE_READ", "0", 1);
 		/* boot-arg metal_split_draws=N: a program but the window server gives the GPU its buffers in slices of about N draws (default 0: whole) */
 		if ((at = strstr(args, "metal_split_draws=")) != NULL && !hm_window_server()) setenv("HAKIOS_METAL_SPLIT_DRAWS", at + strlen("metal_split_draws="), 1);
 	}

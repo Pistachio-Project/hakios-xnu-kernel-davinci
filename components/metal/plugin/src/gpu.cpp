@@ -1,7 +1,12 @@
 #include "hakios-metal/gpu.hpp"
 #include "hakios-metal/pm4.hpp"
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 
@@ -128,13 +133,38 @@ void Gpu::release(Bo& bo) {
 }
 
 std::atomic<uint64_t> gRecycleMissesTotal{0};
+
+bool memoryLow() {
+#if defined(__APPLE__)
+    // (the run 224603: at 212 s, with a scripted workload on, IOSurface allocations began to fail and processes to crash, and the kernel panicked at
+    // 239 s: the plug-in's caches -- 256 MB of texture memory and 128 MB of slabs a queue -- are memory the system then wanted)
+    static std::atomic<int64_t> checkedNs{0};
+    static std::atomic<bool> low{false};
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now - checkedNs.load() < 250000000) return low.load();
+    checkedNs = now;
+    unsigned int freePages = 0;
+    size_t size = sizeof(freePages);
+    uint64_t memsize = 0;
+    size_t msize = sizeof(memsize);
+    static const uint64_t total = sysctlbyname("hw.memsize", &memsize, &msize, nullptr, 0) == 0 ? memsize : 0;
+    if (sysctlbyname("vm.page_free_count", &freePages, &size, nullptr, 0) != 0 || total == 0) return low.load();
+    const uint64_t freeBytes = uint64_t(freePages) * 16384;   // (a page is 16 KB on this kernel; the threshold is generous for 4 KB ones)
+    const uint64_t floor = std::max<uint64_t>(192ull << 20, total / 16);
+    low = freeBytes < floor;
+    return low.load();
+#else
+    return false;
+#endif
+}
+
 std::atomic<uint64_t> gRecycleHits{0}, gRecycleMisses{0}, gRecycleTrimmed{0}, gRecycleCached{0};   // (c_api.cpp's tally, all Gpus)
 
 namespace {
 uint64_t poolBytes() {
     static const uint64_t v = [] {
         const char* e = getenv("HAKIOS_METAL_TEXPOOL_MB");
-        const long mb = e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : 256;
+        const long mb = e != nullptr && e[0] != 0 ? strtol(e, nullptr, 0) : 128;
         return uint64_t(mb < 0 ? 0 : mb) << 20;
     }();
     return v;
@@ -202,7 +232,7 @@ std::unique_ptr<Bo> Gpu::newBoRecycled(uint64_t size, uint32_t flags, int* error
 void Gpu::recycleBo(std::unique_ptr<Bo> bo) {
     if (bo == nullptr) return;
     // (only what this driver made and still owns, of a size worth keeping: not a surface's memory, nor a handle another owns)
-    if (poolBytes() == 0 || !bo->owned_ || !bo->counted_ || bo->cpu_ == nullptr || bo->size_ < (64u << 10) || bo->size_ > poolBytes() / 4) return;
+    if (poolBytes() == 0 || memoryLow() || !bo->owned_ || !bo->counted_ || bo->cpu_ == nullptr || bo->size_ < (64u << 10) || bo->size_ > poolBytes() / 4) return;
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> g(cacheLock_);
     trimLocked(now, bo->size_);
@@ -216,7 +246,7 @@ void Gpu::recycleBo(std::unique_ptr<Bo> bo) {
 
 Gpu::RecycleStats Gpu::recycleStats(bool reset) {
     std::lock_guard<std::mutex> g(cacheLock_);
-    trimLocked(std::chrono::steady_clock::now(), 0);   // (the time's trim, as the report comes round: an idle process lets go too)
+    trimLocked(std::chrono::steady_clock::now(), memoryLow() ? poolBytes() + 1 : 0);   // (the time's trim, and everything when memory is short, as the report comes round: an idle process lets go too)
     gRecycleCached = cachedBytes_;
     RecycleStats s{cacheHits_, cacheMisses_, cacheTrimmed_, cachedBytes_};
     if (reset) cacheHits_ = cacheMisses_ = cacheTrimmed_ = 0;

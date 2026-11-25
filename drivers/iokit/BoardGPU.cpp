@@ -47,6 +47,8 @@ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 #include "MiniIOSurface.h"
 #include <vm/vm_kern_xnu.h>             /* kmem_alloc for the allocation diagnostic (gemNew) */
 extern "C" unsigned int vm_page_free_count, vm_page_wire_count;
+/* every client's buffers together (the 5 s line "gpu memory"): what the GPU's clients hold in the kernel, wired and kept, against the pages left */
+static int64_t gAllBuffers, gAllBufferBytes, gAllKeptBytes;
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 
@@ -879,6 +881,8 @@ HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
 	slot->client = false;
 	fBufferCount--;
 	fBufferBytes -= b->size;
+	gAllBuffers--;
+	gAllBufferBytes -= (int64_t) b->size;
 
 	bool busy = hakios_gpu_ready() && b->fence != 0 && !hakios_gpu_done(b->fence);
 
@@ -1135,6 +1139,8 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
 	b->client = false;
 	fBufferCount++;
 	fBufferBytes += size;
+	gAllBuffers++;
+	gAllBufferBytes += (int64_t) size;
 	return b;
 }
 
@@ -1155,6 +1161,7 @@ HakiosGPUUserClient::dropKept(struct gpu_kept * k)
 	k->memory->release();
 	k->memory = NULL;
 	fKeptBytes -= k->size;
+	gAllKeptBytes -= (int64_t) k->size;
 }
 
 /* With the lock held, the GPU done with the buffer: kept if it is worth it (those kept longest make way). */
@@ -1196,6 +1203,7 @@ HakiosGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_
 	place->flags = flags;
 	place->since = mach_absolute_time();
 	fKeptBytes += size;
+	gAllKeptBytes += (int64_t) size;
 	return true;
 }
 
@@ -1244,9 +1252,12 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 			fNextBuffer = h + 1;
 			fBufferCount++;
 			fBufferBytes += size;
+			gAllBuffers++;
+			gAllBufferBytes += (int64_t) size;
 			request->handle = h + 1;
 			found->memory = NULL;
 			fKeptBytes -= size;
+			gAllKeptBytes -= (int64_t) size;
 			gGPUStat.given_again++;
 			IOLockUnlock(gGPULock);
 			if (gGPUKeep == 2 && b->kernel != NULL) {
@@ -1966,6 +1977,8 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
 		    fBufferBytes >> 20, gGPUStat.shownWaits);
+		IOLog("HakiosGPU: gpu memory: %lld buffers of all clients, %lld MB, of which %lld MB kept for reuse; pages free %u, wired %u (%u MB)\n", gAllBuffers,
+		    gAllBufferBytes >> 20, gAllKeptBytes >> 20, vm_page_free_count, vm_page_wire_count, (unsigned) (((uint64_t) vm_page_wire_count * PAGE_SIZE) >> 20));
 		{
 			char held[200] = "";
 			size_t n = 0;

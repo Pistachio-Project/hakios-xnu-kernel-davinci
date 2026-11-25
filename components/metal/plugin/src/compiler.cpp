@@ -1764,7 +1764,8 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
     const std::string cached = stageCacheWritable(name);
     if (name.empty()) stats.noCache++;
-    if (!cached.empty()) {
+    static const bool readCache = [] { const char* e = getenv("HAKIOS_METAL_CACHE_READ"); return e == nullptr || e[0] != '0'; }();   // (metal_cache_read=0: written, not read: every stage compiled again, for the NIR lines)
+    if (!cached.empty() && readCache) {
         prefetchStart();
         std::string ahead;
         std::unique_ptr<CompiledStage> s;
@@ -1781,7 +1782,7 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
         }
     }
     if (!name.empty()) {
-        const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
+        const char* seed = readCache ? getenv("HAKIOS_METAL_CACHE_SEED") : nullptr;
         for (const char* p = seed; p != nullptr && *p != 0;) {
             const char* colon = strchr(p, ':');
             const std::string dir(p, colon != nullptr ? size_t(colon - p) : strlen(p));
