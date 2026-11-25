@@ -115,6 +115,15 @@ config QCOM_RTC
 	  rtc { } names it, and given to process 1 as hw.rtc_seconds, which keeps the time of day across boots
 	  without the host with it (board/rtc.c, rtc=0 leaves it alone).
 
+config QCOM_BATTERY_QG
+	bool "The battery's live current and voltage, from the PMIC's fuel gauge (QGauge)"
+	default y
+	select QCOM_SPMI
+	help
+	  Battery voltage and current read (never written) through the SPMI arbiter from the QGauge block the board
+	  file's qgauge { } names, with a 5 s log line, hw.battery.* sysctls and an energy accumulator
+	  (board/battery_qg.c, batt_live=1; off by default).
+
 config BATTERY_FROM_LOADER
 	bool "The battery and the charger, as the loader reads them from UEFI's charger drivers"
 	default y

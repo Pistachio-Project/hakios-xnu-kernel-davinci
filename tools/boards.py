@@ -163,6 +163,7 @@ BOARD_SCHEMA = {
                 'sound_pins': ([int], True), 'sound_function': (int, True), 'tdm': (int, False)},
     'buttons': {'pon': (int, True), 'volume_up': (int, True), 'pon_name': (str, False), 'volume_up_name': (str, False)},
     'rtc': {'peripheral': (int, True), 'name': (str, False)},
+    'qgauge': {'peripheral': (int, True), 'name': (str, False)},
     # what differs between phones that run a WCN3990 through an SM7150's modem (board/sm7150_mpss.c, feature wifi-wcn3990);
     # every key is optional and the Pixel 4a's value is the default
     'wcn3990': {'mpss_size': (int, False), 'msa': (int, False), 'msa_size': (int, False), 'rmtfs': (int, False),
@@ -861,6 +862,10 @@ def load(problems=None):
         if clock is not None and (not 0 < clock['peripheral'] <= 0xfff or clock['peripheral'] & 0xff == 0):
             problems.add(f'{rel} [rtc]', f'peripheral = {clock["peripheral"]:#x}: SPMI slave << 8 | the high byte of the '
                                          "RTC's registers (0x061: slave 0, registers 0x6100)")
+        gauge = data.get('qgauge')
+        if gauge is not None and (not 0 < gauge['peripheral'] <= 0xfff or gauge['peripheral'] & 0xff == 0):
+            problems.add(f'{rel} [qgauge]', f'peripheral = {gauge["peripheral"]:#x}: SPMI slave << 8 | the high byte of the '
+                                            "fuel gauge's registers (0x048: slave 0, registers 0x4800)")
         wcn = data.get('wcn3990')
         if wcn is not None:
             where = f'{rel} [wcn3990]'
@@ -1007,6 +1012,8 @@ def load(problems=None):
             # (board/spmi.h takes neither: a version 8 arbiter's second bus has tables of its own, which nothing here reads)
             problems.add(rel, 'soc.dtsi [spmi]: bus = 1 is for a version 7 arbiter, channel_map for a version 8 one: '
                               'the second bus of a version 8 arbiter is not known to the drivers')
+        if 'qgauge' in data and 'spmi' not in soc:
+            problems.add(rel, '[qgauge] needs [spmi] in soc.dtsi')
         if 'rtc' in data and 'spmi' not in soc:
             # (no feature to list: the section is the board's word that the clock is there, and the arbiter the way to it)
             problems.add(rel, '[rtc] needs [spmi] in soc.dtsi')
@@ -1172,6 +1179,10 @@ def table_text(socs, boards):
         if clock:
             name = f', .name = {c_string(clock["name"])}' if 'name' in clock else ''
             out.append(f'\t\t.rtc = {{ .peripheral = {clock["peripheral"]:#05x}{name} }},')
+        gauge = board.get('qgauge')
+        if gauge:
+            name = f', .name = {c_string(gauge["name"])}' if 'name' in gauge else ''
+            out.append(f'\t\t.qgauge = {{ .peripheral = {gauge["peripheral"]:#05x}{name} }},')
         wcn = board.get('wcn3990')
         if wcn:
             parts = [f'.{key} = {wcn[key]:#x}' for key in ('mpss_size', 'msa', 'msa_size', 'rmtfs', 'rmtfs_size') if key in wcn]
@@ -1664,7 +1675,7 @@ def new_board(name, soc_name, dts=None, panel=None, description=None, moved=Fals
         out.comment(*title)
         out.node(node, commented)
         for key, value in values:
-            out.prop(boardfile.property_line(key, value, lambda v: f'{v:#05x}' if node in ('buttons', 'torch', 'rtc') or (node == 'vibrator' and v < 0x1000) else
+            out.prop(boardfile.property_line(key, value, lambda v: f'{v:#05x}' if node in ('buttons', 'torch', 'rtc', 'qgauge') or (node == 'vibrator' and v < 0x1000) else
                                                      str(v) if node == 'vibrator' else  # (microvolts, in decimal)
                                                      f'{v:#010x}' if v >= 0x10000 else str(v)))
         out.end()
@@ -1678,6 +1689,10 @@ def new_board(name, soc_name, dts=None, panel=None, description=None, moved=Fals
     if 'peripheral' in clock:
         section(("The PMIC's real-time clock, read once at boot (rtc=0 leaves it alone): SPMI slave << 8 | the high byte",
                  "of its RTC_RW block's registers."), 'rtc', [(key, clock[key]) for key in ('peripheral', 'name') if key in clock])
+    gauge = board.get('qgauge', {})
+    if 'peripheral' in gauge:
+        section(("The PMIC's fuel gauge (QGauge), read at run time with batt_live=1: SPMI slave << 8 | the high byte",
+                 "of its registers."), 'qgauge', [(key, gauge[key]) for key in ('peripheral', 'name') if key in gauge])
     torch = board.get('torch', {})
     if 'flash' in torch and 'alarm' in torch:
         section(('The flashlight\'s part on the PMIC, for the feature "torch-pm8350c": the flash LED module and that',

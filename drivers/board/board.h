@@ -240,6 +240,12 @@ struct hakios_board {
 		const char *name;               /* for the log: "the PMK8350's RTC" */
 	} rtc;
 
+	/* the PMIC's fuel gauge (board: qgauge { }), read at run time (board/battery_qg.c, batt_live=1). 0: none named */
+	struct {
+		uint16_t peripheral;            /* its QG block: slave << 8 | the high byte (qcom,qgauge@4800 on slave 0: 0x048) */
+		const char *name;               /* for the log: "the PM6150's QGauge" */
+	} qgauge;
+
 	/*
 	 * What differs between phones that run a WCN3990 through an SM7150's modem (board: wcn3990 { }, feature wifi-wcn3990;
 	 * board/sm7150_mpss.c). 0 / NULL: the Pixel 4a's value, which the driver has as its default.
