@@ -3561,7 +3561,7 @@ hm_frame_pacing(const char *what, const unsigned *bins, unsigned frames, double 
  * own at the end. Guarded by a mutex: the notifications arrive on a queue of theirs, the frames on the commit thread. */
 static pthread_mutex_t hm_bench_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int hm_bench_active;
-static struct { unsigned bins[500]; unsigned frames, hitches; double worst, began; } hm_bench;
+static struct { unsigned bins[500]; unsigned frames, hitches; double worst, began; unsigned longs; double longWorst, longSum; } hm_bench;
 
 static void
 hm_bench_frame(double frame, BOOL hitch)
@@ -3574,6 +3574,20 @@ hm_bench_frame(double frame, BOOL hitch)
 		hm_bench.frames++;
 		if (frame > hm_bench.worst) hm_bench.worst = frame;
 		if (hitch) hm_bench.hitches++;
+	}
+	pthread_mutex_unlock(&hm_bench_lock);
+}
+
+/* a gap of a quarter of a second or more between frames inside the window: the pacing leaves it out as a pause, but the scripted workload does not
+ * pause, so here it is a hitch of its own, counted apart (its worst is the run's worst) */
+static void
+hm_bench_long(double gap)
+{
+	pthread_mutex_lock(&hm_bench_lock);
+	if (hm_bench_active) {
+		hm_bench.longs++;
+		hm_bench.longSum += gap;
+		if (gap > hm_bench.longWorst) hm_bench.longWorst = gap;
 	}
 	pthread_mutex_unlock(&hm_bench_lock);
 }
@@ -3613,6 +3627,8 @@ hm_bench_window(BOOL start)
 			hm_print("fps: ... frame pacing (ui_bench window): %u frames, %.1f fps avg, 1%% low %.1f fps, 0.1%% low %.1f fps, "
 				 "worst %.1f ms, %u hitches (frames over 100 ms)\n", hm_bench.frames, hm_bench.frames / total,
 				 k1 ? k1 / low1 : 0.0, k01 ? k01 / low01 : 0.0, hm_bench.worst * 1e3, hm_bench.hitches);
+			hm_print("fps: ... frame pacing (ui_bench window), gaps of 250 ms or more between frames, not in the figures above: %u, %.0f ms in all, "
+				 "the longest %.1f ms\n", hm_bench.longs, hm_bench.longSum * 1e3, hm_bench.longWorst * 1e3);
 		}
 	}
 	pthread_mutex_unlock(&hm_bench_lock);
@@ -7462,6 +7478,7 @@ hm_fps_commit(double seconds)
 
 			if (hm_fps.lastFrame != 0) {
 				if (frame >= 0.25) {
+					hm_bench_long(frame);
 					hm_fps.moving = NO;
 					hm_fps.runLen = 0;
 				} else if (hm_fps.moving) {

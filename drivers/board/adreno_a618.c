@@ -3330,6 +3330,77 @@ a618_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns, uint32_t pid)
 	gpu_pending_locked_ns = locked_ns;
 }
 
+/*
+ * The watchdog (boot-arg gpu_wptr_fix=0 turns the rewrite off; the lines stay): called by every wait for a fence, a few hundred times a second while
+ * work is queued, with the GPU's lock held. Two things are looked at. The core's write pointer read back is not what was written (a write lost while
+ * the core's power was in motion): written again, counted. And the core idle, no busy bit in RBBM_STATUS, for more than 10 ms with a submission not
+ * done: "gpu stall", with where the ring is, the core's status and the GMU's power state, and the write pointer written once more as a kick.
+ * (Run 215207: 10 to 130 ms between a submission's ring write and the core's start, with the core 35-42% busy.)
+ */
+static uint32_t gpu_wptr_fix = 1;
+static uint32_t gpu_wd_rptr, gpu_wd_fixes, gpu_wd_stalls, gpu_wd_kicks;
+static uint64_t gpu_wd_idle_since, gpu_wd_worst;
+static bool gpu_wd_said;
+
+void
+a618_gpu_watchdog(void)
+{
+	uint32_t last = gpu_fence;
+	uint64_t now;
+
+	if (last == 0 || a618_gpu_done(last)) {
+		gpu_wd_idle_since = 0;
+		gpu_wd_said = false;
+		return;
+	}
+	{
+		static bool parsed;
+
+		if (!parsed) {
+			parsed = true;
+			PE_parse_boot_argn("gpu_wptr_fix", &gpu_wptr_fix, sizeof(gpu_wptr_fix));
+		}
+	}
+	if (rd(gpu.base + CP_RB_WPTR) != ring_at) {
+		gpu_wd_fixes++;
+		if (gpu_wd_fixes <= 20) {
+			hakios_say("adreno: gpu wptr: read back %u, written %u (submission %u not done): %s\n", rd(gpu.base + CP_RB_WPTR), ring_at, last,
+			    gpu_wptr_fix ? "written again" : "left (gpu_wptr_fix=0)");
+		}
+		if (gpu_wptr_fix) {
+			wr(gpu.base + CP_RB_WPTR, ring_at);
+		}
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+	if ((rd(gpu.base + RBBM_STATUS) & RBBM_STATUS_BUSY) != 0) {
+		gpu_wd_idle_since = 0;
+		gpu_wd_said = false;
+		return;
+	}
+	if (gpu_wd_idle_since == 0) {
+		gpu_wd_idle_since = now;
+		return;
+	}
+	if (now - gpu_wd_idle_since < 10 * NSEC_PER_MSEC) {
+		return;
+	}
+	gpu_wd_worst = MAX(gpu_wd_worst, now - gpu_wd_idle_since);
+	if (!gpu_wd_said) {
+		gpu_wd_said = true;
+		gpu_wd_stalls++;
+		if (gpu_wd_stalls <= 40) {
+			hakios_say("adreno: gpu stall: rptr %u wptr %u (ring_at %u), rbbm %#x, gx %s, GMU power %#x, submission %u not done, idle for %llu ms (%u stalls, "
+			    "%u kicks, %u wptr fixes so far)\n", rd(gpu.base + CP_RB_RPTR), rd(gpu.base + CP_RB_WPTR), ring_at, rd(gpu.base + RBBM_STATUS),
+			    gx_on() ? "on" : "OFF", rd(gmu.base + GMU_RPMH_POWER_STATE), last, (now - gpu_wd_idle_since) / NSEC_PER_MSEC, gpu_wd_stalls,
+			    gpu_wd_kicks, gpu_wd_fixes);
+		}
+		if (gpu_wptr_fix) {
+			wr(gpu.base + CP_RB_WPTR, ring_at);     /* (a kick: the same value written again) */
+			gpu_wd_kicks++;
+		}
+	}
+}
+
 /* A submission does not come back: what the 3D core and its SMMU context say. */
 void
 a618_gpu_report(const char *why)

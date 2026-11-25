@@ -65,6 +65,7 @@ bool hakios_gpu_unmap(uint64_t address, uint64_t size);
 void hakios_gpu_to_memory(void * start, uint64_t size);
 uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
 void hakios_gpu_fence_times(uint32_t fence, uint64_t out[8]);
+void hakios_gpu_watchdog(void);
 void hakios_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns, uint32_t pid);
 extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
@@ -348,6 +349,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 			}
 		}
 		IOLockLock(gGPULock);
+		hakios_gpu_watchdog();
 	}
 	/*
 	 * A wait of a second or more that came to nothing: the core has stopped answering. What it
