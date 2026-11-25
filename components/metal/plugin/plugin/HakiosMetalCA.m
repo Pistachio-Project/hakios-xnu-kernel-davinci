@@ -4177,6 +4177,41 @@ hm_compress_ok(void)
 static unsigned hm_ubwc_rt_made, hm_ubwc_rt_linear, hm_ubwc_rt_reported;
 /* textures made by layout: UBWC 8-bit, UBWC fp16, linear under 65536 pixels, linear mipped, linear non-2D, linear large 2D (the ones UBWC missed) */
 static unsigned hm_layouts_made[6], hm_layouts_reported[6];
+/* the linear textures by why-not: storage, usage, format, size class (big/small), view bit, CPU-visible; the commonest printed with the layout line */
+static struct hm_linear_kind { uint32_t key; unsigned count; unsigned w, h; } hm_linear_kinds[24];
+static pthread_mutex_t hm_linear_lock = PTHREAD_MUTEX_INITIALIZER;
+static void
+hm_note_linear(MTLTextureDescriptor *d, MTLTextureUsage usage, BOOL memoryless)
+{
+	const uint32_t key = ((uint32_t)[d storageMode] & 7) | (((uint32_t)usage & 31) << 3) | (((uint32_t)[d pixelFormat] & 0x3ff) << 8) |
+			     ((([d usage] & MTLTextureUsagePixelFormatView) != 0) << 18) | ((uint32_t)[d textureType] << 19) | ([d width] * [d height] >= 65536 ? 1u << 24 : 0) |
+			     (memoryless ? 1u << 25 : 0) | ((uint32_t)[d mipmapLevelCount] > 1 ? 1u << 26 : 0);
+	pthread_mutex_lock(&hm_linear_lock);
+	for (unsigned i = 0; i < 24; i++) {
+		if (hm_linear_kinds[i].count != 0 && hm_linear_kinds[i].key == key) { hm_linear_kinds[i].count++; pthread_mutex_unlock(&hm_linear_lock); return; }
+	}
+	for (unsigned i = 0; i < 24; i++) {
+		if (hm_linear_kinds[i].count == 0) { hm_linear_kinds[i] = (struct hm_linear_kind){ key, 1, (unsigned)[d width], (unsigned)[d height] }; break; }
+	}
+	pthread_mutex_unlock(&hm_linear_lock);
+}
+static void
+hm_report_linear(void)
+{
+	pthread_mutex_lock(&hm_linear_lock);
+	for (unsigned n = 0; n < 8; n++) {
+		unsigned best = 24;
+		for (unsigned i = 0; i < 24; i++) if (hm_linear_kinds[i].count != 0 && (best == 24 || hm_linear_kinds[i].count > hm_linear_kinds[best].count)) best = i;
+		if (best == 24) break;
+		const uint32_t k = hm_linear_kinds[best].key;
+		hm_print("fps: ... linear textures: %u x storage %u usage %#x format %u type %u%s%s%s%s, e.g. %ux%u\n", hm_linear_kinds[best].count, k & 7, (k >> 3) & 31,
+			 (k >> 8) & 0x3ff, (k >> 19) & 31, (k >> 18) & 1 ? " +view" : "", (k >> 24) & 1 ? " large" : " small", (k >> 25) & 1 ? " memoryless" : "",
+			 (k >> 26) & 1 ? " mipped" : "", hm_linear_kinds[best].w, hm_linear_kinds[best].h);
+		hm_linear_kinds[best].count = 0;   /* (taken off the table: the next is the next commonest) */
+	}
+	memset(hm_linear_kinds, 0, sizeof(hm_linear_kinds));
+	pthread_mutex_unlock(&hm_linear_lock);
+}
 
 static BOOL
 hm_compress_rt_ok(void)
@@ -4500,6 +4535,7 @@ hm_memoryless_give(hakios_metal_texture *t, unsigned type, unsigned format, unsi
 		const unsigned k = hakios_metal_texture_is_compressed(texture) ? (fp16 ? 1 : 0) : !big ? 2 : [descriptor mipmapLevelCount] > 1 ? 3 :
 				   [descriptor textureType] != MTLTextureType2D ? 4 : 5;
 		__atomic_add_fetch(&hm_layouts_made[k], 1, __ATOMIC_RELAXED);
+		if (k >= 2) hm_note_linear(descriptor, usage, memoryless);
 	}
 	return made;
 }
@@ -7190,6 +7226,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 "(metal_ubwc_half=%d)\n", hm_layouts_made[0], hm_layouts_made[1], hm_layouts_made[2], hm_layouts_made[3], hm_layouts_made[4],
 				 hm_layouts_made[5], hm_boot_arg_set("metal_ubwc_half=0") ? 0 : 1);
 			memcpy(hm_layouts_reported, hm_layouts_made, sizeof(hm_layouts_made));
+			hm_report_linear();
 		}
 		if (hm_sampling()) hm_sample_report();
 		if (hm_timeline_on() && hm_fps.sampledBytes[0] + hm_fps.sampledBytes[1] + hm_fps.sampledBytes[2] + hm_fps.sampledBytes[3] + hm_fps.sampledBytes[4] +
