@@ -3508,6 +3508,35 @@ hm_async_pipelines(void)
 	return on != 0;
 }
 
+/* frame pacing from a histogram of frame times (0.5 ms bins): the average fps (frames over the time they took), the 1% low and
+ * 0.1% low (the average fps of the slowest 1% and 0.1% of the frames, at least one), and the worst frame, ms */
+static void
+hm_frame_pacing(const char *what, const unsigned *bins, unsigned frames, double worst)
+{
+	double total = 0, low1 = 0, low01 = 0;
+	unsigned n1 = frames / 100 ? frames / 100 : 1, n01 = frames / 1000 ? frames / 1000 : 1, seen = 0, k1 = 0, k01 = 0;
+
+	if (frames == 0) {
+		return;
+	}
+	for (unsigned b = 0; b < 500; b++) {
+		total += bins[b] * ((b + 0.5) / 2000.0);
+	}
+	for (int b = 499; b >= 0 && (k1 < n1 || k01 < n01); b--) {
+		for (unsigned i = 0; i < bins[b] && (k1 < n1 || k01 < n01); i++) {
+			const double t = (b + 0.5) / 2000.0;
+
+			if (k1 < n1) { low1 += t; k1++; }
+			if (k01 < n01) { low01 += t; k01++; }
+			seen++;
+		}
+	}
+	hm_print("fps: ... frame pacing (%s): %u frames while something moved, %.1f fps on average, 1%% low %.1f fps, 0.1%% low %.1f fps, "
+		 "worst frame %.1f ms (target 60 average, 50 for the 1%% low)\n", what, frames, frames / total, k1 ? k1 / low1 : 0.0,
+		 k01 ? k01 / low01 : 0.0, worst * 1e3);
+	(void)seen;
+}
+
 /* the stage cache's misses, one line each as compiled (compiler.cpp: cacheNote): the stage's name, the first 12 hex digits of
  * its key (the same stage compiled again at the next boot has the same key if it is the same stage: a key that changes
  * between boots shows here), "nofile" or "FILE-NOT-BELIEVED" (a file under that key that the loader passed over) */
@@ -6424,6 +6453,11 @@ static struct {
 	uint64_t lastTpidr;
 	double sampledBytes[6];   /* metal_fps=timeline: the bound fragment textures' sizes, by hakiosStorageKind */
 	struct { unsigned w, h, origin; double bytes; } bySize[16];
+	double lastFrame;               /* frame pacing: the start of the last frame (commits within 3 ms of each other are one) */
+	unsigned frameBins[500];        /* ...frame-to-frame times of this window, 0.5 ms bins to 250 ms */
+	unsigned frameBinsAll[500];     /* ...and of the whole run so far */
+	unsigned frames, framesAll;
+	double frameWorst, frameWorstAll;
 } hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}} };
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
@@ -6884,6 +6918,12 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			 hm_fps.commit * 1e3, hm_fps.buffers ? hm_fps.latency * 1e3 / hm_fps.buffers : 0.0, hm_fps.latencyMax * 1e3,
 			 hm_fps.passes / per, hm_fps.draws / per, hm_fps.dispatches / per, hm_fps.copies / per, hm_fps.gmemPasses / per,
 			 hm_fps.tiles / per);
+		{
+			static unsigned windows;
+
+			hm_frame_pacing("this window", hm_fps.frameBins, hm_fps.frames, hm_fps.frameWorst);
+			if (++windows % 5 == 0) hm_frame_pacing("the run so far", hm_fps.frameBinsAll, hm_fps.framesAll, hm_fps.frameWorstAll);
+		}
 		if (hm_fps.gapsOnTime + hm_fps.gapsLate + hm_fps.gapsStall != 0) {
 			hm_print("fps: ... gaps between commits while something moves: %u on time (20 ms at most), %u a frame late (to 50 ms), "
 				 "%u stalls (past 50); a buffer made to committed %.1f ms on average, %.1f at most; %u held for an event; "
@@ -7013,6 +7053,9 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 		hm_fps.presents = hm_fps.buffers = 0;
 		hm_fps.gpu = hm_fps.commit = hm_fps.latency = hm_fps.latencyMax = 0;
 		hm_fps.gapsOnTime = hm_fps.gapsLate = hm_fps.gapsStall = hm_fps.held = 0;
+		memset(hm_fps.frameBins, 0, sizeof(hm_fps.frameBins));
+		hm_fps.frames = 0;
+		hm_fps.frameWorst = 0;
 		hm_fps.encode = hm_fps.encodeMax = hm_fps.waited = 0;
 		hm_fps.waits = hm_fps.drawCalls = 0;
 		hm_fps.drawCpu = hm_fps.coreCpu = 0;
@@ -7210,6 +7253,23 @@ hm_fps_commit(double seconds)
 			if (gap <= 0.020) hm_fps.gapsOnTime++;
 			else if (gap <= 0.050) hm_fps.gapsLate++;
 			else hm_fps.gapsStall++;
+		}
+		if (hm_fps.lastCommit == 0 || gap >= 0.003) {
+			/* a new frame (a frame is the commits within 3 ms of each other: the window server commits one buffer a layer tree
+			 * and one more a pass of its own); the time since the last one's start, while something moves (under 250 ms) */
+			const double frame = now - hm_fps.lastFrame;
+
+			if (hm_fps.lastFrame != 0 && gap < 0.25 && frame < 0.25) {
+				const unsigned bin = (unsigned)(frame * 2000.0) < 499 ? (unsigned)(frame * 2000.0) : 499;
+
+				hm_fps.frameBins[bin]++;
+				hm_fps.frameBinsAll[bin]++;
+				hm_fps.frames++;
+				hm_fps.framesAll++;
+				if (frame > hm_fps.frameWorst) hm_fps.frameWorst = frame;
+				if (frame > hm_fps.frameWorstAll) hm_fps.frameWorstAll = frame;
+			}
+			hm_fps.lastFrame = now;
 		}
 		hm_fps.lastCommit = now;
 	}
