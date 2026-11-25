@@ -3466,6 +3466,25 @@ hakios_adreno_cap_mhz(void)
 	return gpu_is_a618() ? a618_gpu_cap_mhz() : 0;
 }
 
+/* pm_ddr=1 and pm_gpu=1 (cpufreq.c, ddr.c): how long ago the GPU was last given work, in ms; ~0 when it is not up (A618 only) */
+uint32_t a618_gpu_idle_ms(void);
+void a618_gpu_pm_screen(bool off);
+
+uint32_t
+hakios_adreno_idle_ms(void)
+{
+	return gpu_is_a618() ? a618_gpu_idle_ms() : ~0u;
+}
+
+/* the display went dark or lit (cpufreq.c, pm_screen=1): the GPU to its lowest level, and back */
+void
+hakios_adreno_pm_screen(bool off)
+{
+	if (gpu_is_a618()) {
+		a618_gpu_pm_screen(off);
+	}
+}
+
 /* The answers to msm's GET_PARAM (Linux's adreno_get_param for this GPU; the numbers are msm_drm.h's). */
 bool
 hakios_gpu_parameter(uint32_t which, uint64_t *value)

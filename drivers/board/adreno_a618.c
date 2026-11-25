@@ -1943,7 +1943,9 @@ oob_set(const char *what, uint32_t request)
 		space_faulted(&gmu_space);
 		return false;
 	}
-	hakios_say("adreno: %u: the GMU answers the request %s\n", step, what);
+	if (!quiet) {
+		hakios_say("adreno: %u: the GMU answers the request %s\n", step, what);
+	}
 	return true;
 }
 
@@ -2121,6 +2123,18 @@ static const struct {
 static uint32_t gpu_votes[GPU_SPEEDS], gpu_speed = 5;        /* 565 MHz: 610 (index 6) only with adreno_speed=6 */
 /* what the GMU was last asked for (the thermal cap may lower it below gpu_speed, never raise it above); 0: not yet asked */
 static uint32_t gpu_applied;
+/* the thermal limiter's level (0: none yet), the load governor's (pm_gpu=1; 0: not governing) and what wakes it (a618_gpu_submit) */
+static uint32_t gpu_thermal_cap, gpu_pm_level;
+static volatile bool gpu_pm_low;
+static uint32_t gpu_pm_event;
+static uint32_t gpu_pm_on, gpu_pm_idle_ms = 80, gpu_pm_floor = 4;
+static bool gpu_pm_dark;
+static struct {
+	uint64_t at, ticks[GPU_SPEEDS];
+	uint32_t changes, busy, looks, submissions_seen;
+} gpu_pm_stat;
+
+static void gpu_pm_thread(void *arg, wait_result_t result);
 /* every talk to the GMU after the steps: the thermal limiter's (a618_gpu_set_cap) */
 static LCK_GRP_DECLARE(gpu_dcvs_lock_group, "hakios-a618-dcvs");
 static LCK_MTX_DECLARE(gpu_dcvs_lock, &gpu_dcvs_lock_group);
@@ -3179,6 +3193,9 @@ a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 	}
 	gpu_submissions++;
 	gpu_submitted_at = mach_absolute_time();
+	if (gpu_pm_low) {
+		thread_wakeup((event_t)&gpu_pm_event);  /* (pm_gpu=1: the core was let down while idle: up to the top before the work is done) */
+	}
 	{
 		uint32_t slot = gpu_fence % GPU_TIMES;
 
@@ -3328,6 +3345,14 @@ gpu_keep(void)
 		uint32_t clock_log = 1;
 		thread_t thread;
 
+		PE_parse_boot_argn("pm_gpu", &gpu_pm_on, sizeof(gpu_pm_on));
+		PE_parse_boot_argn("pm_gpu_idle_ms", &gpu_pm_idle_ms, sizeof(gpu_pm_idle_ms));
+		PE_parse_boot_argn("pm_gpu_floor", &gpu_pm_floor, sizeof(gpu_pm_floor));
+		if (gpu_pm_on && kernel_thread_start(gpu_pm_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+			hakios_say("adreno: pm_gpu=1: the 3D core's level by its load (idle %u ms: lowest; busy: %u MHz; floor level %u)\n",
+			    gpu_pm_idle_ms, gpu_speeds[gpu_speed].khz / 1000, gpu_pm_floor);
+		}
 		PE_parse_boot_argn("adreno_clk", &clock_log, sizeof(clock_log));
 		if (clock_log && kernel_thread_start(gpu_clock_thread, NULL, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
@@ -3538,37 +3563,204 @@ a618_gpu_cap_mhz(void)
 	return gpu_kept && gpu_applied != 0 ? gpu_speeds[gpu_applied].khz / 1000 : 0;
 }
 
-/* true if the core is now asked for min(asked, max_level) (or already was); false: not done, to be asked again */
-bool
-a618_gpu_set_cap(uint32_t max_level)
+/*
+ * With gpu_dcvs_lock held and the GPU up: the core is asked for min(the speed asked at the start, the thermal cap, the load
+ * governor's level) by the DCVS request of step 17 (put the setting, OOB_DCVS, give it back); true when it is, or already was.
+ * WHY: a word for the log when the thermal limiter asked ("thermal"), else NULL (the governor changes level every few tens of
+ * milliseconds: counted, not logged).
+ */
+static bool
+gpu_level_apply(const char *why)
 {
-	uint32_t want = max_level < gpu_speed ? max_level : gpu_speed;
-	bool done = false;
+	uint32_t want = gpu_thermal_cap != 0 && gpu_thermal_cap < gpu_speed ? gpu_thermal_cap : gpu_speed;
 
+	if (gpu_pm_level != 0 && gpu_pm_level < want) {
+		want = gpu_pm_level;
+	}
 	if (want < 1) {
 		want = 1;
 	}
-	lck_mtx_lock(&gpu_dcvs_lock);
-	if (!gpu_kept || gpu_applied == 0) {
-		lck_mtx_unlock(&gpu_dcvs_lock);
-		return false;
-	}
 	if (want == gpu_applied) {
-		lck_mtx_unlock(&gpu_dcvs_lock);
 		return true;
 	}
 	put(&gmu, "dcvs_ack_option", GMU_DCVS_ACK_OPTION, 0);
 	put(&gmu, "dcvs_perf_setting", GMU_DCVS_PERF_SETTING, 3u << 28 | want);
 	put(&gmu, "dcvs_bw_setting", GMU_DCVS_BW_SETTING, 0xff);
-	if (oob_set("for the thermal speed", OOB_DCVS)) {
-		oob_clear(OOB_DCVS);
-		hakios_say("adreno: thermal: 3D core %s at %u MHz (level %u of %u)\n", want < gpu_applied ? "capped" : "released",
-		    gpu_speeds[want].khz / 1000, want, gpu_speed);
-		gpu_applied = want;
-		done = true;
+	if (!oob_set("for the thermal speed", OOB_DCVS)) {
+		return false;
 	}
+	oob_clear(OOB_DCVS);
+	if (why != NULL) {
+		hakios_say("adreno: %s: 3D core %s at %u MHz (level %u of %u)\n", why, want < gpu_applied ? "capped" : "released",
+		    gpu_speeds[want].khz / 1000, want, gpu_speed);
+	}
+	gpu_applied = want;
+	return true;
+}
+
+/* true if the core is now asked for min(asked, max_level) (or already was); false: not done, to be asked again */
+bool
+a618_gpu_set_cap(uint32_t max_level)
+{
+	bool done;
+
+	lck_mtx_lock(&gpu_dcvs_lock);
+	if (!gpu_kept || gpu_applied == 0) {
+		lck_mtx_unlock(&gpu_dcvs_lock);
+		return false;
+	}
+	gpu_thermal_cap = max_level < 1 ? 1 : max_level;
+	done = gpu_level_apply("thermal");
 	lck_mtx_unlock(&gpu_dcvs_lock);
 	return done;
+}
+
+/*
+ * POWER MANAGEMENT, phase 4 (boot-arg pm_gpu=1; default 0: the core stays at the speed asked for at the start). A thread looks
+ * every 10 ms, as Android's msm-adreno-tz does with its 80 ms idle timeout (the vendor device tree's qcom,idle-timeout):
+ *
+ *   - no work given for pm_gpu_idle_ms (default 80): the lowest level (180 MHz, the lowest voltage of the 3D core's rail);
+ *     the first submission after that wakes the thread (a618_gpu_submit), which asks for the top at once;
+ *   - work lately: the top level (565 MHz: "keeping 565 available under load" -- at 355 the window server drew 20-24 frames a
+ *     second); one level down when the core was busy under 25% of the last six 50 ms windows (300 ms), but never below
+ *     pm_gpu_floor (default 4, 430 MHz), and up to the top when a window is busier than 50%;
+ *   - the thermal limiter's cap on top of it all (gpu_level_apply), and, with the screen off (pm_screen=1), the lowest level.
+ * Every 5 s a line "pm: gpu": the time at each level, how many changes, the load seen, the submissions.
+ *
+ * What is NOT done: powering the 3D core down when idle (the vendor's "slumber", Linux's a6xx_gmu_suspend): the core's state, the
+ * zap shader and the GMU would have to be brought up again at the next submission, and this driver's bring-up is the 21 steps, run
+ * once; the A618 has no IFPC (the vendor's kgsl enables it from the A640 on). The 3D core therefore keeps its power switch on
+ * (OOB_GPU held) and the GMU's own clock gating, and the saving is the lower voltage.
+ */
+uint32_t a618_gpu_idle_ms(void);
+uint32_t
+a618_gpu_idle_ms(void)
+{
+	uint64_t ns;
+
+	if (!gpu_kept || gpu_submitted_at == 0) {
+		return ~0u;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - gpu_submitted_at, &ns);
+	return (uint32_t)MIN(ns / NSEC_PER_MSEC, 0xfffffff0u);
+}
+
+static void
+gpu_pm_set(uint32_t level, uint64_t now)
+{
+	lck_mtx_lock(&gpu_dcvs_lock);
+	if (gpu_kept && gpu_applied != 0) {
+		gpu_pm_stat.ticks[gpu_applied] += now - gpu_pm_stat.at;
+		gpu_pm_stat.at = now;
+		gpu_pm_level = level;
+		if (gpu_level_apply(NULL)) {
+			gpu_pm_stat.changes++;
+		}
+	}
+	lck_mtx_unlock(&gpu_dcvs_lock);
+}
+
+static void
+gpu_pm_thread(__unused void *arg, __unused wait_result_t result)
+{
+	uint32_t top = gpu_speed, level = top, quiet_windows = 0, window_busy = 0, window_looks = 0;
+	uint64_t said, period, last_submissions = gpu_submissions;
+
+	nanoseconds_to_absolutetime(5 * NSEC_PER_SEC, &period);
+	said = mach_absolute_time();
+	gpu_pm_stat.at = said;
+	for (;;) {
+		uint64_t now, deadline;
+		uint32_t idle_ms, want;
+
+		clock_interval_to_deadline(10, NSEC_PER_MSEC, &deadline);
+		assert_wait_deadline((event_t)&gpu_pm_event, THREAD_UNINT, deadline);
+		thread_block(THREAD_CONTINUE_NULL);
+		if (!gpu_kept) {
+			(void)thread_terminate(current_thread());
+			thread_block(THREAD_CONTINUE_NULL);
+		}
+		now = mach_absolute_time();
+		idle_ms = a618_gpu_idle_ms();
+		if (gpu_pm_level != 0) {
+			level = gpu_pm_level;           /* (a618_gpu_pm_screen() may have moved it) */
+		}
+		if (gx_on()) {
+			gpu_pm_stat.looks++;
+			window_looks++;
+			if (rd(gpu.base + RBBM_STATUS) & RBBM_STATUS_BUSY) {
+				gpu_pm_stat.busy++;
+				window_busy++;
+			}
+		}
+		want = level;
+		if (gpu_pm_dark || idle_ms >= gpu_pm_idle_ms) {
+			want = 1;
+			quiet_windows = 0;
+		} else if (level < top && (idle_ms < 20 || window_busy * 2 > window_looks + 1)) {
+			want = top;                     /* (work again: up at once) */
+		}
+		if (window_looks >= 5) {
+			if (!gpu_pm_dark && idle_ms < gpu_pm_idle_ms) {
+				if (window_busy * 4 > window_looks) {
+					want = window_busy * 2 > window_looks ? top : want;
+					quiet_windows = 0;
+				} else if (++quiet_windows >= 6 && level > gpu_pm_floor && level > 1) {
+					want = level - 1;
+					quiet_windows = 0;
+				}
+			}
+			window_busy = window_looks = 0;
+		}
+		if (want != level) {
+			level = want;
+			gpu_pm_set(level, now);
+		}
+		gpu_pm_low = level < top;
+		if (gpu_submissions != last_submissions) {
+			gpu_pm_stat.submissions_seen += (uint32_t)(gpu_submissions - last_submissions);
+			last_submissions = gpu_submissions;
+		}
+		if (now - said >= period) {
+			uint64_t total = 0, span = now - said;
+			char line[200];
+			size_t at = 0;
+
+			lck_mtx_lock(&gpu_dcvs_lock);
+			gpu_pm_stat.ticks[gpu_applied < GPU_SPEEDS ? gpu_applied : 0] += now - gpu_pm_stat.at;
+			gpu_pm_stat.at = now;
+			for (uint32_t i = 1; i < GPU_SPEEDS; i++) {
+				total += gpu_pm_stat.ticks[i];
+			}
+			for (uint32_t i = 1; i < GPU_SPEEDS && total != 0; i++) {
+				if (gpu_pm_stat.ticks[i] * 100 / (span ? span : 1) != 0) {
+					at += (size_t)snprintf(line + at, sizeof(line) - at, " %u=%llu%%", gpu_speeds[i].khz / 1000,
+					    gpu_pm_stat.ticks[i] * 100 / (span ? span : 1));
+				}
+			}
+			memset(gpu_pm_stat.ticks, 0, sizeof(gpu_pm_stat.ticks));
+			lck_mtx_unlock(&gpu_dcvs_lock);
+			line[at] = 0;
+			hakios_say("pm: gpu (MHz=share of time):%s; %u changes, core busy %u%% of %u looks, %u submissions, idle for %u ms, now level %u%s\n",
+			    line, gpu_pm_stat.changes, gpu_pm_stat.looks ? 100 * gpu_pm_stat.busy / gpu_pm_stat.looks : 0,
+			    gpu_pm_stat.looks, gpu_pm_stat.submissions_seen, idle_ms == ~0u ? 0 : idle_ms, gpu_applied, gpu_pm_dark ? " (screen dark)" : "");
+			gpu_pm_stat.changes = 0;
+			gpu_pm_stat.busy = gpu_pm_stat.looks = gpu_pm_stat.submissions_seen = 0;
+			said = now;
+		}
+	}
+}
+
+/* the display went dark (cpufreq.c, pm_screen=1): the lowest level at once, and the top again when it is lit */
+void a618_gpu_pm_screen(bool off);
+void
+a618_gpu_pm_screen(bool off)
+{
+	gpu_pm_dark = off;
+	if (gpu_pm_on && gpu_kept) {
+		gpu_pm_set(off ? 1 : gpu_speed, mach_absolute_time());
+		thread_wakeup((event_t)&gpu_pm_event);
+	}
 }
 
 /* How long the core has worked: not measured on this chip yet. */
