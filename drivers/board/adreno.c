@@ -4547,6 +4547,16 @@ void
 hakios_adreno_init(void)
 {
 	if (gpu_is_a618()) {
+		/* (display_probe= reads the display block, not the GPU: on an A618 board as on any other, before the handover) */
+		uint32_t probe = 0;
+
+		if (PE_parse_boot_argn("display_probe", &probe, sizeof(probe)) && probe) {
+			if (display_layout_known()) {
+				display_probe(probe);
+			} else {
+				printf("adreno: display_probe: this board's SoC file has no display { } intf1 and clocks { }: nothing read\n");
+			}
+		}
 		a618_adreno_init();
 		return;
 	}
