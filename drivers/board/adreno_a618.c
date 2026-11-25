@@ -3401,6 +3401,25 @@ a618_gpu_watchdog(void)
 	}
 }
 
+/* What the core is doing right now, for the plug-in's "gpu busy-wait" lines: its status word, the indirect buffers it is in (address, dwords still to read)
+ * and the ring's read and write pointers. */
+#define CP_IB1_BASE_SAMPLE      GPU_WORD(0x0928)
+#define CP_IB1_REM_SIZE_SAMPLE  GPU_WORD(0x092a)
+#define CP_IB2_BASE_SAMPLE      GPU_WORD(0x092b)
+#define CP_IB2_REM_SIZE_SAMPLE  GPU_WORD(0x092d)
+void
+a618_gpu_sample(uint64_t out[8])
+{
+	out[0] = rd(gpu.base + RBBM_STATUS);
+	out[1] = (uint64_t)rd(gpu.base + CP_IB1_BASE_SAMPLE + 4) << 32 | rd(gpu.base + CP_IB1_BASE_SAMPLE);
+	out[2] = rd(gpu.base + CP_IB1_REM_SIZE_SAMPLE);
+	out[3] = (uint64_t)rd(gpu.base + CP_IB2_BASE_SAMPLE + 4) << 32 | rd(gpu.base + CP_IB2_BASE_SAMPLE);
+	out[4] = rd(gpu.base + CP_IB2_REM_SIZE_SAMPLE);
+	out[5] = rd(gpu.base + CP_RB_RPTR);
+	out[6] = rd(gpu.base + CP_RB_WPTR);
+	out[7] = ring_at;
+}
+
 /* A submission does not come back: what the 3D core and its SMMU context say. */
 void
 a618_gpu_report(const char *why)

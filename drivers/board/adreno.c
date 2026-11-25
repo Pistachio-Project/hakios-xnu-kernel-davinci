@@ -139,6 +139,7 @@ void a618_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[
 uint32_t a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
 void a618_gpu_fence_times(uint32_t fence, uint64_t out[8]);
 void a618_gpu_watchdog(void);
+void a618_gpu_sample(uint64_t out[8]);
 void a618_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns, uint32_t pid);
 void a618_gpu_report(const char *why);
 bool a618_gpu_recover(void);
@@ -3732,6 +3733,17 @@ hakios_gpu_done(uint32_t fence)
 
 	to_memory((vm_offset_t)word, 4);
 	return (int32_t)(*word - fence) >= 0;
+}
+
+/* What the core is doing (a618_gpu_sample); zeros for another core. */
+void
+hakios_gpu_sample(uint64_t out[8])
+{
+	if (gpu_is_a618()) {
+		a618_gpu_sample(out);
+	} else {
+		bzero(out, 8 * sizeof(uint64_t));
+	}
 }
 
 /* Called by every wait for a fence (a618_gpu_watchdog). */

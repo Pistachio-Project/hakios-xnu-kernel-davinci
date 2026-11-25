@@ -66,6 +66,7 @@ void hakios_gpu_to_memory(void * start, uint64_t size);
 uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
 void hakios_gpu_fence_times(uint32_t fence, uint64_t out[8]);
 void hakios_gpu_watchdog(void);
+void hakios_gpu_sample(uint64_t out[8]);
 void hakios_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns, uint32_t pid);
 extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
@@ -316,6 +317,194 @@ hakios_gpu_irq_wake_fence(uint32_t fence)
 	thread_wakeup((event_t) &gGPUFenceEvents[fence % GPU_FENCE_EVENTS]);
 }
 
+
+/*
+ * Who has the ring (boot-arg gpu_busywait=0 turns the sampling off). Each submission is noted as it is made -- the program, and where its
+ * indirect buffers are in the GPU's address space and in ours -- and, in every wait for a fence, while the oldest unfinished submission has held
+ * the core for more than 20 ms: the core is sampled (which blocks of it are busy, the indirect buffers it is reading, and by walking the packets from
+ * the buffer's start to where it has read to, the packet it is in: a CP_WAIT_* there is the core waiting for something and not working) and one line
+ * says so, "gpu busy-wait". And every time the waits look, the time since the last look is added to the program that holds the ring's head while the
+ * window server has a submission behind it: "gpu ring held" in the 5 s line.
+ */
+#define GPU_SUBLOG 64
+static struct gpu_sublog {
+	uint32_t fence, pid, count;
+	bool window_server;
+	char name[17];
+	uint64_t address[4];
+	uint32_t words[4];
+	const uint8_t * kernel[4];
+} gSubLog[GPU_SUBLOG];
+static uint32_t gBusyWaitOn = 1;
+static uint64_t gBusyWaitLast, gBusyWaitAt;            /* the last look, and the last line */
+static uint32_t gBusyWaitLines;
+static struct { char name[17]; uint64_t ns; } gHeld[8];
+
+static const char *
+packetName(uint32_t op)
+{
+	switch (op) {
+	case 0x10: return "CP_NOP";
+	case 0x12: return "CP_WAIT_MEM_WRITES";
+	case 0x13: return "CP_WAIT_FOR_ME";
+	case 0x14: return "CP_WAIT_MEM_GTE";
+	case 0x15: return "CP_WAIT_REG_EQ";
+	case 0x16: return "CP_WAIT_REG_GTE";
+	case 0x1d: return "CP_SKIP_IB2_ENABLE_GLOBAL";
+	case 0x26: return "CP_WAIT_FOR_IDLE";
+	case 0x2c: return "CP_BLIT";
+	case 0x30: return "CP_LOAD_STATE6_GEOM";
+	case 0x32: return "CP_LOAD_STATE6_FRAG";
+	case 0x33: return "CP_EXEC_CS";
+	case 0x34: return "CP_LOAD_STATE6";
+	case 0x38: return "CP_DRAW_INDX_OFFSET";
+	case 0x3c: return "CP_WAIT_REG_MEM";
+	case 0x3d: return "CP_MEM_WRITE";
+	case 0x3e: return "CP_REG_TO_MEM";
+	case 0x3f: return "CP_INDIRECT_BUFFER";
+	case 0x43: return "CP_SET_DRAW_STATE";
+	case 0x44: return "CP_COND_EXEC";
+	case 0x46: return "CP_EVENT_WRITE";
+	case 0x47: return "CP_COND_REG_EXEC";
+	case 0x5c: return "CP_CONTEXT_REG_BUNCH";
+	case 0x63: return "CP_SET_MODE";
+	case 0x65: return "CP_SET_MARKER";
+	case 0x6c: return "CP_SET_VISIBILITY_OVERRIDE";
+	case 0x73: return "CP_MEM_TO_MEM";
+	default: return NULL;
+	}
+}
+
+/* The packet that holds dword POSITION of the stream of WORDS dwords at STREAM, as "OPCODE (+N dwords in)", walked from the start. */
+static void
+packetAt(const uint8_t * stream, uint32_t words, uint32_t position, char * out, size_t outSize)
+{
+	const volatile uint32_t * w = (const volatile uint32_t *) stream;
+	uint32_t at = 0;
+
+	snprintf(out, outSize, "?");
+	if (stream == NULL || position >= words) {
+		return;
+	}
+	hakios_gpu_to_memory((void *) stream, (uint64_t) words * 4);
+	for (uint32_t steps = 0; at < words && steps < 100000; steps++) {
+		uint32_t h = w[at], size, op = 0;
+		bool t7 = (h >> 28) == 7;
+
+		if (t7) {
+			size = 1 + (h & 0x7fff);
+			op = (h >> 16) & 0x7f;
+		} else if ((h >> 28) == 4) {
+			size = 1 + (h & 0x7f);
+		} else {
+			snprintf(out, outSize, "not a packet at dword %u (%#x)", at, h);
+			return;
+		}
+		if (position < at + size) {
+			const char * name = t7 ? packetName(op) : "register writes";
+
+			if (name != NULL) {
+				snprintf(out, outSize, "%s (dword %u of %u, packet of %u)", name, position - at, words, size);
+			} else {
+				snprintf(out, outSize, "opcode %#x (dword %u of %u, packet of %u)", op, position - at, words, size);
+			}
+			return;
+		}
+		at += size;
+	}
+}
+
+static void
+busyWaitLook(void)
+{
+	static const char * const blocks[24] = { "CX-AHB", "CP-AHB", "CP", "DBGC", "VBIF", "TSE", "RAS", "RB", "CCU", "A2D", "LRZ", "COM_DCOM",
+		"PC_DCALL", "PC_VSD", "TESS", "VFD", "VPC", "UCHE", "SP", "TPL1", "VSC", "HLSQ", "GPU-ign-CP", "GPU-ign" };
+	uint32_t last, head;
+	uint64_t now, ns, t[8], f[8];
+
+	if (!gBusyWaitOn) {
+		return;
+	}
+	last = hakios_gpu_last();
+	if (last == 0 || hakios_gpu_done(last)) {
+		gBusyWaitLast = 0;
+		return;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+	for (head = last; head > 1 && head > last - (GPU_SUBLOG - 1) && !hakios_gpu_done(head - 1); head--) {
+	}
+	struct gpu_sublog * s = &gSubLog[head % GPU_SUBLOG];
+
+	if (s->fence != head) {
+		return;
+	}
+	/* the ring held by a program that is not the window server while the window server has a submission behind it: the time since the last look */
+	if (gBusyWaitLast != 0 && !s->window_server) {
+		bool behind = false;
+
+		for (uint32_t g = head + 1; g <= last && g - head < GPU_SUBLOG; g++) {
+			behind = behind || (gSubLog[g % GPU_SUBLOG].fence == g && gSubLog[g % GPU_SUBLOG].window_server);
+		}
+		if (behind) {
+			uint64_t dt = MIN(now - gBusyWaitLast, 10 * NSEC_PER_MSEC);
+			int slot = -1;
+
+			for (int i = 0; i < 8; i++) {
+				if (gHeld[i].name[0] != 0 && strncmp(gHeld[i].name, s->name, 16) == 0) {
+					slot = i;
+					break;
+				}
+				if (slot < 0 && gHeld[i].name[0] == 0) {
+					slot = i;
+				}
+			}
+			if (slot >= 0) {
+				strlcpy(gHeld[slot].name, s->name, sizeof(gHeld[slot].name));
+				gHeld[slot].ns += dt;
+			}
+		}
+	}
+	gBusyWaitLast = now;
+	hakios_gpu_fence_times(head, f);
+	if (f[2] == 0 || now - f[2] < 20 * NSEC_PER_MSEC || now - gBusyWaitAt < 20 * NSEC_PER_MSEC || gBusyWaitLines >= 300) {
+		return;
+	}
+	ns = now - f[2];
+	gBusyWaitAt = now;
+	gBusyWaitLines++;
+	hakios_gpu_sample(t);
+	{
+		char busy[200] = "", in1[120] = "?", in2[120] = "?";
+		size_t n = 0;
+		uint32_t queued = 0, mine = 0;
+
+		for (int b = 0; b < 24; b++) {
+			if ((t[0] >> b) & 1) {
+				n += (size_t) snprintf(busy + n, sizeof(busy) - n, " %s", blocks[b]);
+			}
+		}
+		for (uint32_t i = 0; i < s->count && i < 4; i++) {
+			if (t[1] >= s->address[i] && t[1] < s->address[i] + 4ull * s->words[i] + 4) {
+				uint32_t position = s->words[i] >= t[2] ? (uint32_t) (s->words[i] - t[2]) : 0;
+
+				packetAt(s->kernel[i], s->words[i], position, in1, sizeof(in1));
+			}
+		}
+		if (t[3] != 0) {
+			snprintf(in2, sizeof(in2), "ib2 at %#llx, %llu dwords to read", t[3], t[4]);
+		} else {
+			snprintf(in2, sizeof(in2), "no ib2");
+		}
+		for (uint32_t g = head + 1; g <= last && g - head < GPU_SUBLOG; g++) {
+			queued++;
+			mine += (gSubLog[g % GPU_SUBLOG].fence == g && gSubLog[g % GPU_SUBLOG].window_server) ? 1 : 0;
+		}
+		IOLog("HakiosGPU: gpu busy-wait: executing %s pid %u submission %u for %llu ms (ring write to now); rbbm %#llx, blocks busy:%s; ib1 at %#llx with %llu dwords "
+		    "to read, in %s; %s; rptr %llu wptr %llu; %u submissions behind it, %u of the window server's\n", s->name, s->pid, head, ns / NSEC_PER_MSEC, t[0], busy, t[1], t[2], in1,
+		    in2, t[5], t[7], queued, mine);
+	}
+}
+
 /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
 static bool
 gpuWait(uint32_t fence, uint64_t milliseconds)
@@ -350,6 +539,7 @@ gpuWait(uint32_t fence, uint64_t milliseconds)
 		}
 		IOLockLock(gGPULock);
 		hakios_gpu_watchdog();
+		busyWaitLook();
 	}
 	/*
 	 * A wait of a second or more that came to nothing: the core has stopped answering. What it
@@ -499,6 +689,7 @@ HakiosGPUStart(void)
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
 	(void)PE_parse_boot_argn("gpu_fair_ms", &gGPUFairMs, sizeof(gGPUFairMs));
 	(void)PE_parse_boot_argn("gpu_prio", &gGPUPrioMs, sizeof(gGPUPrioMs));
+	(void)PE_parse_boot_argn("gpu_busywait", &gBusyWaitOn, sizeof(gBusyWaitOn));
 	gGPUPrioMs = MIN(gGPUPrioMs, 200u);
 	hakios_cputop_start();                         /* (boot-arg cputop=S: who the CPUs work for; bsd/dev/board/cputop.c) */
 	gGPUFairMs = MIN(gGPUFairMs, 500u);             /* (a wait of a second is taken for a GPU that has stopped: gpuWait) */
@@ -600,6 +791,8 @@ class HakiosGPUUserClient : public IOUserClient
 	uint32_t                fFlushes;               /* submissions that pushed buffers out of the cache (gpu_buffer.flushed; never 0) */
 	uint32_t                fStrangers;             /* requests that named a buffer the client does not have */
 	uint32_t                fLastFence;             /* this client's last submission */
+	char                    fProcName[17];
+	uint32_t                fPid;
 	bool                    fYields;                /* ... which the next waits for (gpu_fair_ms): not the window server */
 	struct gpu_left         fLeft[GPU_LEFT];
 	uint32_t                fLeftCount;
@@ -659,6 +852,8 @@ HakiosGPUUserClient::start(IOService * provider)
 
 		proc_name(proc_selfpid(), name, sizeof(name));
 		fYields = strcmp(name, "backboardd") != 0;
+		strlcpy(fProcName, name, sizeof(fProcName));
+		fPid = (uint32_t) proc_selfpid();
 	}
 	return fBuffers != NULL;
 }
@@ -1483,6 +1678,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 	struct msm_gem_submit_bo * bos = NULL;
 	struct msm_gem_submit_cmd * cmds = NULL;
 	uint64_t addresses[GPU_SUBMIT_CMDS];
+	const uint8_t * kernels[GPU_SUBMIT_CMDS];
 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
 	uint64_t began, nanos, again, enteredNs;
 	IOReturn ret = kIOReturnBadArgument;
@@ -1644,6 +1840,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			goto out;
 		}
 		addresses[count] = b->address + cmds[i].submit_offset;
+		kernels[count] = b->kernel != NULL ? b->kernel + cmds[i].submit_offset : NULL;
 		words[count++] = cmds[i].size / 4;
 	}
 	if (count == 0) {
@@ -1672,6 +1869,20 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		gGPUReported = !hakios_gpu_recover();
 		if (!gGPUReported) {
 			request->fence = hakios_gpu_submit(addresses, words, count);
+		}
+	}
+	if (request->fence != 0) {
+		struct gpu_sublog * log = &gSubLog[request->fence % GPU_SUBLOG];
+
+		log->fence = request->fence;
+		log->pid = fPid;
+		log->window_server = !fYields;
+		strlcpy(log->name, fProcName, sizeof(log->name));
+		log->count = count;
+		for (uint32_t i = 0; i < count && i < 4; i++) {
+			log->address[i] = addresses[i];
+			log->words[i] = words[i];
+			log->kernel[i] = kernels[i];
 		}
 	}
 	/* (after the submission given again, too: clientClose() and gpu_fair_ms wait for this one) */
@@ -1755,6 +1966,20 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
 		    fBufferBytes >> 20, gGPUStat.shownWaits);
+		{
+			char held[200] = "";
+			size_t n = 0;
+
+			for (int i = 0; i < 8; i++) {
+				if (gHeld[i].name[0] != 0 && gHeld[i].ns != 0) {
+					n += (size_t) snprintf(held + n, sizeof(held) - n, " %s %llu ms", gHeld[i].name, gHeld[i].ns / NSEC_PER_MSEC);
+					gHeld[i].ns = 0;
+				}
+			}
+			if (n != 0) {
+				IOLog("HakiosGPU: gpu ring held while the window server had a submission behind it, in these 5 s:%s\n", held);
+			}
+		}
 		if (gGPUPrioMs != 0) {
 			uint64_t waited;
 
