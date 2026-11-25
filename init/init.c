@@ -1282,6 +1282,23 @@ kernel_built(void)
 	return build_date_floor(version);
 }
 
+/*
+ * Where the processes Metal is shown that are not root keep their compiled shader stages across boots: each makes its own
+ * directory (0700, its uid) in this one, as in /tmp -- sticky, writable by all. /private/var/db itself is root's: SpringBoard
+ * and iconservicesagent (mobile) could not make HakiosMetalCA.m's cache there and fell back on /var/tmp, which var_store
+ * leaves out, so they compiled every stage again at every boot (iconservicesagent ~45 s of processor a run, 25 November).
+ */
+static void
+metal_cache_parent(void)
+{
+	const char *dir = "/private/var/db/hakios-metal-caches";
+
+	mkdir(dir, 01777);
+	if (chmod(dir, 01777) != 0) {
+		printf("init: %s: %s\n", dir, strerror(errno));
+	}
+}
+
 static void
 clock_floor(void)
 {
@@ -2160,6 +2177,7 @@ main(int argc, char **argv, char **envp)
 	show_system();
 	mount_writable();
 	restore_var();
+	metal_cache_parent();
 	clock_floor();
 	clock_rtc();
 	forget_old_modulation();

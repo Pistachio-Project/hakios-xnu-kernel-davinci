@@ -2515,9 +2515,16 @@ hm_own_cache_dir(const char *dir)
 		char mine[64];
 		const char *dir = NULL;
 
+		char kept[80];
+
+		/* (a user's own directory in /private/var/db/hakios-metal-caches, which init makes sticky and writable by all:
+		 * kept across boots by var_store as HM_CACHE_DIR is, where /var/tmp is not) */
+		snprintf(kept, sizeof(kept), "/private/var/db/hakios-metal-caches/%u", (unsigned)geteuid());
 		snprintf(mine, sizeof(mine), "/var/tmp/hakios-metal-cache-%u", (unsigned)geteuid());
 		if (hm_own_cache_dir(HM_CACHE_DIR)) {
 			dir = HM_CACHE_DIR;
+		} else if (hm_own_cache_dir(kept)) {
+			dir = kept;
 		} else if (hm_own_cache_dir("/var/tmp/hakios-metal-cache")) {
 			dir = "/var/tmp/hakios-metal-cache";
 		} else if (hm_own_cache_dir(mine)) {
