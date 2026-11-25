@@ -597,10 +597,11 @@ class GroupCache {
 public:
     // a draw begins: nothing pending
     void begin();
-    // PROGRAM_KEY: what the program and the pass's options decide, which a group's key may start with (the caller sets it once a draw)
+    // PROGRAM_KEY: what the program and the pass's options decide, which a group's key may start with (the caller sets it once a
+    // draw); the cache numbers the keys it has seen, so that a group's key is that number and its own extra bytes
     void setProgramKey(const void* key, size_t n);
-    // whether group G must be encoded into out[G] for a draw with this key (EXTRA after the program key if WITH_PROGRAM);
-    // false: the cache knows its words
+    // whether group G must be encoded into out[G] for a draw with this key (the program key's number and EXTRA if
+    // WITH_PROGRAM); false: the cache knows its words
     bool need(uint32_t g, bool withProgram, const void* extra, size_t n);
     pm4::Stream out[kGroupCount];
     // the words the draw needs, written to TO (before the draw's own stream), and what the cache holds noted for the next draw
@@ -616,7 +617,8 @@ private:
     struct Delta { int from; std::vector<uint32_t> words; };   // [reg, count, values...]*
     struct Entry {
         uint64_t hash;
-        std::vector<uint8_t> key;
+        int program;                   // the program key's number, -1 for a group that has none
+        std::vector<uint8_t> key;      // the group's own bytes
         std::vector<uint32_t> words;   // the group's writes in order, [reg, count, values...]*
         std::vector<Delta> deltas;
     };
@@ -624,14 +626,16 @@ private:
         std::vector<Entry> entries;
         int last = -1;
     };
+    struct ProgramKey { uint64_t hash; std::vector<uint8_t> bytes; };
     static constexpr int kSame = -1, kNew = -2;
-    static constexpr size_t kMaxEntries = 96;
+    static constexpr size_t kMaxEntries = 96, kMaxPrograms = 256;
     G g_[kGroupCount];
     int pending_[kGroupCount] = {-1, -1, -1, -1, -1, -1};
     uint64_t newHash_[kGroupCount] = {};
+    int newProgram_[kGroupCount] = {};
     std::vector<uint8_t> newKey_[kGroupCount];
-    std::vector<uint8_t> programKey_, scratch_;
-    uint64_t programHash_ = 0;
+    std::vector<ProgramKey> programs_;
+    int programId_ = 0;
     const std::vector<uint32_t>& delta(G& grp, int from, int to);
 };
 

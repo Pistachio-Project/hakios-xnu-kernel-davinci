@@ -2275,31 +2275,41 @@ void GroupCache::begin() {
 }
 
 void GroupCache::setProgramKey(const void* key, size_t n) {
-    programKey_.assign(static_cast<const uint8_t*>(key), static_cast<const uint8_t*>(key) + n);
-    programHash_ = hashBytes(key, n);
+    const uint64_t h = hashBytes(key, n);
+    if (programId_ < int(programs_.size())) {
+        const ProgramKey& cur = programs_[size_t(programId_)];
+        if (cur.hash == h && cur.bytes.size() == n && memcmp(cur.bytes.data(), key, n) == 0) return;   // (the last draw's program, most often)
+    }
+    for (size_t i = 0; i < programs_.size(); i++) {
+        if (programs_[i].hash == h && programs_[i].bytes.size() == n && memcmp(programs_[i].bytes.data(), key, n) == 0) {
+            programId_ = int(i);
+            return;
+        }
+    }
+    if (programs_.size() >= kMaxPrograms) reset();   // (the entries name programs by number)
+    programs_.push_back(ProgramKey{h, std::vector<uint8_t>(static_cast<const uint8_t*>(key), static_cast<const uint8_t*>(key) + n)});
+    programId_ = int(programs_.size()) - 1;
 }
 
 bool GroupCache::need(uint32_t g, bool withProgram, const void* extra, size_t n) {
     G& grp = g_[g];
-    const size_t pn = withProgram ? programKey_.size() : 0;
-    scratch_.resize(pn + n);
-    if (pn != 0) memcpy(scratch_.data(), programKey_.data(), pn);
-    if (n != 0) memcpy(scratch_.data() + pn, extra, n);
-    const uint64_t h = hashBytes(extra, n, withProgram ? programHash_ : 0x9e3779b97f4a7c15ull) + g;
-    auto equal = [&](const Entry& e) { return e.hash == h && e.key.size() == scratch_.size() && memcmp(e.key.data(), scratch_.data(), scratch_.size()) == 0; };
+    const int program = withProgram ? programId_ : -1;
+    auto equal = [&](const Entry& e) { return e.program == program && e.key.size() == n && (n == 0 || memcmp(e.key.data(), extra, n) == 0); };
     if (grp.last >= 0 && equal(grp.entries[size_t(grp.last)])) {
         pending_[g] = kSame;
         return false;
     }
+    const uint64_t h = hashBytes(extra, n, 0x9e3779b97f4a7c15ull + uint64_t(program + 1));
     for (size_t i = 0; i < grp.entries.size(); i++) {
-        if (equal(grp.entries[i])) {
+        if (grp.entries[i].hash == h && equal(grp.entries[i])) {
             pending_[g] = int(i);
             return false;
         }
     }
     pending_[g] = kNew;
     newHash_[g] = h;
-    newKey_[g] = scratch_;
+    newProgram_[g] = program;
+    newKey_[g].assign(static_cast<const uint8_t*>(extra), static_cast<const uint8_t*>(extra) + n);
     out[g].clear();
     return true;
 }
@@ -2386,7 +2396,7 @@ void GroupCache::emit(pm4::Stream& to) {
                 grp.entries.clear();
                 grp.last = -1;
             }
-            grp.entries.push_back(Entry{newHash_[g], std::move(newKey_[g]), std::move(flat), {}});
+            grp.entries.push_back(Entry{newHash_[g], newProgram_[g], std::move(newKey_[g]), std::move(flat), {}});
             p = int(grp.entries.size()) - 1;
         }
         if (grp.last < 0) emitFlat(to, grp.entries[size_t(p)].words);
@@ -2404,6 +2414,8 @@ void GroupCache::reset() {
         g.entries.clear();
         g.last = -1;
     }
+    programs_.clear();
+    programId_ = 0;
 }
 
 void GroupCache::swap(GroupCache& o) {
