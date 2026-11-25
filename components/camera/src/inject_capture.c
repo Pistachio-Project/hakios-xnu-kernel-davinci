@@ -49,6 +49,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include "hk_trace.h"
 
 static int torch = -1;                  /* /dev/hakios-torch */
 static Class device_class, stream_class;
@@ -58,6 +59,24 @@ static unsigned level_said;
 static void
 say(const char *format, ...) __printflike(1, 2);
 static void preview_path(void);
+
+void
+hk_trace_say(const char *format, ...)
+{
+	char line[320];
+	va_list ap;
+	int n;
+
+	va_start(ap, format);
+	n = vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	if (n > (int)sizeof(line) - 1) {
+		n = (int)sizeof(line) - 1;
+	}
+	if (n > 0) {
+		write(2, line, (size_t)n);
+	}
+}
 
 static void
 say(const char *format, ...)
@@ -281,6 +300,8 @@ flashlight_init(void)
 	replace("FigFlashlightLocal", "isOverheated", "B@:", (IMP)is_overheated, NULL);
 	replace("FigCaptureThermalMonitor", "maxTorchLevel", "f@:", (IMP)max_torch_level, NULL);
 	say("hakios: cameracaptured: the flashlight is the kernel's (/dev/hakios-torch)\n");
+	/* what its clients ask of it, and when it sets itself up (the device and stream are made on its first level, not at the client's init) */
+	say("hakios: cameracaptured: tracing %u methods of FigFlashlightLocal\n", hk_trace_class(local, "server"));
 }
 
 /* ---- the camera ----------------------------------------------------------------------------------- */
