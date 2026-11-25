@@ -2118,7 +2118,7 @@ static const struct {
 	{ 610000, 320 },
 };
 #define GPU_SPEEDS              ((uint32_t)(sizeof(gpu_speeds) / sizeof(gpu_speeds[0])))
-static uint32_t gpu_votes[GPU_SPEEDS], gpu_speed = GPU_SPEEDS - 1;
+static uint32_t gpu_votes[GPU_SPEEDS], gpu_speed = 5;        /* 565 MHz: 610 (index 6) only with adreno_speed=6 */
 /* what the GMU was last asked for (the thermal cap may lower it below gpu_speed, never raise it above); 0: not yet asked */
 static uint32_t gpu_applied;
 /* every talk to the GMU after the steps: the thermal limiter's (a618_gpu_set_cap) */
