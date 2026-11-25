@@ -64,8 +64,8 @@ void hakios_gpu_mapped(void);
 bool hakios_gpu_unmap(uint64_t address, uint64_t size);
 void hakios_gpu_to_memory(void * start, uint64_t size);
 uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
-void hakios_gpu_fence_times(uint32_t fence, uint64_t out[6]);
-void hakios_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns);
+void hakios_gpu_fence_times(uint32_t fence, uint64_t out[8]);
+void hakios_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns, uint32_t pid);
 extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
 bool hakios_gpu_irq_on(void);
@@ -211,6 +211,7 @@ struct hakios_show {
 struct hakios_fence_times {
 	uint32_t fence, pad;
 	uint64_t enter_ns, locked_ns, ring_ns, start_ns, end_ns, irq_ns;       /* the kernel's clock (mach_absolute_time, ns); 0: not known */
+	uint32_t ahead, ahead_other, pid, pad2;                                /* in the ring ahead of it, of which another program's; its program */
 };
 struct hakios_worked {
 	uint64_t microseconds;                  /* the core's own time on the submissions counted here */
@@ -267,6 +268,14 @@ static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
  * submissions is ahead of the window server's next. (0: off.)
  */
 static uint32_t gGPUFairMs;
+/*
+ * boot-arg gpu_prio=N (default 30; 0: off): the core has one ring and no preemption, so what another program has put in it is ahead of the
+ * window server's next frame whatever it is. A program but the window server (backboardd) hands the core a submission only when at
+ * most one is unfinished, or after N ms: what is ahead of the window server's frame is then one submission at most. (SLOW CB path
+ * lines of run 204332: 5 s of the slow buffers' time was between the ring write and the core's start.)
+ */
+static uint32_t gGPUPrioMs = 30;
+static uint64_t gGPUPrioWaits, gGPUPrioWaited;
 extern "C" void hakios_cputop_start(void);
 static uint64_t gGPUFairWaits, gGPUFairWaited;  /* submissions that waited so, and for how long together (absolute time) */
 static TUNABLE(uint32_t, gGPUClientSnapshot, "gpu_client_snapshot", 1);
@@ -477,6 +486,8 @@ HakiosGPUStart(void)
 
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
 	(void)PE_parse_boot_argn("gpu_fair_ms", &gGPUFairMs, sizeof(gGPUFairMs));
+	(void)PE_parse_boot_argn("gpu_prio", &gGPUPrioMs, sizeof(gGPUPrioMs));
+	gGPUPrioMs = MIN(gGPUPrioMs, 200u);
 	hakios_cputop_start();                         /* (boot-arg cputop=S: who the CPUs work for; bsd/dev/board/cputop.c) */
 	gGPUFairMs = MIN(gGPUFairMs, 500u);             /* (a wait of a second is taken for a GPU that has stopped: gpuWait) */
 	gGPULock = IOLockAlloc();
@@ -1515,6 +1526,17 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		gGPUFairWaits++;
 		gGPUFairWaited += mach_absolute_time() - waited;
 	}
+	if (gGPUPrioMs != 0 && fYields) {
+		/* gpu_prio: wait until at most one submission is unfinished (the last's predecessor done), not longer than gpu_prio ms */
+		uint32_t last = hakios_gpu_last();
+		uint64_t waited = mach_absolute_time();
+
+		if (last >= 2 && !hakios_gpu_done(last - 1)) {
+			(void)gpuWait(last - 1, gGPUPrioMs);
+			gGPUPrioWaits++;
+			gGPUPrioWaited += mach_absolute_time() - waited;
+		}
+	}
 	/*
 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
@@ -1624,7 +1646,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		uint64_t lockedNs;
 
 		absolutetime_to_nanoseconds(mach_absolute_time(), &lockedNs);
-		hakios_gpu_note_enter(enteredNs, lockedNs);   /* (lockedNs: when the work before the ring was done under the lock, the lock itself got earlier) */
+		hakios_gpu_note_enter(enteredNs, lockedNs, (uint32_t)proc_selfpid());   /* (lockedNs: when the work before the ring was done under the lock, the lock itself got earlier) */
 	}
 	request->fence = hakios_gpu_submit(addresses, words, count);
 	/*
@@ -1721,6 +1743,14 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
 		    fBufferBytes >> 20, gGPUStat.shownWaits);
+		if (gGPUPrioMs != 0) {
+			uint64_t waited;
+
+			absolutetime_to_nanoseconds(gGPUPrioWaited, &waited);
+			IOLog("HakiosGPU: %llu submissions of other programs than the window server waited for the ring to be nearly empty (gpu_prio=%u), %llu us each\n",
+			    gGPUPrioWaits, gGPUPrioMs, gGPUPrioWaits ? waited / 1000 / gGPUPrioWaits : 0);
+			gGPUPrioWaits = gGPUPrioWaited = 0;
+		}
 		if (gGPUFairMs != 0) {
 			uint64_t waited;
 
@@ -1997,13 +2027,14 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 		break;
 	}
 	case kHakiosFenceTimes: {
-		uint64_t t[6];
+		uint64_t t[8];
 
 		IOLockLock(gGPULock);
 		hakios_gpu_fence_times(r.times.fence, t);
 		IOLockUnlock(gGPULock);
 		r.times.enter_ns = t[0], r.times.locked_ns = t[1], r.times.ring_ns = t[2];
 		r.times.start_ns = t[3], r.times.end_ns = t[4], r.times.irq_ns = t[5];
+		r.times.ahead = (uint32_t)t[6], r.times.ahead_other = (uint32_t)(t[6] >> 32), r.times.pid = (uint32_t)t[7];
 		break;
 	}
 	case kHakiosShow:

@@ -565,7 +565,7 @@ const char *hakios_metal_cb_pass_sysmem_why(hakios_metal_cb *cb, unsigned i);
 /* where a slow buffer's time went, ms in 10 hops (-1: not known): commit call to submission, to the driver call, the driver call, the kernel before the
  * ring write, the ring write, ring to the core's start, the core's time, the core's end to the interrupt, the interrupt to the waiter, the waiter to the handlers;
  * 1 when the kernel's times are there */
-int hakios_metal_cb_path(hakios_metal_cb *cb, double out[10]);
+int hakios_metal_cb_path(hakios_metal_cb *cb, double out[12]);   /* ...and [10], [11]: submissions ahead in the ring at its submission, of which another program's */
 double hakios_metal_cb_pass_gap(hakios_metal_cb *cb, unsigned i);
 void hakios_metal_cb_pass_detail(hakios_metal_cb *cb, unsigned i, char *buf, size_t size);
 int hakios_metal_cb_refuse(hakios_metal_cb *cb, const char *why);

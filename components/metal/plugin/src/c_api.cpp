@@ -12,6 +12,9 @@
 
 #include <cstdio>
 #include <cstring>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #include <functional>
 #include <optional>
 #include <vector>
@@ -94,6 +97,13 @@ private:
     struct Job { std::shared_ptr<std::atomic<int>> pending; std::function<void()> f; };
     void run() {
         worker_ = true;
+#if defined(__APPLE__)
+        // (the recorder of the window server's frames: not behind its other threads. HAKIOS_METAL_WAITER_QOS=0 leaves it as it was)
+        {
+            const char* q = getenv("HAKIOS_METAL_WAITER_QOS");
+            if (q == nullptr || q[0] != '0') pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        }
+#endif
         std::unique_lock<std::mutex> g(m_);
         for (;;) {
             more_.wait(g, [this] { return quit_ || !q_.empty(); });
@@ -957,7 +967,7 @@ void hakios_metal_cb_set_profile(hakios_metal_cb* cb, int on) {
 
 int hakios_metal_cb_pass_time(hakios_metal_cb* cb, unsigned i, unsigned* kind, unsigned* width, unsigned* height, unsigned* draws, double* us) {
     syncOne(cb);
-    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    const std::vector<CommandBuffer::PassTime>& t = cb->cb->passTimesRef();
     if (i >= t.size()) return i == 0 ? 0 : -1;
     if (kind) *kind = t[i].kind;
     if (width) *width = t[i].width;
@@ -1059,7 +1069,7 @@ const char* hakios_metal_cb_gmem_refusal(hakios_metal_cb* cb) {
 
 double hakios_metal_cb_pass_gap(hakios_metal_cb* cb, unsigned i) {
     syncOne(cb);
-    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    const std::vector<CommandBuffer::PassTime>& t = cb->cb->passTimesRef();
     return i < t.size() ? t[i].gapUs : 0.0;
 }
 
@@ -1075,7 +1085,7 @@ const char* hakios_metal_cb_pass_sysmem_why(hakios_metal_cb* cb, unsigned i) {
 
 int hakios_metal_cb_pass_attachments(hakios_metal_cb* cb, unsigned i, unsigned* attached, unsigned* touched) {
     syncOne(cb);
-    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    const std::vector<CommandBuffer::PassTime>& t = cb->cb->passTimesRef();
     if (i >= t.size()) return -1;
     *attached = t[i].attached;
     *touched = t[i].touched;
@@ -1084,7 +1094,7 @@ int hakios_metal_cb_pass_attachments(hakios_metal_cb* cb, unsigned i, unsigned* 
 
 int hakios_metal_cb_pass_tiles(hakios_metal_cb* cb, unsigned i) {
     syncOne(cb);
-    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+    const std::vector<CommandBuffer::PassTime>& t = cb->cb->passTimesRef();
     return i < t.size() ? int(t[i].tiles) : -1;
 }
 
@@ -1804,7 +1814,7 @@ void hakios_metal_cb_commit(hakios_metal_cb* cb, void (*callback)(hakios_metal_c
     cb->cb->commit();
 }
 
-int hakios_metal_cb_path(hakios_metal_cb* cb, double out[10]) {
+int hakios_metal_cb_path(hakios_metal_cb* cb, double out[12]) {
     syncOne(cb);
     return cb->cb->pathHops(out) ? 1 : 0;
 }

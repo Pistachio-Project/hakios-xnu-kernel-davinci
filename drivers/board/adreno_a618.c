@@ -3085,8 +3085,9 @@ static struct {
  * how far to read), and the core's interrupt taken for it; with the core's own stamps of when it began (GPU_STARTS_AT) and was through
  * (GPU_TIMES_AT) in its always-on counter. a618_gpu_fence_times puts them together for the plug-in's SLOW CB lines. */
 #define GPU_STARTS_AT           0x600           /* in the scratch page: when the core began each of its last 64 submissions */
-static struct { uint64_t enter_ns, locked_ns, ring_ns, irq_ns; uint32_t fence; } gpu_path[GPU_TIMES];
+static struct { uint64_t enter_ns, locked_ns, ring_ns, irq_ns; uint32_t fence, pid, ahead, ahead_other; } gpu_path[GPU_TIMES];
 static uint64_t gpu_pending_enter_ns, gpu_pending_locked_ns;
+static uint32_t gpu_pending_pid;
 static uint32_t gpu_irq_marked;                 /* the last submission whose interrupt time is written */
 /* what the last seconds' waits that had to wait have been: noticed this long after the core was through (ns) */
 static struct {
@@ -3227,6 +3228,20 @@ a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
 		gpu_sub[slot].ticks = rd(gpu.base + CP_ALWAYS_ON_COUNTER) | (uint64_t)rd(gpu.base + CP_ALWAYS_ON_COUNTER + 4) << 32;
 		gpu_sub[slot].fence = gpu_fence;
 		gpu_path[slot].fence = gpu_fence;
+		gpu_path[slot].pid = gpu_pending_pid;
+		{
+			/* what is in the ring ahead of this one: submissions not yet done, and how many of them are another program's */
+			uint32_t ahead = 0, other = 0;
+
+			for (uint32_t f = gpu_fence - 1; ahead < GPU_TIMES - 1 && f != 0 && !a618_gpu_done(f); f--) {
+				ahead++;
+				if (gpu_path[f % GPU_TIMES].fence == f && gpu_path[f % GPU_TIMES].pid != gpu_pending_pid) {
+					other++;
+				}
+			}
+			gpu_path[slot].ahead = ahead;
+			gpu_path[slot].ahead_other = other;
+		}
 		gpu_path[slot].enter_ns = gpu_pending_enter_ns;
 		gpu_path[slot].locked_ns = gpu_pending_locked_ns;
 		gpu_path[slot].ring_ns = 0;
@@ -3277,12 +3292,12 @@ a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count
  * lock got, the ring written, the core's start and end by its always-on counter put on that clock (through the submission's own
  * pair of host time and counter), and the interrupt. */
 void
-a618_gpu_fence_times(uint32_t fence, uint64_t out[6])
+a618_gpu_fence_times(uint32_t fence, uint64_t out[8])
 {
 	uint32_t slot = fence % GPU_TIMES;
 	uint64_t start, end;
 
-	bzero(out, 6 * sizeof(uint64_t));
+	bzero(out, 8 * sizeof(uint64_t));
 	if (gpu_path[slot].fence != fence || gpu_sub[slot].fence != fence) {
 		return;
 	}
@@ -3300,12 +3315,15 @@ a618_gpu_fence_times(uint32_t fence, uint64_t out[6])
 		out[4] = gpu_sub[slot].host_ns + (end - gpu_sub[slot].ticks) * 10000 / 192;
 	}
 	out[5] = gpu_path[slot].irq_ns;
+	out[6] = (uint64_t)gpu_path[slot].ahead | (uint64_t)gpu_path[slot].ahead_other << 32;
+	out[7] = gpu_path[slot].pid;
 }
 
 /* The user client's own times for the submission it is about to make (taken by the next a618_gpu_submit). */
 void
-a618_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns)
+a618_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns, uint32_t pid)
 {
+	gpu_pending_pid = pid;
 	gpu_pending_enter_ns = enter_ns;
 	gpu_pending_locked_ns = locked_ns;
 }

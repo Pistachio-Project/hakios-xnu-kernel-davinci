@@ -7,6 +7,9 @@
 #include <map>
 #include <mutex>
 #include <cstring>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 namespace hakios::metal {
 
@@ -526,7 +529,7 @@ std::vector<CommandBuffer::DrawTime> CommandBuffer::drawTimes() const {
 
 std::string CommandBuffer::passDetail(size_t i) const {
     if (i >= profiled_.size()) return {};
-    const std::vector<PassTime> timed = passTimes();
+    const std::vector<PassTime>& timed = passTimesRef();
     const PassTime& t = timed.size() > i ? timed[i] : profiled_[i];
     std::string out = t.head;
     if (t.gapUs != 0) out += " [" + std::to_string(int(t.gapUs)) + " us after the pass before]";
@@ -540,6 +543,14 @@ std::string CommandBuffer::passDetail(size_t i) const {
     out += ":";
     for (const auto& n : t.names) out += " " + n.first + "x" + std::to_string(n.second);
     return out;
+}
+
+const std::vector<CommandBuffer::PassTime>& CommandBuffer::passTimesRef() const {
+    if (!timedCached_) {
+        timedCache_ = passTimes();
+        timedCached_ = !timedCache_.empty();
+    }
+    return timedCache_;
 }
 
 std::vector<CommandBuffer::PassTime> CommandBuffer::passTimes() const {
@@ -717,6 +728,10 @@ std::shared_ptr<CommandQueue> CommandQueue::make(Gpu& gpu, std::string* why) {
         return nullptr;
     }
     std::shared_ptr<CommandQueue> q(new CommandQueue(gpu, id));
+    {
+        const char* in = getenv("HAKIOS_METAL_INFLIGHT");
+        q->inflightLimit_ = in != nullptr && in[0] != 0 ? unsigned(strtoul(in, nullptr, 0)) : 0;
+    }
     q->thread_ = std::thread([p = q.get(), orphaned = q->orphaned_] { p->waiter(orphaned); });
     const char* pre = getenv("HAKIOS_METAL_PREFILL");
     // (on only when asked for -- the plug-in asks, unless boot-arg metal_pool_prefill=0: the host tests compare draws by the
@@ -897,6 +912,10 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     // the stream is written in order, as write-combined memory wants it, and read back by nobody
     memcpy(cb->commands_->cpu(), w.data(), 4 * w.size());
     std::unique_lock<std::mutex> g(lock_);  // the fences of one queue are handed out in commit order
+    if (inflightLimit_ != 0 && thread_.get_id() != std::this_thread::get_id()) {   // (not on the waiter's own thread: a handler's commit)
+        // (back-pressure: the waiter notifies as each buffer completes. A buffer waited for 2 s is given anyway.)
+        changed_.wait_for(g, std::chrono::seconds(2), [this] { return quit_ || inFlight_.size() < inflightLimit_; });
+    }
     // (its words are in the GPU's buffer now: the memory goes to the next command buffer, a few kept at most)
     if (spareStreams_.size() < kSpareStreams) spareStreams_.push_back(cb->stream_.release());
     cb->status_ = CommandBuffer::kCommitted;
@@ -917,6 +936,14 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
 }
 
 void CommandQueue::waiter(const std::shared_ptr<bool>& orphaned) {
+#if defined(__APPLE__)
+    // The thread that finds a buffer done and runs its handlers: at the window server's own priority (HAKIOS_METAL_WAITER_QOS=0 leaves
+    // it as it was). Woken by the core's interrupt it waited 7 to 40 ms for a core behind the window server's own busy threads.
+    {
+        const char* q = getenv("HAKIOS_METAL_WAITER_QOS");
+        if (q == nullptr || q[0] != '0') pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+#endif
     std::unique_lock<std::mutex> g(lock_);
     for (;;) {
         changed_.wait(g, [this] { return quit_ || !inFlight_.empty(); });
@@ -964,6 +991,7 @@ void CommandQueue::waiter(const std::shared_ptr<bool>& orphaned) {
         cb->finish(e == 0 ? CommandBuffer::kCompleted : CommandBuffer::kError, !poisoned);
         g.lock();
         inFlight_.pop_front();
+        changed_.notify_all();
         if (poisoned) {
             cb->owner_.reset();           // (self holds the queue to the end of this turn)
         } else if (cb->commands_ != nullptr) {
@@ -980,7 +1008,7 @@ void CommandQueue::waiter(const std::shared_ptr<bool>& orphaned) {
     }
 }
 
-bool CommandBuffer::pathHops(double out[10]) const {
+bool CommandBuffer::pathHops(double out[12]) const {
     auto ms = [](int64_t a, int64_t b) { return a != 0 && b != 0 ? double(b - a) / 1e6 : -1.0; };
     const HakiosFenceTimes& k = kernelTimes_;
     auto kms = [](uint64_t a, uint64_t b) { return a != 0 && b != 0 && b >= a ? double(b - a) / 1e6 : -1.0; };
@@ -995,6 +1023,8 @@ bool CommandBuffer::pathHops(double out[10]) const {
     // (the kernel's clock and this one are the same while the machine has not slept)
     out[8] = haveKernelTimes_ && k.irqNs != 0 ? ms(int64_t(k.irqNs), completedAt_) : -1.0;
     out[9] = ms(completedAt_, handlersAt_);
+    out[10] = haveKernelTimes_ ? double(k.ahead) : -1.0;
+    out[11] = haveKernelTimes_ ? double(k.aheadOther) : -1.0;
     return haveKernelTimes_;
 }
 

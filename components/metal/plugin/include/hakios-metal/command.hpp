@@ -246,6 +246,9 @@ public:
     const std::vector<uint32_t>& streamForTest() const { return stream_.words(); }
     size_t streamCapacity() const { return stream_.capacity(); }   // (words it holds room for: the queue's memory, takePass)
     std::vector<PassTime> passTimes() const;
+    // the same, made once and kept (the plug-in's completion handler asks pass by pass: a copy each with the detail strings was the handler's
+    // time, and the next buffer's completion was noticed after it). Only after completion: the stamps are final then.
+    const std::vector<PassTime>& passTimesRef() const;
     // why profiled pass I of a draw was drawn in sysmem ("" for a GMEM pass, or one not profiled); valid while the buffer lives
     // PassTime's what-is-in-it as one line ("" past the passes)
     std::string passDetail(size_t i) const;
@@ -278,6 +281,8 @@ private:
     uint32_t gmemClears_ = 0, gmemClearWords_[kMaxColorOutputs][4] = {};   // (draw's, for the pass it opens)
     std::string gmemWhy_;
     std::unordered_map<uint64_t, uint32_t> ordinals_;   // passes opened so far into each kind of target
+    mutable std::vector<PassTime> timedCache_;
+    mutable bool timedCached_ = false;
     std::vector<PassTime> profiled_;   // as recorded; us filled in by passTimes from the stamps
     std::shared_ptr<Buffer> profileStamps_;
     // the counter into stamp slot SLOT (two a pass: start, end), when profiling and there is room
@@ -480,7 +485,7 @@ public:
     // ms: commit call to the submission's entry; entry to the driver call (the stream copied); the driver call; in the kernel before
     // the ring write (lock and cache flush); the ring write; ring to the core's start; the core's time; the core's end to the interrupt;
     // the interrupt to the waiter's return; the waiter to the handlers. 10 numbers; false when the kernel's times are not known
-    bool pathHops(double out[10]) const;
+    bool pathHops(double out[12]) const;   // (10 hops, then the submissions ahead in the ring and of those another program's)
 private:
 };
 
@@ -495,6 +500,9 @@ public:
     // the number of command buffers held in quarantine: ones whose wait timed out with the GPU neither finishing nor
     // reset, their memory never reused (for tests and diagnostics)
     size_t quarantinedCount();
+    // at most N buffers of this queue given to the GPU at once (HAKIOS_METAL_INFLIGHT, 0: no limit): a commit past that waits on the
+    // queue's thread for the oldest to complete -- latency over depth: a buffer queued behind two others is a frame shown that much late
+    void setInflightLimit(unsigned n) { inflightLimit_ = n; }
     int64_t gpuClockNs() { return gpu_.transport().nowNs(); }
     Gpu& gpu() { return gpu_; }
     // the buffers kept for command streams, idle (to see that they are given back and used again)
@@ -582,6 +590,7 @@ private:
     bool warmQuit_ = false;
     std::unordered_map<uint64_t, std::vector<std::shared_ptr<Buffer>>> freeBuffers_;   // by size: giveSlabs', giveBuffer's
     uint64_t freeBytes_ = 0;
+    unsigned inflightLimit_ = 0;
     struct Resident { std::vector<uint32_t> words; std::shared_ptr<Buffer> buffer; };
     std::unordered_multimap<const uint32_t*, Resident> resident_;   // (under lock_) programBuffer's
     uint64_t residentBytes_ = 0;

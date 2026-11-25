@@ -40,7 +40,7 @@ enum Request : uint32_t {
 };
 
 // kHakiosFenceTimes: the kernel's clock (mach_absolute_time, ns); 0: not known
-struct HakiosFenceTimes { uint32_t fence, pad; uint64_t enterNs, lockedNs, ringNs, startNs, endNs, irqNs; };
+struct HakiosFenceTimes { uint32_t fence, pad; uint64_t enterNs, lockedNs, ringNs, startNs, endNs, irqNs; uint32_t ahead, aheadOther, pid, pad2; };
 struct MsmTimespec { int64_t seconds, nanoseconds; };
 struct MsmParam { uint32_t pipe, param; uint64_t value; uint32_t len, pad; };
 struct MsmGemNew { uint64_t size; uint32_t flags, handle; };

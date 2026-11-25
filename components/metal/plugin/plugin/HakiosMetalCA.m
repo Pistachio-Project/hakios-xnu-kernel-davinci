@@ -2546,6 +2546,16 @@ hm_own_cache_dir(const char *dir)
 		}
 	}
 	setenv("HAKIOS_METAL_LISTING", "0", 0);
+	{   /* boot-arg metal_inflight=N: at most N buffers on the GPU at once from a queue (default 0: no limit) */
+		char args[1024] = "";
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_inflight=")) != NULL) {
+			setenv("HAKIOS_METAL_INFLIGHT", at + strlen("metal_inflight=") , 1);   /* (to the next space, atoi-style: strtoul stops there) */
+		}
+		if (hm_boot_arg_set("metal_waiter_qos=0")) setenv("HAKIOS_METAL_WAITER_QOS", "0", 1);
+	}
 	if (hm_boot_arg_set("metal_tex_pool=0")) setenv("HAKIOS_METAL_TEXPOOL_MB", "0", 1);
 	/* (on unless boot-arg metal_pool_prefill=0. It was off for one run, after a panic in vm_purgeable_object_remove that the pool
 	 * was suspected of; the modem's RMTFS buffer DMAing into kernel RAM (09576816) explains it. Heavy windows of the run before
@@ -6903,13 +6913,14 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 								 "and the wake-up's own delay)\n", hm_now(), latency * 1e3, cbPasses, cbPassUs / 1e3, cbGapUs / 1e3,
 								 latency * 1e3 - cbPassUs / 1e3 - cbGapUs / 1e3);
 							{
-								double h[10];
+								double h[12];
 
 								if (hakios_metal_cb_path(cb, h)) {
 									hm_print("fps: ... SLOW CB path (ms): commit call to submission %.1f, to the driver call %.1f, the driver call %.1f "
 										 "(in the kernel: lock and flush %.1f, ring write %.1f); ring to the core's start %.1f; the core %.1f; "
-										 "its end to the interrupt %.1f; interrupt to the waiter %.1f; waiter to the handlers %.1f\n",
-										 h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9]);
+										 "its end to the interrupt %.1f; interrupt to the waiter %.1f; waiter to the handlers %.1f; in the ring ahead of it when given: %.0f, of "
+										 "which another program's %.0f\n",
+										 h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11]);
 								}
 							}
 						}

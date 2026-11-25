@@ -137,8 +137,8 @@ void a618_gpu_noticed(uint32_t fence);
 uint32_t a618_gpu_last(void);
 void a618_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
 uint32_t a618_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
-void a618_gpu_fence_times(uint32_t fence, uint64_t out[6]);
-void a618_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns);
+void a618_gpu_fence_times(uint32_t fence, uint64_t out[8]);
+void a618_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns, uint32_t pid);
 void a618_gpu_report(const char *why);
 bool a618_gpu_recover(void);
 void a618_adreno_minute(void);
@@ -3735,20 +3735,20 @@ hakios_gpu_done(uint32_t fence)
 
 /* The path of a submission (a618_gpu_fence_times); zeros for a core that does not keep it. */
 void
-hakios_gpu_fence_times(uint32_t fence, uint64_t out[6])
+hakios_gpu_fence_times(uint32_t fence, uint64_t out[8])
 {
 	if (gpu_is_a618()) {
 		a618_gpu_fence_times(fence, out);
 	} else {
-		bzero(out, 6 * sizeof(uint64_t));
+		bzero(out, 8 * sizeof(uint64_t));
 	}
 }
 
 void
-hakios_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns)
+hakios_gpu_note_enter(uint64_t enter_ns, uint64_t locked_ns, uint32_t pid)
 {
 	if (gpu_is_a618()) {
-		a618_gpu_note_enter(enter_ns, locked_ns);
+		a618_gpu_note_enter(enter_ns, locked_ns, pid);
 	}
 }
 
