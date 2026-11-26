@@ -19,6 +19,10 @@
 #include <kern/sched.h>
 #include <kern/queue.h>
 #include <kern/locks.h>
+#include <kern/policy_internal.h>
+#include <kern/thread_group.h>
+#include <kern/sched_clutch.h>
+#include <mach/task_policy.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <os/atomic_private.h>
@@ -38,14 +42,6 @@ static const char *const bucket_name[TH_BUCKET_SCHED_MAX] = {
 	[TH_BUCKET_FIXPRI] = "FIX", [TH_BUCKET_SHARE_FG] = "FG", [TH_BUCKET_SHARE_IN] = "IN",
 	[TH_BUCKET_SHARE_DF] = "DF", [TH_BUCKET_SHARE_UT] = "UT", [TH_BUCKET_SHARE_BG] = "BG",
 };
-
-static const char *const targets[2] = { "backboardd", "SpringBoard" };
-
-struct snap {
-	uint64_t tid;
-	uint64_t t[2];
-};
-static struct snap snaps[2][AMP_THREADS];
 
 static void
 amp_say(const char *line)
@@ -82,73 +78,203 @@ find_task(const char *name)
 	return found;
 }
 
-/* the line of a process's busiest threads since the last one */
+/*
+ * The sampler (boot-arg amp_samp=MS, default 2; 0: none): every MS it looks at what each processor runs and
+ * counts, per process (by its task pointer, resolved to a name only when a line is made), the samples by
+ * scheduling bucket on P and on E. The thread it reads is never dereferenced beyond its bucket and task.
+ */
+#define AMP_TASKS 128
+static struct { task_t task; uint16_t n[2][TH_BUCKET_SCHED_MAX]; } samp[AMP_TASKS];
+static uint32_t samp_ms = 2;
+static uint64_t samp_unit_us;   /* the length of a sample of the last 5 s, in us */
+
 static void
-report_task(int which, uint64_t window)
+sample_once(void)
 {
-	struct { uint64_t tid, cum[2], d[2], total; } cur[AMP_THREADS];
-	unsigned int n = 0;
-	task_t task = find_task(targets[which]);
-	char line[240];
-	int at;
+	thread_t self = current_thread();
 
-	if (task == TASK_NULL) {
-		return;
-	}
-	task_lock(task);
-	thread_t th;
-	queue_iterate(&task->threads, th, thread_t, task_threads) {
-		if (n >= AMP_THREADS) {
-			break;
+	for (int cpu = 0; cpu <= ml_get_max_cpu_number() && cpu < MAX_CPUS; cpu++) {
+		processor_t pr = processor_array[cpu];
+		thread_t th;
+		struct thread_ro *tro;
+		task_t task;
+		unsigned int e, b, i;
+
+		if (pr == PROCESSOR_NULL || pr->processor_set == PROCESSOR_SET_NULL) {
+			continue;
 		}
-		cur[n].tid = th->thread_id;
-		cur[n].cum[0] = th->hk_cluster_time[0];
-		cur[n].cum[1] = th->hk_cluster_time[1];
-		n++;
-	}
-	task_unlock(task);
-	task_deallocate(task);
-
-	for (unsigned int i = 0; i < n; i++) {
-		const struct snap *s = NULL;
-
-		for (unsigned int j = 0; j < AMP_THREADS; j++) {
-			if (snaps[which][j].tid == cur[i].tid) {
-				s = &snaps[which][j];
+		th = pr->active_thread;
+		if (th == THREAD_NULL || th == self || (th->state & TH_IDLE) || (tro = th->t_tro) == NULL ||
+		    (task = tro->tro_task) == TASK_NULL) {
+			continue;
+		}
+		b = th->th_sched_bucket;
+		if (b >= TH_BUCKET_SCHED_MAX) {
+			continue;
+		}
+		e = pr->processor_set->pset_type == PSET_AMP_E;
+		for (i = 0; i < AMP_TASKS && samp[i].task != task; i++) {
+			if (samp[i].task == TASK_NULL) {
+				samp[i].task = task;
 				break;
 			}
 		}
-		cur[i].d[0] = cur[i].cum[0] - (s ? s->t[0] : 0);
-		cur[i].d[1] = cur[i].cum[1] - (s ? s->t[1] : 0);
-		cur[i].total = cur[i].d[0] + cur[i].d[1];
+		if (i < AMP_TASKS) {
+			samp[i].n[e][b]++;
+		}
 	}
-	bzero(snaps[which], sizeof(snaps[which]));
-	for (unsigned int i = 0; i < n; i++) {
-		snaps[which][i].tid = cur[i].tid;
-		snaps[which][i].t[0] = cur[i].cum[0];
-		snaps[which][i].t[1] = cur[i].cum[1];
+}
+
+/* is this task still there; if so its name, pid and role (the tasks lock held) */
+static bool
+task_info_locked(task_t want, char *name, size_t len, int *role)
+{
+	task_t t;
+
+	queue_iterate(&tasks, t, task_t, tasks) {
+		if (t == want) {
+			const char *n = task_best_name(t);
+
+			strlcpy(name, n ? n : "?", len);
+			*role = proc_get_effective_task_policy(t, TASK_POLICY_ROLE);
+			return true;
+		}
 	}
+	return false;
+}
 
-	at = snprintf(line, sizeof(line), "amp: %s ms tid:P/E in %llu ms:", targets[which], to_ms(window));
-	for (int rank = 0; rank < 3; rank++) {
-		unsigned int best = n;
-		uint64_t best_total = 0;
+static void
+report_top(uint64_t window)
+{
+	char line[300];
 
-		for (unsigned int i = 0; i < n; i++) {
-			if (cur[i].total > best_total) {
-				best_total = cur[i].total;
+	for (int rank = 0; rank < 10; rank++) {
+		unsigned int best = AMP_TASKS;
+		uint32_t best_p = 0;
+		char name[20] = "?";
+		int role = -1, at;
+
+		for (unsigned int i = 0; i < AMP_TASKS && samp[i].task != TASK_NULL; i++) {
+			uint32_t p = 0;
+
+			for (int b = 0; b < TH_BUCKET_SCHED_MAX; b++) {
+				p += samp[i].n[0][b];
+			}
+			if (p > best_p) {
+				best_p = p;
 				best = i;
 			}
 		}
-		if (best == n) {
+		if (best == AMP_TASKS) {
 			break;
 		}
-		at += snprintf(line + at, sizeof(line) - at, " %llx:%llu/%llu", cur[best].tid & 0xffffff, to_ms(cur[best].d[0]),
-		    to_ms(cur[best].d[1]));
-		cur[best].total = 0;
+		lck_mtx_lock(&tasks_threads_lock);
+		if (!task_info_locked(samp[best].task, name, sizeof(name), &role)) {
+			strlcpy(name, "(gone)", sizeof(name));
+		}
+		lck_mtx_unlock(&tasks_threads_lock);
+		at = snprintf(line, sizeof(line), "amp: top%d %s role %d P ms", rank, name, role);
+		for (int w = 0; w < 2; w++) {
+			for (int b = 0; b < TH_BUCKET_SCHED_MAX; b++) {
+				at += snprintf(line + at, sizeof(line) - at, "%s%llu", b == 0 ? (w ? " | E ms " : " ") : "/", (unsigned long long)samp[best].n[w][b] * samp_unit_us / 1000);
+				samp[best].n[w][b] = 0;
+			}
+		}
+		snprintf(line + at, sizeof(line) - at, " (FIX/FG/IN/DF/UT/BG)\n");
+		amp_say(line);
 	}
-	snprintf(line + at, sizeof(line) - at, "\n");
-	amp_say(line);
+	(void)window;
+	bzero(samp, sizeof(samp));
+}
+
+/*
+ * Boot-arg amp_ui=1 (2): the thread groups of processes that are not "the UI" have their DF (default QoS)
+ * work prefer the E pset, so that the P cluster is left to UI work (FIX, FG, IN) when it is saturated. The UI
+ * is: kernel_task, backboardd, SpringBoard, and (1) a process whose task role is foreground, control or
+ * graphics server; with 2 the names and the foreground role only. A thread group of both is UI.
+ * Redone every 500 ms (new processes, a new frontmost app). A group the policy once moved is put back by it.
+ */
+static uint32_t ui_mode;
+#define AMP_TGS 192
+
+static bool
+task_is_ui(task_t t)
+{
+	const char *n = task_best_name(t);
+	int role = proc_get_effective_task_policy(t, TASK_POLICY_ROLE);
+
+	if (t == kernel_task || (n && (strncmp(n, "backboardd", 16) == 0 || strncmp(n, "SpringBoard", 16) == 0))) {
+		return true;
+	}
+	if (role == TASK_FOREGROUND_APPLICATION) {
+		return true;
+	}
+	return ui_mode == 1 && (role == TASK_CONTROL_APPLICATION || role == TASK_GRAPHICS_SERVER);
+}
+
+static uint32_t ui_demoted;     /* thread groups with their DF at E at the last look */
+
+static void
+ui_policy_apply(void)
+{
+	static struct { struct thread_group *tg; bool ui; } tgs[AMP_TGS];
+	unsigned int n = 0;
+	pset_id_t e_pset = PSET_ID_INVALID, p_pset = PSET_ID_INVALID;
+	task_t t;
+
+	for (pset_id_t id = 0; id < sched_num_psets; id++) {
+		if (pset_array[id] != PROCESSOR_SET_NULL) {
+			if (pset_array[id]->pset_type == PSET_AMP_E && e_pset == PSET_ID_INVALID) {
+				e_pset = id;
+			} else if (pset_array[id]->pset_type == PSET_AMP_P && p_pset == PSET_ID_INVALID) {
+				p_pset = id;
+			}
+		}
+	}
+	if (e_pset == PSET_ID_INVALID || p_pset == PSET_ID_INVALID) {
+		return;
+	}
+	bzero(tgs, sizeof(tgs));
+	lck_mtx_lock(&tasks_threads_lock);
+	queue_iterate(&tasks, t, task_t, tasks) {
+		bool ui = task_is_ui(t);
+		thread_t th;
+
+		task_lock(t);
+		queue_iterate(&t->threads, th, thread_t, task_threads) {
+			struct thread_group *tg = thread_group_get(th);
+			unsigned int i;
+
+			if (tg == NULL) {
+				continue;
+			}
+			for (i = 0; i < n && tgs[i].tg != tg; i++) {
+			}
+			if (i == n) {
+				if (n >= AMP_TGS) {
+					continue;
+				}
+				tgs[n].tg = thread_group_retain(tg);
+				tgs[n].ui = false;
+				n++;
+			}
+			tgs[i].ui |= ui;
+		}
+		task_unlock(t);
+	}
+	lck_mtx_unlock(&tasks_threads_lock);
+
+	ui_demoted = 0;
+	for (unsigned int i = 0; i < n; i++) {
+		pset_id_t want[TH_BUCKET_SCHED_MAX];
+
+		for (int b = 0; b < TH_BUCKET_SCHED_MAX; b++) {
+			want[b] = (b == TH_BUCKET_SHARE_UT || b == TH_BUCKET_SHARE_BG || (b == TH_BUCKET_SHARE_DF && !tgs[i].ui)) ? e_pset : p_pset;
+		}
+		ui_demoted += !tgs[i].ui;
+		sched_edge_tg_preferred_pset_change(tgs[i].tg, want, 0);
+		thread_group_release(tgs[i].tg);
+	}
 }
 
 static void
@@ -156,14 +282,31 @@ amp_thread(void *arg __unused, wait_result_t wr __unused)
 {
 	const ml_topology_info_t *topology = ml_get_topology_info();
 	uint64_t idle_before[MAX_CPUS] = { 0 }, then = mach_absolute_time();
-	uint64_t bucket_before[2][TH_BUCKET_SCHED_MAX] = { { 0 } };
+	uint64_t bucket_before[2][TH_BUCKET_SCHED_MAX] = { { 0 } }, ui_ticks;
+
+	nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &ui_ticks);
 
 	for (;;) {
 		char line[300];
 		uint64_t now, ns, busy[MAX_CPU_TYPES] = { 0 }, total[MAX_CPU_TYPES] = { 0 };
 		int at;
 
-		delay_for_interval(AMP_PERIOD_MS, NSEC_PER_MSEC);
+		uint64_t loops = 0, last_ui = 0, end_ns, now_ns;
+
+		clock_interval_to_deadline(AMP_PERIOD_MS, NSEC_PER_MSEC, &end_ns);
+		do {
+			delay_for_interval(samp_ms ? samp_ms : 250, NSEC_PER_MSEC);
+			loops++;
+			if (samp_ms) {
+				sample_once();
+			}
+			now_ns = mach_absolute_time();
+			if (ui_mode && now_ns - last_ui >= ui_ticks) {
+				last_ui = now_ns;
+				ui_policy_apply();
+			}
+		} while (now_ns < end_ns);
+		samp_unit_us = loops ? (uint64_t)AMP_PERIOD_MS * 1000 / loops : 0;
 		now = mach_absolute_time();
 		for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
 			uint64_t idle = 0, b;
@@ -189,10 +332,11 @@ amp_thread(void *arg __unused, wait_result_t wr __unused)
 			bucket_before[0][b] = p;
 			bucket_before[1][b] = e;
 		}
+		at += snprintf(line + at, sizeof(line) - at, " ui=%u demoted_tgs=%u", ui_mode, ui_demoted);
 		snprintf(line + at, sizeof(line) - at, "\n");
 		amp_say(line);
-		for (int w = 0; w < 2; w++) {
-			report_task(w, now - then);
+		if (samp_ms) {
+			report_top(now - then);
 		}
 		then = now;
 	}
@@ -207,6 +351,8 @@ hakios_amp_start(void)
 	if (!hakios_amp_enabled) {
 		return;
 	}
+	PE_parse_boot_argn("amp_samp", &samp_ms, sizeof(samp_ms));
+	PE_parse_boot_argn("amp_ui", &ui_mode, sizeof(ui_mode));
 	if (kernel_thread_start(amp_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
