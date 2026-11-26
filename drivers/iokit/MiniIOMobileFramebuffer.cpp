@@ -371,7 +371,7 @@ struct te_state {
 	uint32_t        good;
 	uint64_t        pMin, pMax, pSum, pN;   /* this window */
 	uint64_t        framesSeen, repeated, skipped;
-	uint64_t        logAt, logCount;
+	uint64_t        logAt, logCount, logFirst;
 };
 static te_state gTe;
 static thread_call_t gTeCall;
@@ -406,7 +406,7 @@ teWatch(void)
 		if (!gTe.silent) {
 			gTe.silent = true;
 			gTe.fallbacks++;
-			printf("MiniIOMobileFramebuffer: vsync: no TE interrupt for %u ms (%llu so far%s): the timer carries the vsync\n",
+			IOLog("MiniIOMobileFramebuffer: vsync: no TE interrupt for %u ms (%llu so far%s): the timer carries the vsync\n",
 			    TE_SILENT_US / 1000, gTe.count, hakios_display_te_alive() ? "" : ", the interrupt was given up");
 		}
 	}
@@ -431,7 +431,18 @@ teLog(uint64_t now)
 	drift = (int64_t) (gTe.seenAt - gTe.t0) - (int64_t) (gTe.n0 * nominal);
 	absolutetime_to_nanoseconds(drift < 0 ? (uint64_t) -drift : (uint64_t) drift, &ns);
 	hakios_display_te_info(&irqs, &spur, &status, &enable, &line, &tear);
-	printf("MiniIOMobileFramebuffer: vsync: %llu TE interrupts (%llu in 5 s, %llu coalesced), period %llu us (min/max %llu/%llu), "
+	if (gTe.logCount == 0 && gTe.logFirst == 0) {
+		gTe.logFirst = 1;
+		uint32_t line2, d1, d2, d3, d4;
+		uint64_t d5, d6;
+
+		IODelay(1000);
+		hakios_display_te_info(&d5, &d6, &d1, &d2, &line2, &d3);
+		d4 = 0;
+		IOLog("MiniIOMobileFramebuffer: vsync: after set_tear_on: pp0 line counter %u, 1 ms later %u, mdp intr status %#x enable %#x\n",
+		    line, line2 + d4, status, enable);
+	}
+	IOLog("MiniIOMobileFramebuffer: vsync: %llu TE interrupts (%llu in 5 s, %llu coalesced), period %llu us (min/max %llu/%llu), "
 	    "timer drift corrected: a free-running %u Hz timer would be %s%llu us off the panel since %llu refreshes, "
 	    "%llu timer fallbacks, frames shown twice %llu, skipped %llu; irq handler %llu runs %llu not ours, mdp status %#x enable %#x, "
 	    "pp0 line counter %u tear check %u\n", gTe.count, gTe.count - gTe.logCount, gTe.coalesced,
@@ -493,7 +504,7 @@ teThread(thread_call_param_t unused0, thread_call_param_t unused1)
 		gPanel.frame = (uint32_t) gTe.count;
 		if (gTe.good >= 8 && gPanel.lines != 0) {
 			if (gTe.silent) {
-				printf("MiniIOMobileFramebuffer: vsync: TE interrupts are back\n");
+				IOLog("MiniIOMobileFramebuffer: vsync: TE interrupts are back\n");
 			}
 			gTe.silent = false;
 			gPanel.ok = true;
@@ -1015,9 +1026,9 @@ IOMobileFramebuffer::start(IOService * provider)
 		gTe.started = gTeCall != NULL && hakios_display_te_start(teIrq);
 		if (!gTe.started) {
 			gTe.fed = false;
-			printf("MiniIOMobileFramebuffer: fb_te_vsync=1: no TE interrupt on this board: the timer carries the vsync\n");
+			IOLog("MiniIOMobileFramebuffer: fb_te_vsync=1: no TE interrupt on this board: the timer carries the vsync\n");
 		} else {
-			printf("MiniIOMobileFramebuffer: fb_te_vsync=1: the vsync follows the panel's TE interrupt (timer after %u ms without)\n",
+			IOLog("MiniIOMobileFramebuffer: fb_te_vsync=1: the vsync follows the panel's TE interrupt (timer after %u ms without)\n",
 			    TE_SILENT_US / 1000);
 		}
 	}
