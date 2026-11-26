@@ -523,6 +523,8 @@ public:
 	uint32_t        fStatOnBeat;            /* frames that waited for a refresh, and for how long together */
 	uint64_t        fStatBeatWait;
 	uint32_t        fStatSurfaces[8];       /* the first different surfaces the bottom layer was given */
+	uint64_t        fStatCallTime, fStatCallMax, fStatHeldTime; /* SwapEnd calls: time in present() in all, longest, and held for a free slot */
+	uint32_t        fStatCalls;
 	uint32_t        fStatHeld, fStatLost;   /* swaps that waited for the one before; that gave up waiting */
 	uint64_t        fSwapTime;              /* when the last swap was handed over */
 	uint32_t        fStatSwapsLate;         /* swaps that came more than a refresh and a quarter after the one before (and no pause) */
@@ -1723,6 +1725,7 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
 	fSwapTime = now;
 	fStatHeld += fSwapsWaiting >= swapQueue();
+	uint64_t heldFrom = fSwapsWaiting >= swapQueue() ? mach_absolute_time() : 0;
 	while (fSwapsWaiting >= swapQueue()) {
 		if (IOLockSleepDeadline(fSwapLock, &fSwapsWaiting, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
 		    fSwapsWaiting >= swapQueue()) {
@@ -1730,6 +1733,9 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 			IOLockUnlock(fSwapLock);
 			return;
 		}
+	}
+	if (heldFrom != 0) {
+		fStatHeldTime += mach_absolute_time() - heldFrom;
 	}
 	unsigned slot = (fSwapFirst + fSwapsWaiting) % SWAP_QUEUE;
 
@@ -1741,6 +1747,11 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	}
 	fSwapsWaiting++;
 	IOLockWakeup(fSwapLock, fSwap, true);
+	uint64_t took = mach_absolute_time() - now;
+
+	fStatCalls++;
+	fStatCallTime += took;
+	fStatCallMax = took > fStatCallMax ? took : fStatCallMax;
 	IOLockUnlock(fSwapLock);
 }
 
@@ -2397,6 +2408,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
+		IOLockLock(fSwapLock);
+		IOLog("MiniIOMobileFramebuffer: SwapEnd: %u calls returned after %llu us on average (%llu at most), %llu us of that held for a free queue slot (%u held); "
+		    "the presenter is not what the window server waits for unless this is large\n", fStatCalls,
+		    fStatCalls ? micros(fStatCallTime / fStatCalls) : 0, micros(fStatCallMax), micros(fStatHeldTime), fStatHeld);
+		fStatCalls = 0;
+		fStatCallTime = fStatCallMax = fStatHeldTime = 0;
+		IOLockUnlock(fSwapLock);
 		IOLog("MiniIOMobileFramebuffer: %u swaps came before the GPU work of their surface, %u of them shown without it\n",
 		    fStatStale, fStatStaleShown);
 		if (surfaces[0] != NULL) {
