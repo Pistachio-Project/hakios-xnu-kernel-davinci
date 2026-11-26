@@ -18,6 +18,7 @@
 #include <mach/arm/thread_status.h>
 #include <arm64/proc_reg.h>
 #include <kdp/kdp_dyld.h>
+#include <sys/bsdtask_info.h>
 #include <vm/vm_map.h>
 #include <vm/vm_map_xnu.h>
 #include <pexpert/pexpert.h>
@@ -293,6 +294,522 @@ prof_all_thread(__unused void *arg, __unused wait_result_t wr)
 	}
 }
 
+
+/*
+ * Boot-arg waitprof=NAME[,NAME] (e.g. backboardd,SpringBoard): an off-CPU profiler. About every 2 ms each thread of
+ * the named processes is looked at under its thread lock: running, runnable (on a run queue, not on a core) or
+ * blocked. A blocked one is named by what it waits on: the wait event (a port, a semaphore, a driver's own object),
+ * the block hint, the timeout still to run (thread->wait_timer), the continuation or the return addresses of its
+ * kernel stack (the frame chain from the context it was switched out with: symbolize on the host with the
+ * unstripped kernel and the kernel slide of the report), and how it entered the kernel: the user PC and LR, the
+ * trap number (x16: negative Mach traps, positive BSD syscalls) and the exception class of its saved state (0x15
+ * a system call, 0x24 a data abort: a page fault in user code), and for a mach_msg the message id and the first
+ * word of its body after the NDR -- an IOConnectCallMethod's selector.
+ * An episode is one stay on one wait (the thread's context-switch count does not change); episodes of
+ * waitprof_ms (default 30) ms or more are logged when they end ("waitprof: LONG ..."), with the uptime they ended
+ * at to be matched with the plug-in's HITCH lines; so are runnable episodes ("RUNNABLE": a thread kept off the CPUs).
+ * Every waitprof_secs (default 5) the 8 waits that held threads longest in all, and the threads' time shares.
+ */
+#define WP_MAXT         2
+#define WP_THREADS      192
+#define WP_AGG          256
+#define WP_BT           6
+
+struct wp_wait {                /* what a thread waits on */
+	uint64_t event, cont, upc, ulr, trap;
+	uint64_t timeout_ms;    /* (still to run when first seen; ~0: none) */
+	uint32_t ec, msgid, word, hint;
+	uint8_t has_msg, nbt;
+	uint64_t bt[WP_BT];
+};
+
+struct wp_agg {
+	uint64_t tid, key;
+	char name[24];
+	struct wp_wait w;
+	uint32_t ms, smp, eps, max_ms;
+};
+
+struct wp_thr {
+	uint64_t tid;
+	char name[24];
+	uint32_t cs;            /* (c_switch of the episode) */
+	uint8_t kind;           /* 0 none, 1 blocked, 2 runnable */
+	int agg;
+	uint64_t began, last;   /* (ns) */
+	uint64_t ev;
+	uint32_t ms_run, ms_rdy, ms_blk;
+	struct wp_wait w;
+};
+
+static struct wp_target {
+	char name[17];
+	task_t task;
+	struct wp_thr *thr;
+	struct wp_agg *agg;
+	uint32_t nagg, samples, lost;
+} wp_t[WP_MAXT];
+static unsigned wp_n;
+static uint32_t wp_long_ms = 30, wp_secs = 5;
+
+extern void loader_log_line(const char *line);
+extern boolean_t machine_thread_on_core(thread_t thread);
+
+#define WPSAY(...) \
+	do { \
+		char wp_line[480]; \
+		snprintf(wp_line, sizeof(wp_line), __VA_ARGS__); \
+		loader_log_line(wp_line); \
+	} while (0)
+
+static const char *
+wp_trap_name(uint64_t t)
+{
+	switch ((int64_t)t) {
+	case -31: return "mach_msg";
+	case -47: return "mach_msg2";
+	case -36: return "sem_wait";
+	case -37: return "sem_wait_signal";
+	case -38: return "sem_timedwait";
+	case -39: return "sem_timedwait_signal";
+	case -59: return "swtch_pri";
+	case -61: return "thread_switch";
+	case -90: return "mach_wait_until";
+	case 93: return "select";
+	case 230: case 417: return "poll";
+	case 363: return "kevent";
+	case 368: return "workq_kernreturn";
+	case 374: return "kevent_qos";
+	case 375: return "kevent_id";
+	case 394: case 395: return "pselect";
+	case 515: return "ulock_wait";
+	case 544: return "ulock_wait2";
+	case 301: return "psynch_mutexwait";
+	case 302: return "psynch_mutexdrop";
+	case 305: return "psynch_cvwait";
+	case 306: return "psynch_rw_rdlock";
+	case 307: return "psynch_rw_wrlock";
+	case 334: return "usleep/nanosleep";
+	case 240: return "nanosleep";
+	case 5: return "open";
+	case 3: return "read";
+	case 4: return "write";
+	case 197: return "mmap";
+	case 54: return "ioctl";
+	case 6: return "close";
+	case 361: return "bsdthread_terminate";
+	case 478: return "bsdthread_ctl";
+	case 336: return "proc_info";
+	default: return "";
+	}
+}
+
+static void
+wp_fill_user(struct wp_target *tg, thread_t t, struct wp_wait *w)
+{
+	const arm_saved_state_t *us = t->machine.upcb;
+
+	if (us == NULL || !is_saved_state64(us)) {
+		return;
+	}
+	w->upc = get_saved_state_pc(us) & 0x0000ffffffffffffull;
+	w->ulr = get_saved_state_lr(us) & 0x0000ffffffffffffull;
+	w->ec = (uint32_t)(get_saved_state_esr(us) >> 26);
+	w->trap = get_saved_state_reg(us, 16);
+	if (w->ec == 0x15 && (w->trap == (uint64_t)-31 || w->trap == (uint64_t)-47)) {
+		vm_map_t map = get_task_map_reference(tg->task);
+		uint32_t m[9];
+
+		if (map == VM_MAP_NULL) {
+			return;
+		}
+		bzero(m, sizeof(m));
+		if (w->trap == (uint64_t)-31) {
+			/* mach_msg(header,...): bits size remote local voucher id | NDR(8) | words */
+			if (vm_map_read_user(map, get_saved_state_reg(us, 0), m, sizeof(m)) == KERN_SUCCESS) {
+				w->msgid = m[5];
+				w->word = m[8];
+				w->has_msg = 1;
+			}
+		} else {
+			/* mach_msg2(data=body, opts, bits_size, remote_local, voucher_id, ...): the id is the high half of x4 */
+			uint32_t b[3];
+
+			w->msgid = (uint32_t)(get_saved_state_reg(us, 4) >> 32);
+			if (vm_map_read_user(map, get_saved_state_reg(us, 0), b, sizeof(b)) == KERN_SUCCESS) {
+				w->word = b[2];
+				w->has_msg = 1;
+			} else {
+				w->has_msg = 2;
+			}
+		}
+		vm_map_deallocate(map);
+	}
+}
+
+static void
+wp_stack(thread_t t, struct wp_wait *w)
+{
+	vm_offset_t stk = t->kernel_stack;
+	const arm_kernel_saved_state_t *ks;
+	uint64_t fp;
+
+	if (stk == 0 || t->machine.kstackptr == NULL) {
+		return;
+	}
+	ks = &((thread_kernel_state_t)t->machine.kstackptr)->machine.ss;
+	w->bt[w->nbt++] = ks->lr;
+	fp = ks->fp;
+	while (w->nbt < WP_BT && fp >= stk && fp + 16 <= stk + kernel_stack_size && (fp & 7) == 0) {
+		uint64_t ra = ((uint64_t *)fp)[1], next = ((uint64_t *)fp)[0];
+
+		if (ra != 0) {
+			w->bt[w->nbt++] = ra;
+		}
+		if (next <= fp) {
+			break;
+		}
+		fp = next;
+	}
+}
+
+static int
+wp_agg_for(struct wp_target *tg, const struct wp_thr *th, const struct wp_wait *w)
+{
+	uint64_t key = th->tid * 0x9E3779B97F4A7C15ull ^ (w->event * 31) ^ (w->bt[1] * 17) ^ (w->bt[0] * 7) ^ w->upc ^
+	    (w->cont * 13) ^ (w->trap << 40);
+
+	for (uint32_t i = 0; i < tg->nagg; i++) {
+		if (tg->agg[i].key == key && tg->agg[i].tid == th->tid) {
+			return (int)i;
+		}
+	}
+	if (tg->nagg == WP_AGG) {
+		tg->lost++;
+		return -1;
+	}
+	struct wp_agg *a = &tg->agg[tg->nagg];
+
+	bzero(a, sizeof(*a));
+	a->key = key;
+	a->tid = th->tid;
+	strlcpy(a->name, th->name, sizeof(a->name));
+	a->w = *w;
+	return (int)tg->nagg++;
+}
+
+static void
+wp_describe(char *out, size_t n, const struct wp_wait *w)
+{
+	size_t at = 0;
+
+	at += (size_t)snprintf(out + at, n - at, "ec %#x trap %lld %s", w->ec, (long long)w->trap, wp_trap_name(w->trap));
+	if (w->has_msg) {
+		at += (size_t)snprintf(out + at, n - at, " msgid %u body0 %#x", w->msgid, w->word);
+	}
+	at += (size_t)snprintf(out + at, n - at, " ev %#llx hint %u", w->event, w->hint);
+	if (w->timeout_ms != ~0ull) {
+		at += (size_t)snprintf(out + at, n - at, " timeout %llums", w->timeout_ms);
+	}
+	at += (size_t)snprintf(out + at, n - at, " upc %#llx ulr %#llx", w->upc, w->ulr);
+	if (w->cont != 0) {
+		at += (size_t)snprintf(out + at, n - at, " cont %#llx", w->cont);
+	}
+	if (w->nbt != 0) {
+		at += (size_t)snprintf(out + at, n - at, " k:");
+		for (unsigned i = 0; i < w->nbt; i++) {
+			at += (size_t)snprintf(out + at, n - at, " %#llx", w->bt[i]);
+		}
+	}
+}
+
+static void
+wp_end_episode(struct wp_target *tg, struct wp_thr *th)
+{
+	uint64_t ms = (th->last - th->began) / NSEC_PER_MSEC + 2;
+
+	if (th->kind == 1 && th->agg >= 0) {
+		struct wp_agg *a = &tg->agg[th->agg];
+
+		a->eps++;
+		a->max_ms = MAX(a->max_ms, (uint32_t)ms);
+	}
+	if (th->kind != 0 && ms >= wp_long_ms) {
+		char d[300];
+
+		d[0] = 0;
+		if (th->kind == 1) {
+			wp_describe(d, sizeof(d), &th->w);
+		}
+		WPSAY("waitprof: %s %s at %llu.%03llu s: tid %llu '%s' %llu ms %s", tg->name, th->kind == 1 ? "LONG" : "RUNNABLE",
+		    th->last / NSEC_PER_SEC, th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, d);
+	}
+	th->kind = 0;
+}
+
+static void
+wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
+{
+	thread_t t;
+	task_t task = tg->task;
+
+	tg->samples++;
+	task_lock(task);
+	queue_iterate(&task->threads, t, thread_t, task_threads) {
+		struct wp_thr *th = NULL;
+		struct wp_wait w;
+		uint32_t state, cs, hint;
+		uint64_t tid = t->thread_id;
+		uint64_t ev, to_abs = 0;
+		uintptr_t cont;
+		bool timer_armed;
+		int kind;
+		spl_t s;
+
+		for (unsigned i = 0; i < WP_THREADS; i++) {
+			if (tg->thr[i].tid == tid) {
+				th = &tg->thr[i];
+				break;
+			}
+			if (th == NULL && tg->thr[i].tid == 0) {
+				th = &tg->thr[i];
+			}
+		}
+		if (th == NULL) {
+			continue;
+		}
+		bzero(&w, sizeof(w));
+		w.timeout_ms = ~0ull;
+		s = splsched();
+		thread_lock(t);
+		state = t->state;
+		cs = t->c_switch;
+		ev = (uint64_t)t->wait_event;
+		hint = t->block_hint;
+		cont = (uintptr_t)t->continuation;
+		timer_armed = t->wait_timer != NULL && t->wait_timer_armed;
+		if (timer_armed) {
+			to_abs = t->wait_timer->tc_soft_deadline;
+		}
+		if ((state & (TH_WAIT | TH_RUN)) == TH_WAIT) {
+			kind = 1;
+		} else if ((state & TH_RUN) && !machine_thread_on_core(t)) {
+			kind = 2;
+		} else {
+			kind = 0;
+		}
+		if (kind == 1) {
+			w.event = ev;
+			w.hint = hint;
+			w.cont = cont;
+			if (timer_armed) {
+				uint64_t nowabs = mach_absolute_time(), ns;
+
+				absolutetime_to_nanoseconds(to_abs > nowabs ? to_abs - nowabs : 0, &ns);
+				w.timeout_ms = ns / NSEC_PER_MSEC;
+			}
+		}
+		thread_unlock(t);
+		splx(s);
+
+		if (th->tid == 0) {
+			th->tid = tid;
+			th->kind = 0;
+			th->agg = -1;
+			bzero(th->name, sizeof(th->name));
+			if (get_bsdthread_info(t) != NULL) {
+				char nm[MAXTHREADNAMESIZE];
+
+				bzero(nm, sizeof(nm));
+				bsd_getthreadname(get_bsdthread_info(t), nm);
+				strlcpy(th->name, nm, sizeof(th->name));
+			}
+		}
+		if (th->name[0] == 0 && get_bsdthread_info(t) != NULL) {
+			char nm[MAXTHREADNAMESIZE];
+
+			bzero(nm, sizeof(nm));
+			bsd_getthreadname(get_bsdthread_info(t), nm);
+			strlcpy(th->name, nm, sizeof(th->name));
+		}
+		/* the same episode: same kind, same dispatch count, same event */
+		if (th->kind != 0 && !(th->kind == kind && th->cs == cs && (kind != 1 || th->ev == ev))) {
+			wp_end_episode(tg, th);
+		}
+		if (kind == 0) {
+			th->ms_run += (uint32_t)dt_ms;
+			continue;
+		}
+		if (kind == 2) {
+			th->ms_rdy += (uint32_t)dt_ms;
+			if (th->kind == 0) {
+				th->kind = 2;
+				th->cs = cs;
+				th->began = now_ns;
+				bzero(&th->w, sizeof(th->w));
+			}
+			th->last = now_ns;
+			continue;
+		}
+		th->ms_blk += (uint32_t)dt_ms;
+		if (th->kind == 0) {
+			/* a new wait: what made it, read once (the thread is blocked: its state is still) */
+			wp_stack(t, &w);
+			wp_fill_user(tg, t, &w);
+			if ((t->state & (TH_WAIT | TH_RUN)) != TH_WAIT || t->c_switch != cs) {
+				continue;       /* (it woke meanwhile: the reading is not of this wait) */
+			}
+			th->kind = 1;
+			th->cs = cs;
+			th->ev = ev;
+			th->began = now_ns;
+			th->w = w;
+			th->agg = wp_agg_for(tg, th, &w);
+		}
+		th->last = now_ns;
+		if (th->agg >= 0) {
+			tg->agg[th->agg].ms += (uint32_t)dt_ms;
+			tg->agg[th->agg].smp++;
+		}
+	}
+	task_unlock(task);
+}
+
+static void
+wp_report(struct wp_target *tg)
+{
+	bool used[WP_AGG];
+
+	bzero(used, sizeof(used));
+	WPSAY("waitprof: %s: %u samples in %us, kernel slide %#lx, %u waits not kept", tg->name, tg->samples, wp_secs,
+	    (unsigned long)vm_kernel_slide, tg->lost);
+	for (unsigned n = 0; n < 8; n++) {
+		int best = -1;
+		char d[300];
+
+		for (uint32_t i = 0; i < tg->nagg; i++) {
+			if (!used[i] && tg->agg[i].ms != 0 && (best < 0 || tg->agg[i].ms > tg->agg[best].ms)) {
+				best = (int)i;
+			}
+		}
+		if (best < 0) {
+			break;
+		}
+		used[best] = true;
+		wp_describe(d, sizeof(d), &tg->agg[best].w);
+		WPSAY("waitprof: %s #%u tid %llu '%s' blocked %u ms (%u eps, max %u ms) %s", tg->name, n, tg->agg[best].tid,
+		    tg->agg[best].name, tg->agg[best].ms, tg->agg[best].eps, tg->agg[best].max_ms, d);
+	}
+	/* the threads' shares: the ones that ran or waited for a CPU for 3% or more of the period */
+	for (unsigned i = 0; i < WP_THREADS; i++) {
+		struct wp_thr *th = &tg->thr[i];
+		uint32_t all = th->ms_run + th->ms_rdy + th->ms_blk;
+
+		if (th->tid != 0 && all != 0 && (th->ms_run + th->ms_rdy) * 100 / all >= 3) {
+			WPSAY("waitprof: %s tid %llu '%s' run %u%% runnable %u%% blocked %u%%", tg->name, th->tid, th->name,
+			    th->ms_run * 100 / all, th->ms_rdy * 100 / all, th->ms_blk * 100 / all);
+		}
+		th->ms_run = th->ms_rdy = th->ms_blk = 0;
+	}
+	bzero(tg->agg, WP_AGG * sizeof(tg->agg[0]));
+	tg->nagg = tg->samples = tg->lost = 0;
+}
+
+static task_t
+wp_find(const char *name)
+{
+	task_t found = TASK_NULL, task;
+
+	lck_mtx_lock(&tasks_threads_lock);
+	queue_iterate(&tasks, task, task_t, tasks) {
+		void *p = get_bsdtask_info(task);
+
+		if (p != NULL && strncmp(proc_name_address(p), name, 16) == 0) {
+			task_reference(task);
+			found = task;
+			break;
+		}
+	}
+	lck_mtx_unlock(&tasks_threads_lock);
+	return found;
+}
+
+static void
+waitprof_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	uint64_t last_ns = 0, report_ns = 0, find_ns = 0;
+
+	for (;;) {
+		uint64_t abs = mach_absolute_time(), now, dt_ms;
+
+		absolutetime_to_nanoseconds(abs, &now);
+		dt_ms = last_ns != 0 ? MIN((now - last_ns) / NSEC_PER_MSEC, 20) : 2;
+		last_ns = now;
+		for (unsigned i = 0; i < wp_n; i++) {
+			struct wp_target *tg = &wp_t[i];
+
+			if (tg->task == TASK_NULL || !tg->task->active) {
+				if (tg->task != TASK_NULL) {
+					task_deallocate(tg->task);
+					tg->task = TASK_NULL;
+					bzero(tg->thr, WP_THREADS * sizeof(tg->thr[0]));
+				}
+				if (now - find_ns >= NSEC_PER_SEC) {
+					tg->task = wp_find(tg->name);
+				}
+				continue;
+			}
+			wp_sample(tg, now, dt_ms);
+			if (now - report_ns >= (uint64_t)wp_secs * NSEC_PER_SEC && report_ns != 0) {
+				wp_report(tg);
+			}
+		}
+		if (now - find_ns >= NSEC_PER_SEC) {
+			find_ns = now;
+		}
+		if (report_ns == 0 || now - report_ns >= (uint64_t)wp_secs * NSEC_PER_SEC) {
+			report_ns = now;
+		}
+		delay_for_interval(2, NSEC_PER_MSEC);
+	}
+}
+
+static void
+waitprof_start(void)
+{
+	char arg[40];
+	thread_t thread;
+	char *p, *q;
+
+	if (!PE_parse_boot_arg_str("waitprof", arg, sizeof(arg)) || arg[0] == 0) {
+		return;
+	}
+	PE_parse_boot_argn("waitprof_ms", &wp_long_ms, sizeof(wp_long_ms));
+	PE_parse_boot_argn("waitprof_secs", &wp_secs, sizeof(wp_secs));
+	wp_secs = MAX(wp_secs, 1);
+	for (p = arg; *p != 0 && wp_n < WP_MAXT; p = q) {
+		struct wp_target *tg = &wp_t[wp_n];
+		size_t len;
+
+		for (q = p; *q != 0 && *q != ','; q++) {
+		}
+		len = MIN((size_t)(q - p), sizeof(tg->name) - 1);
+		memcpy(tg->name, p, len);
+		if (*q == ',') {
+			q++;
+		}
+		tg->thr = kalloc_data(WP_THREADS * sizeof(tg->thr[0]), Z_WAITOK | Z_ZERO);
+		tg->agg = kalloc_data(WP_AGG * sizeof(tg->agg[0]), Z_WAITOK | Z_ZERO);
+		if (tg->thr == NULL || tg->agg == NULL || len == 0) {
+			return;
+		}
+		wp_n++;
+	}
+	if (wp_n != 0 && kernel_thread_start_priority(waitprof_thread, NULL, BASEPRI_KERNEL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
 void hakios_prof_start(void);
 
 void
@@ -300,6 +817,7 @@ hakios_prof_start(void)
 {
 	thread_t thread;
 
+	waitprof_start();       /* (boot-arg waitprof=NAME[,NAME]: below) */
 	if (!PE_parse_boot_arg_str("hakios_prof", prof_name, sizeof(prof_name)) || prof_name[0] == 0) {
 		return;
 	}

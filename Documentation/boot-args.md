@@ -634,6 +634,7 @@ beside the code, so the file named in each heading has the full explanation.
 | --- | --- |
 | `hakios_prof` | A sampling profiler for one process (boot-arg hakios_prof=NAME, e.g. backboardd): about 1000 times a second each other CPU running a thread of that process is interrupted (cpu_xcall) and the PC it was at is counted -- the user PC, or the kernel PC when the thread was in the kernel. |
 | `hakios_prof_secs` | Every hakios_prof_secs (default 10) the log gets the 60 commonest PCs ("dprof: PC count", user ones first marked u, kernel ones k) and the process's images outside the shared cache with their load addresses and the cache's slide, so the PCs can be named on the host (ipsw dyld a2s for the cache, nm f… |
+| `waitprof` | An off-CPU profiler (boot-arg waitprof=NAME[,NAME], e.g. backboardd,SpringBoard): every ~2 ms each thread of the processes is classed running / runnable / blocked and a blocked one named by its wait event, block hint, remaining timeout, continuation or kernel stack return addresses, and the user PC/LR, trap number, exception class and (mach_msg) message id and first body word (an IOKit selector). Episodes of `waitprof_ms` (default 30) ms or more are logged as "waitprof: LONG at S.mmm s: ..." when they end (RUNNABLE for threads kept off the CPUs); every `waitprof_secs` (default 5) the 8 longest waits and the threads' run/runnable/blocked shares. |
 
 ### `osfmk/arm64/user_exception_trace.c`
 
