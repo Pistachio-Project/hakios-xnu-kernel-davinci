@@ -1368,6 +1368,84 @@ display_link_rates(void)
 	    dl_max ? "; " DL_FULL_FOR "'s at the panel's rate (dl_max=1)" : "");
 }
 
+
+/*
+ * Boot-arg touch_lat=1 (or 2): when a touch event reaches SpringBoard's -[UIApplication sendEvent:], how long after the
+ * kernel stamped it (UIEvent's timestamp is the stamp this library's input thread gave the HID event, in seconds of
+ * mach_absolute_time): a line every 5 s, "touch: SpringBoard got N events, kernel stamp->SB receive avg/p90/max".
+ */
+static void (*original_send_event)(id, SEL, id);
+static uint64_t sbl_us[4096];
+static unsigned sbl_n;
+
+static int
+sbl_cmp(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+static void
+sbl_flush(void)
+{
+	uint64_t sum = 0;
+	unsigned n = sbl_n;
+
+	if (n == 0) {
+		return;
+	}
+	sbl_n = 0;
+	qsort(sbl_us, n, sizeof(sbl_us[0]), sbl_cmp);
+	for (unsigned i = 0; i < n; i++) {
+		sum += sbl_us[i];
+	}
+	say("touch: SpringBoard got %u events, kernel stamp->SB receive avg/p90/max %llu/%llu/%llu us\n", n, sum / n,
+	    sbl_us[n * 9 / 10 >= n ? n - 1 : n * 9 / 10], sbl_us[n - 1]);
+}
+
+static void
+sbl_send_event(id self, SEL cmd, id event)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	if (((long (*)(id, SEL))objc_msgSend)(event, sel_registerName("type")) == 0) {      /* UIEventTypeTouches */
+		double stamp = ((double (*)(id, SEL))objc_msgSend)(event, sel_registerName("timestamp"));
+		double now = (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
+
+		if (stamp > 0 && now >= stamp && sbl_n < sizeof(sbl_us) / sizeof(sbl_us[0])) {
+			sbl_us[sbl_n++] = (uint64_t)((now - stamp) * 1e6);
+		}
+	}
+	original_send_event(self, cmd, event);
+}
+
+static void
+touch_latency_in_springboard(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	Method send = class_getInstanceMethod(objc_getClass("UIApplication"), sel_registerName("sendEvent:"));
+
+	if (send == NULL || sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0 ||
+	    (!boot_arg(arguments, "touch_lat=1") && !boot_arg(arguments, "touch_lat=2"))) {
+		return;
+	}
+	original_send_event = (void (*)(id, SEL, id))method_getImplementation(send);
+	method_setImplementation(send, (IMP)sbl_send_event);
+	dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+
+	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), 5 * NSEC_PER_SEC, NSEC_PER_SEC / 10);
+	dispatch_source_set_event_handler(timer, ^{
+		sbl_flush();
+	});
+	dispatch_resume(timer);
+	say("hakios: SpringBoard counts the touches' way from the kernel's stamp to sendEvent: (touch_lat)\n");
+}
+
 __attribute__((constructor))
 static void
 hakios_springboard_init(void)
@@ -1403,6 +1481,7 @@ hakios_springboard_init(void)
 	 * this one opens it, the way a jailbreak's own hook does.
 	 */
 	load_tweaks();
+	touch_latency_in_springboard();
 	/* (the rates SpringBoard's display links and animations ask the window server for: dl_max, anim_max) */
 	display_link_rates();
 	/*

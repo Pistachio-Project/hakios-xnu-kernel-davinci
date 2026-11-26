@@ -37,6 +37,7 @@
 #include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -1090,7 +1091,7 @@ release_all(IOHIDServiceClientRef screen, IOHIDServiceClientRef buttons)
  * the kernel stamped it, when this thread had it, when the event system had the event -- in
  * microseconds of mach_absolute_time, the kernel's own time (tools/latency.py).
  */
-static bool touch_latency;
+static bool touch_latency, touch_latency_events;   /* (touch_lat=2: also a line for every sample: each costs a console write) */
 static mach_timebase_info_data_t timebase;
 
 static uint64_t
@@ -1138,17 +1139,21 @@ input_thread(__unused void *arg)
 	static const int types[] = { HID_CLIENT_SIMPLE, HID_CLIENT_RATE_CONTROLLED };
 	IOHIDEventSystemClientRef client = NULL;
 	IOHIDServiceClientRef screen = NULL, buttons = NULL;
-	struct hakios_touch t;
+	struct hakios_touch t, batch[64];
 	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
 	int device;
 
 	pthread_setname_np("hakios input");
+	/* the touches' way in is the event system's own work, and at user-interactive QoS, as Apple's HID threads are: at the default QoS
+	 * (inherited from the creator) it waits behind every busy thread of the P cluster, and a lower one prefers the E cores (amp=1) */
+	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 	{
 		char arguments[1024] = "";
 		size_t size = sizeof(arguments) - 1;
 
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
-			touch_latency = strstr(arguments, "touch_lat=1") != NULL;
+			touch_latency_events = strstr(arguments, "touch_lat=2") != NULL;
+			touch_latency = touch_latency_events || strstr(arguments, "touch_lat=1") != NULL;
 		}
 		mach_timebase_info(&timebase);
 	}
@@ -1164,7 +1169,8 @@ input_thread(__unused void *arg)
 			say("hakios: input: no HID client of type %d\n", types[i]);
 			continue;
 		}
-		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("hakios.input", NULL));
+		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("hakios.input", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+		    QOS_CLASS_USER_INTERACTIVE, 0)));
 		screen = make_service(client, "HakiOS touch screen", HID_PAGE_DIGITIZER, HID_USAGE_TOUCH_SCREEN, true);
 		if (screen == NULL) {
 			say("hakios: input: a HID client of type %d may not create services\n", types[i]);
@@ -1183,10 +1189,10 @@ input_thread(__unused void *arg)
 	}
 
 	for (;;) {
-		ssize_t got = read(device, &t, sizeof(t));
+		ssize_t got = read(device, batch, sizeof(batch));
 		uint64_t read_at = mach_absolute_time();
 
-		if (got != (ssize_t)sizeof(t)) {
+		if (got <= 0 || got % (ssize_t)sizeof(t) != 0) {
 			/*
 			 * A signal (EINTR) took nothing: read again. Anything else may have taken samples with it: what is
 			 * held is let go, and the device opened again -- the thread that ended here left the phone with no
@@ -1207,6 +1213,17 @@ input_thread(__unused void *arg)
 			continue;
 		}
 
+		/*
+		 * The queue may hold several samples (this thread was late: the event system is slow to take an event, 7 to 130 ms
+		 * a dispatch with the log on): of a run of moves of one finger only the last goes in -- their dispatch is what
+		 * made the backlog (touches seconds late), and the position is where the finger is. The stamps stay the kernel's.
+		 */
+		for (size_t bi = 0; bi < (size_t)got / sizeof(t); bi++) {
+		t = batch[bi];
+		if (t.type == HAKIOS_TOUCH_MOVE && bi + 1 < (size_t)got / sizeof(t) && batch[bi + 1].type == HAKIOS_TOUCH_MOVE &&
+		    batch[bi + 1].finger == t.finger) {
+			continue;
+		}
 		if (count++ < 4) {
 			say("hakios: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
 		}
@@ -1232,9 +1249,46 @@ input_thread(__unused void *arg)
 		} else {
 			send_touch(screen, &t);
 			if (touch_latency) {
-				say("tl: i %u posted %llu read %llu sent %llu\n", t.type, micros(t.time), micros(read_at),
-				    micros(mach_absolute_time()));
+				uint64_t sent_at = mach_absolute_time(), now_us_ = micros(sent_at);
+				static uint64_t sum_pr, max_pr, sum_rs, max_rs, n_ev, since;
+				uint64_t pr = micros(read_at) - micros(t.time), rs = micros(sent_at) - micros(read_at);
+
+				sum_pr += pr; sum_rs += rs; n_ev++;
+				max_pr = pr > max_pr ? pr : max_pr;
+				max_rs = rs > max_rs ? rs : max_rs;
+				static uint64_t g_t0, g_last, g_n, g_maxgap;
+				static double g_x0, g_y0, g_x1, g_y1;
+
+				if (t.type == HAKIOS_TOUCH_DOWN || g_n == 0) {
+					g_t0 = micros(t.time); g_n = 0; g_maxgap = 0;
+					g_x0 = t.x; g_y0 = t.y;
+				} else if (micros(t.time) - g_last > g_maxgap) {
+					g_maxgap = micros(t.time) - g_last;
+				}
+				g_last = micros(t.time); g_x1 = t.x; g_y1 = t.y; g_n++;
+				if (t.type == HAKIOS_TOUCH_UP && g_last > g_t0) {
+					/* the panel is 1080 x 2340: the gesture's length and speed in panel pixels, from the kernel's stamps */
+					double dx = (g_x1 - g_x0) * 1080 / 65535, dy = (g_y1 - g_y0) * 2340 / 65535, us = (double)(g_last - g_t0);
+
+					say("touch: gesture %llu samples in %.0f ms (%.0f Hz, longest gap %llu us), moved %.0f,%.0f px = %.0f px/s\n",
+					    g_n, us / 1000, g_n * 1e6 / us, g_maxgap, dx, dy, sqrt(dx * dx + dy * dy) * 1e6 / us);
+					g_n = 0;
+				}
+				if (since == 0) {
+					since = now_us_;
+				}
+				if (now_us_ - since >= 5000000 || t.type == HAKIOS_TOUCH_UP) {
+					say("touch: %llu events, kernel queue->user read avg/max %llu/%llu us, read->IOHID dispatch %llu/%llu us\n",
+					    n_ev, sum_pr / n_ev, max_pr, sum_rs / n_ev, max_rs);
+					sum_pr = max_pr = sum_rs = max_rs = n_ev = 0;
+					since = now_us_;
+				}
+				if (touch_latency_events) {
+					say("tl: i %u posted %llu read %llu sent %llu\n", t.type, micros(t.time), micros(read_at),
+					    micros(mach_absolute_time()));
+				}
 			}
+		}
 		}
 	}
 }
