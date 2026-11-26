@@ -593,7 +593,9 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 	MTLPixelFormat _ycbcrFormat;        /* ... and the private format it was asked as (500, 540), which it answers */
 	void *_deallocBytes;
 	NSUInteger _deallocLength;
+	MTLPixelFormat _reportedFormat;     /* metal_rt8=1: the format asked (RGBA16Float, RG16Float) of a texture stored as 8-bit unorm; 0 for the rest */
 }
+- (void)hakiosSetReportedFormat:(MTLPixelFormat)format;
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device texture:(hakios_metal_texture *)texture
 			  descriptor:(MTLTextureDescriptor *)descriptor usage:(MTLTextureUsage)usage;
 - (hakios_metal_texture *)hakiosTexture;
@@ -4234,6 +4236,42 @@ hm_compress_rt_ok(void)
 	return on;
 }
 
+/*
+ * Boot-arg metal_rt8=1 (an experiment, default off): GPU-private intermediate render targets of RGBA16Float or RG16Float --
+ * Liquid Glass's blur and backdrop passes -- are stored as RGBA8Unorm or RG8Unorm, half the bytes to draw and to sample.
+ * The texture still answers the format asked (pixelFormat); the core, and so the tex descriptor, the RB's MRT format, the
+ * clears, the blends and the GMEM bytes a pixel, all follow the 8-bit format the texture really is (every one reads
+ * Texture::info(), none the pipeline's descriptor). The shader's output is converted by the RB, so values past 0..1 clamp and
+ * gradients band: that is the price, and what the experiment measures. Not touched: Shared/Managed storage (the CPU reads
+ * it), a texture with the PixelFormatView or ShaderWrite usage, anything but one 2D single-sample level, depth, R32Float,
+ * IOSurface-backed ones (not this path). Returns the 8-bit format to store as, or 0 with *why naming the exclusion.
+ */
+static unsigned hm_rt8_stored[2], hm_rt8_excluded[5];
+static const char *const hm_rt8_why[5] = { "shared/managed storage", "PixelFormatView usage", "ShaderWrite usage", "not one 2D single-sample level", "core refused" };
+static BOOL
+hm_rt8_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) on = hm_boot_arg_set("metal_rt8=1");
+	return on;
+}
+static unsigned
+hm_rt8_format(MTLTextureDescriptor *d, int *why)
+{
+	const MTLPixelFormat pf = [d pixelFormat];
+	const MTLTextureUsage u = [d usage];
+
+	*why = -1;
+	if (!hm_rt8_on() || (pf != MTLPixelFormatRGBA16Float && pf != MTLPixelFormatRG16Float) || (u & MTLTextureUsageRenderTarget) == 0) return 0;
+	if ([d storageMode] != MTLStorageModePrivate && [d storageMode] != MTLStorageModeMemoryless) *why = 0;
+	else if (u & MTLTextureUsagePixelFormatView) *why = 1;
+	else if (u & MTLTextureUsageShaderWrite) *why = 2;
+	else if ([d textureType] != MTLTextureType2D || [d mipmapLevelCount] != 1 || [d sampleCount] != 1) *why = 3;
+	if (*why >= 0) return 0;
+	return pf == MTLPixelFormatRGBA16Float ? (unsigned)MTLPixelFormatRGBA8Unorm : (unsigned)MTLPixelFormatRG8Unorm;
+}
+
 static BOOL
 hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 {
@@ -4243,6 +4281,8 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 	if (halfOn < 0) halfOn = !hm_boot_arg_set("metal_ubwc_half=0");
 	const BOOL half = (pf == MTLPixelFormatRGBA16Float || pf == MTLPixelFormatRG16Float) && halfOn;
 
+	int rt8why;
+	if (hm_rt8_format(descriptor, &rt8why) == MTLPixelFormatRG8Unorm) return NO;   /* (RG8 is laid out linear: the compressed layouts are RGBA8's) */
 	if (!hm_compress_ok() || [descriptor textureType] != MTLTextureType2D || [descriptor mipmapLevelCount] != 1 || [descriptor sampleCount] != 1 ||
 	    (pf != MTLPixelFormatRGBA8Unorm && pf != MTLPixelFormatBGRA8Unorm && !half) ||
 	    [descriptor width] * [descriptor height] < 65536) {
@@ -4475,7 +4515,10 @@ hm_memoryless_give(hakios_metal_texture *t, unsigned type, unsigned format, unsi
 	/* (a memoryless texture of one 1D or 2D slice: its memory from hm_memoryless_take, and back there at its dealloc) */
 	const BOOL memoryless = [descriptor storageMode] == MTLStorageModeMemoryless && !hm_compress(descriptor, usage) &&
 				([descriptor textureType] == MTLTextureType2D || [descriptor textureType] == MTLTextureType1D);
-	const unsigned shape[5] = { (unsigned)[descriptor textureType], (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],
+	int rt8why;
+	unsigned rt8 = hm_rt8_format(descriptor, &rt8why);   /* metal_rt8=1: the 8-bit format the core is given, or 0 */
+	unsigned coreFormat = rt8 != 0 ? rt8 : (unsigned)[descriptor pixelFormat];
+	unsigned shape[5] = { (unsigned)[descriptor textureType], coreFormat, (unsigned)[descriptor width],
 				    (unsigned)[descriptor height], (unsigned)[descriptor mipmapLevelCount] };
 	/* the mip levels are the core's (texture.hpp: fdl6_layout's rule, which the TP follows): it refuses a count past the
 	 * bottom of the chain with the numbers */
@@ -4499,7 +4542,7 @@ hm_memoryless_give(hakios_metal_texture *t, unsigned type, unsigned format, unsi
 		texture = hakios_metal_texture_new_3d(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width], (unsigned)[descriptor height],
 						      (unsigned)[descriptor depth], (unsigned)usage);
 	} else if (hm_compress(descriptor, usage)) {
-		texture = hakios_metal_texture_new_compressed(_gpu, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],
+		texture = hakios_metal_texture_new_compressed(_gpu, coreFormat, (unsigned)[descriptor width],
 							      (unsigned)[descriptor height], (unsigned)usage);
 		if (usage != MTLTextureUsageShaderRead) {
 			__atomic_add_fetch(texture != NULL ? &hm_ubwc_rt_made : &hm_ubwc_rt_linear, 1, __ATOMIC_RELAXED);
@@ -4514,7 +4557,7 @@ hm_memoryless_give(hakios_metal_texture *t, unsigned type, unsigned format, unsi
 		if (texture == NULL) {
 			HM_ONCE("a compressed %lux%lu texture was not made (%s): one that is not is made linear instead\n", (unsigned long)[descriptor width],
 				(unsigned long)[descriptor height], hakios_metal_error());
-			texture = hakios_metal_texture_new_levels(_gpu, (unsigned)[descriptor textureType], (unsigned)[descriptor pixelFormat],
+			texture = hakios_metal_texture_new_levels(_gpu, (unsigned)[descriptor textureType], coreFormat,
 								  (unsigned)[descriptor width], (unsigned)[descriptor height], 1, (unsigned)usage);
 		}
 	} else {
@@ -4523,10 +4566,21 @@ hm_memoryless_give(hakios_metal_texture *t, unsigned type, unsigned format, unsi
 			texture = hm_memoryless_take(shape[0], shape[1], shape[2], shape[3], shape[4], usage);
 		}
 		if (texture == NULL) {
-			texture = hakios_metal_texture_new_levels(_gpu, (unsigned)[descriptor textureType], (unsigned)[descriptor pixelFormat],
+			texture = hakios_metal_texture_new_levels(_gpu, (unsigned)[descriptor textureType], coreFormat,
 								  (unsigned)[descriptor width], (unsigned)[descriptor height],
 								  (unsigned)[descriptor mipmapLevelCount], (unsigned)usage);
 		}
+	}
+	if (texture == NULL && rt8 != 0) {
+		/* (the 8-bit store was not made: the texture is as asked, 16-bit, and counted as excluded) */
+		__atomic_add_fetch(&hm_rt8_excluded[4], 1, __ATOMIC_RELAXED);
+		HM_ONCE("metal_rt8: an 8-bit %lux%lu texture was not made (%s): made in its own 16-bit format instead\n", (unsigned long)[descriptor width],
+			(unsigned long)[descriptor height], hakios_metal_error());
+		texture = hakios_metal_texture_new_levels(_gpu, (unsigned)[descriptor textureType], (unsigned)[descriptor pixelFormat],
+							  (unsigned)[descriptor width], (unsigned)[descriptor height], 1, (unsigned)usage);
+		rt8 = 0;
+		rt8why = -1;
+		shape[1] = (unsigned)[descriptor pixelFormat];
 	}
 	if (texture == NULL) {
 		/* the core's own sentence: the format by name, a size outside 1..32767, or no memory */
@@ -4536,6 +4590,12 @@ hm_memoryless_give(hakios_metal_texture *t, unsigned type, unsigned format, unsi
 	}
 	HakiosMetalTexture *made = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];
 	if (memoryless && made != nil) [made hakiosKeepMemoryAs:shape];
+	if (made != nil && rt8 != 0) {
+		[made hakiosSetReportedFormat:[descriptor pixelFormat]];
+		__atomic_add_fetch(&hm_rt8_stored[rt8 == MTLPixelFormatRGBA8Unorm ? 0 : 1], 1, __ATOMIC_RELAXED);
+	} else if (rt8why >= 0) {
+		__atomic_add_fetch(&hm_rt8_excluded[rt8why], 1, __ATOMIC_RELAXED);
+	}
 	{
 		/* the layouts made, for the fps report: UBWC (the 8-bit formats / the 16-bit float ones), and linear ones by size and by why */
 		const BOOL big = [descriptor width] * [descriptor height] >= 65536;
@@ -5182,7 +5242,8 @@ HM_REFUSES_OUT_LOUD
 - (NSUInteger)width                 { return hakios_metal_texture_width(_texture); }
 - (NSUInteger)height                { return hakios_metal_texture_height(_texture); }
 - (NSUInteger)depth                 { return hakios_metal_texture_type(_texture) == MTLTextureType3D ? hakios_metal_texture_depth(_texture) : 1; }
-- (MTLPixelFormat)pixelFormat       { return _ycbcr != 0 ? _ycbcrFormat : (MTLPixelFormat)hakios_metal_texture_format(_texture); }
+- (MTLPixelFormat)pixelFormat       { return _ycbcr != 0 ? _ycbcrFormat : _reportedFormat != 0 ? _reportedFormat : (MTLPixelFormat)hakios_metal_texture_format(_texture); }
+- (void)hakiosSetReportedFormat:(MTLPixelFormat)format { _reportedFormat = format; }
 - (MTLTextureType)textureType       { return (MTLTextureType)hakios_metal_texture_type(_texture); }
 - (MTLTextureUsage)usage            { return _usage; }
 - (NSUInteger)mipmapLevelCount      { return hakios_metal_texture_levels(_texture); }
@@ -5443,7 +5504,8 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 	 * pixel -- MPS takes each level of a pyramid so) is the core's own view of the same memory */
 	if (pixelFormat != [self pixelFormat] || type != [self textureType] || levels.location != 0 ||
 	    levels.length != [self mipmapLevelCount] || slices.location != 0 || slices.length != allSlices) {
-		own = hakios_metal_texture_new_view(_texture, (unsigned)pixelFormat, (unsigned)type, (unsigned)levels.location, (unsigned)levels.length,
+		/* (an rt8 texture answers the format asked; the same format asked of its view is the 8-bit one the core holds) */
+		own = hakios_metal_texture_new_view(_texture, _reportedFormat != 0 && pixelFormat == _reportedFormat ? hakios_metal_texture_format(_texture) : (unsigned)pixelFormat, (unsigned)type, (unsigned)levels.location, (unsigned)levels.length,
 						    (unsigned)slices.location, (unsigned)slices.length);
 		if (own == NULL) {
 			hm_print("refused: -[%s %s] format %lu type %lu levels %lu+%lu slices %lu+%lu of a texture of format %lu type %lu "
@@ -5468,6 +5530,7 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 	view->_parentSlice = slices.location;
 	view->_usage = _usage;
 	view->_askedOptions = _askedOptions;
+	view->_reportedFormat = _reportedFormat;
 	view->_memoryless = _memoryless;
 	view->_allowGPUOptimizedContents = _allowGPUOptimizedContents;
 	view->_uniqueIdentifier = hm_next_resource_id();
@@ -7309,6 +7372,19 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				 "all\n", hm_compress_rt_ok() ? 1 : 0, made, made - hm_ubwc_rt_reported, span,
 				 __atomic_load_n(&hm_ubwc_rt_linear, __ATOMIC_RELAXED));
 			hm_ubwc_rt_reported = made;
+		}
+		if (hm_rt8_on()) {
+			const unsigned a = __atomic_load_n(&hm_rt8_stored[0], __ATOMIC_RELAXED), b = __atomic_load_n(&hm_rt8_stored[1], __ATOMIC_RELAXED);
+			unsigned k = 0;
+			char reasons[160] = "";
+
+			for (unsigned i = 0; i < 5; i++) {
+				const unsigned c = __atomic_load_n(&hm_rt8_excluded[i], __ATOMIC_RELAXED);
+
+				k += c;
+				if (c != 0) snprintf(reasons + strlen(reasons), sizeof(reasons) - strlen(reasons), "%s%s %u", reasons[0] ? ", " : "", hm_rt8_why[i], c);
+			}
+			hm_print("fps: ... rt8: %u textures stored as 8-bit (fmt115 %u, fmt65 %u), %u excluded (%s)\n", a + b, a, b, k, k ? reasons : "none");
 		}
 		if (memcmp(hm_layouts_made, hm_layouts_reported, sizeof(hm_layouts_made)) != 0) {
 			hm_print("fps: ... textures made by layout: %u UBWC 8-bit, %u UBWC fp16 | linear: %u small, %u mipped, %u not 2D, %u large 2D unmipped "

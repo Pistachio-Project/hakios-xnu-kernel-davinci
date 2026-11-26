@@ -2950,12 +2950,21 @@ bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, Blit
     // r2d_src and r2d_dst do over a UBWC view): a copy of its own format, pixel for pixel, of its one level -- or a
     // multisample attachment's resolve into one, which turnip's resolve_sysmem sends through the same r2d_dst. A scale, a
     // filter or a turn into or out of one is nothing anything here asks for, and is refused rather than sent unmeasured
+    // metal_rt8: a render target of RGBA16Float or RG16Float stored as 8-bit unorm (the plug-in's experiment) and a texture of the
+    // 16-bit format it answers to are copied through the engine's own conversion: the source is sampled as float, the
+    // destination's format narrows or widens it (Metal never pairs these two formats otherwise: it asks for one pixel format)
+    auto rt8Pair = [](const FormatInfo& x, const FormatInfo& y) {
+        auto half = [](const FormatInfo& f) { return f.fmt6 == FMT6_16_16_16_16_FLOAT || f.fmt6 == FMT6_16_16_FLOAT; };
+        auto narrow = [](const FormatInfo& f) { return f.fmt6 == FMT6_8_8_8_8_UNORM || f.fmt6 == FMT6_8_8_UNORM; };
+        return (half(x) && narrow(y) && x.bytesPerPixel == 2 * y.bytesPerPixel) || (half(y) && narrow(x) && y.bytesPerPixel == 2 * x.bytesPerPixel);
+    };
+    const bool converts = sf.fmt6 != df.fmt6 && rt8Pair(sf, df);
     if ((src.compressed() || dst.compressed()) &&
-        (sf.fmt6 != df.fmt6 || sf.swap != df.swap || srcLevel != 0 || dstLevel != 0 || linear || o.rotate2d != 0 || s.w != d.w || s.h != d.h)) {
+        ((sf.fmt6 != df.fmt6 && !converts) || (converts && sf.swap != df.swap) || sf.swap != df.swap || srcLevel != 0 || dstLevel != 0 || linear || o.rotate2d != 0 || s.w != d.w || s.h != d.h)) {
         return refuse(why, std::string("a copy ") + (src.compressed() ? "from" : "into") + " a compressed texture: of its own format, pixel for pixel, unturned, " +
                                "from and into level 0 is what is served");
     }
-    if (sf.fmt6 != df.fmt6 || sf.swap != df.swap) {
+    if ((sf.fmt6 != df.fmt6 && !converts) || sf.swap != df.swap) {
         return refuse(why, std::string("a copy from ") + sf.name + " to " + df.name + ": the two must be one pixel format (an sRGB pair is one)");
     }
     if (srcLevel >= src.levels() || dstLevel >= dst.levels()) {
