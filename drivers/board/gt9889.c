@@ -93,6 +93,7 @@
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/sched.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
@@ -1173,6 +1174,44 @@ lift_if_silent(uint64_t now)
 	}
 }
 
+/*
+ * Boot-arg touch_lat=1: how long a report takes through this thread, in a line every 5 s ("touch: ..."): the thread's
+ * wake lateness (the 8 ms sleep's overshoot: what the scheduler adds), the chip read (bus), the decode and the posting.
+ * (The line's interrupt time is not known: the latch is looked at every POLL_MS, so a report waits 0 to POLL_MS more
+ * than what is measured here. Userland's own half is in inject26.c, "touch: ... user read".)
+ */
+static uint32_t lat_on;
+static struct {
+	uint64_t n, wake_sum, wake_max, read_sum, read_max, post_sum, post_max, wakes, since_us;
+} lat;
+
+static void
+lat_add(uint64_t *sum, uint64_t *max, uint64_t v)
+{
+	*sum += v;
+	if (v > *max) {
+		*max = v;
+	}
+}
+
+static void
+lat_flush(uint64_t now)
+{
+	if (lat.since_us == 0) {
+		lat.since_us = now;
+	}
+	if (now - lat.since_us < 5000000) {
+		return;
+	}
+	if (lat.n != 0 || lat.wakes != 0) {
+		say("touch: gt9889 %llu reports: wake late avg/max %llu/%llu us (of %llu polls), bus read %llu/%llu us, decode+post %llu/%llu us\n",
+		    lat.n, lat.wakes ? lat.wake_sum / lat.wakes : 0, lat.wake_max, lat.wakes, lat.n ? lat.read_sum / lat.n : 0, lat.read_max,
+		    lat.n ? lat.post_sum / lat.n : 0, lat.post_max);
+	}
+	memset(&lat, 0, sizeof(lat));
+	lat.since_us = now;
+}
+
 /* One look at the chip; false: it is given up. */
 static bool
 poll_once(unsigned tick)
@@ -1182,7 +1221,7 @@ poll_once(unsigned tick)
 	unsigned bytes = 0;
 	enum gt9889_look look = GT9889_BAD;
 	bool armed = __atomic_load_n(&latch_armed, __ATOMIC_SEQ_CST), edge = false, down = fingers_down() != 0, asked, got;
-	uint64_t now;
+	uint64_t now, started_us = lat_on ? now_us() : 0, posted_us;
 
 	if (esd_on && tick % ESD_TICKS == 0) {
 		esd_tick();
@@ -1235,6 +1274,12 @@ poll_once(unsigned tick)
 		heard(now);
 		seen.reports++;
 		report(&frame);
+		if (lat_on) {
+			posted_us = now_us();
+			lat.n++;
+			lat_add(&lat.read_sum, &lat.read_max, now - started_us);
+			lat_add(&lat.post_sum, &lat.post_max, posted_us - now);
+		}
 	} else if (look == GT9889_NOTHING || look == GT9889_REQUEST) {
 		if (look == GT9889_REQUEST && seen.requests++ < 4) {
 			say("gt9889: the firmware asks for something (event byte 0x%02x): this driver does nothing for it, and says it was taken\n",
@@ -1339,7 +1384,17 @@ gt9889_thread(__unused void *parameter, __unused wait_result_t result)
 			break;
 		}
 		done();
-		wait_ms(POLL_MS);
+		if (lat_on) {
+			uint64_t slept = now_us();
+
+			wait_ms(POLL_MS);
+			slept = now_us() - slept;
+			lat.wakes++;
+			lat_add(&lat.wake_sum, &lat.wake_max, slept > POLL_MS * 1000 ? slept - POLL_MS * 1000 : 0);
+			lat_flush(now_us());
+		} else {
+			wait_ms(POLL_MS);
+		}
 	}
 	/* (or the run's end has the chip: hakios_gt9889_quiesce() powers it off) */
 	thread_terminate(current_thread());
@@ -1396,12 +1451,13 @@ hakios_gt9889_init(void)
 	PE_parse_boot_argn("gt9889_trace", &trace, sizeof(trace));
 	PE_parse_boot_argn("gt9889_steps", &steps, sizeof(steps));
 	PE_parse_boot_argn("gt9889_doze", &doze, sizeof(doze));
+	PE_parse_boot_argn("touch_lat", &lat_on, sizeof(lat_on));
 	if (steps == 0) {
 		say("gt9889: gt9889_steps=0: nothing is done\n");
 		return;
 	}
 	__atomic_store_n(&started, true, __ATOMIC_SEQ_CST);
-	if (kernel_thread_start(gt9889_thread, NULL, &thread) == KERN_SUCCESS) {
+	if (kernel_thread_start_priority(gt9889_thread, NULL, BASEPRI_PREEMPT, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {
 		__atomic_store_n(&started, false, __ATOMIC_SEQ_CST);

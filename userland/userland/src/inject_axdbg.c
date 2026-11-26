@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <mach/mach_time.h>
 #include <stdarg.h>
 #include <fcntl.h>
 
@@ -97,10 +98,100 @@ ax_report(const char *why)
 	snprintf(last, sizeof(last), "%s", strchr(line, ']'));
 }
 
+
+/* The fix. On this port the setting reaches the preference (cfprefsd, the plist) but libAccessibility's cache in the
+ * other processes is never invalidated: Settings posts nothing that arrives here (logs/001321-run.log: no notify line,
+ * notify state 0 everywhere). So the two getters UIKit, CoreMaterial and SpringBoard call are answered from the
+ * preference itself (looked at again at most every 300 ms), and when a value is seen to change the cache
+ * notifications are posted locally, which is what makes UIKit and SpringBoard restyle live. */
+extern Boolean _AXSEnhanceBackgroundContrastEnabled(void);
+extern Boolean _AXSReduceMotionEnabled(void);
+
+static int
+ax_pref_value(CFStringRef key, int fallback)
+{
+	CFTypeRef v = CFPreferencesCopyAppValue(key, CFSTR("com.apple.Accessibility"));
+	int result = fallback;
+
+	if (v != NULL) {
+		if (CFGetTypeID(v) == CFBooleanGetTypeID()) {
+			result = CFBooleanGetValue(v);
+		} else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+			int x = 0;
+			CFNumberGetValue(v, kCFNumberIntType, &x);
+			result = x != 0;
+		}
+		CFRelease(v);
+	}
+	return result;
+}
+
+static Boolean
+ax_cached(CFStringRef key, uint64_t *when, int *value, Boolean (*original)(void))
+{
+	uint64_t now = mach_absolute_time();
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	if (*when == 0 || (now - *when) * tb.numer / tb.denom > 300000000ULL) {
+		*value = ax_pref_value(key, original ? (int)original() : 0);
+		*when = now;
+	}
+	return *value != 0;
+}
+
+static Boolean
+ax_contrast(void)
+{
+	static uint64_t when;
+	static int value;
+
+	return ax_cached(CFSTR("EnhancedBackgroundContrastEnabled"), &when, &value, NULL);
+}
+
+static Boolean
+ax_motion(void)
+{
+	static uint64_t when;
+	static int value;
+
+	return ax_cached(CFSTR("ReduceMotionEnabled"), &when, &value, NULL);
+}
+
+__attribute__((used)) static struct {
+	const void *replacement;
+	const void *original;
+} ax_interposers[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)(uintptr_t)&ax_contrast, (const void *)(uintptr_t)&_AXSEnhanceBackgroundContrastEnabled },
+	{ (const void *)(uintptr_t)&ax_motion, (const void *)(uintptr_t)&_AXSReduceMotionEnabled },
+};
+
+static void
+ax_post_changes(void)
+{
+	static int last_c = -1, last_m = -1;
+	int c = ax_pref_value(CFSTR("EnhancedBackgroundContrastEnabled"), 0);
+	int m = ax_pref_value(CFSTR("ReduceMotionEnabled"), 0);
+
+	if (last_c >= 0 && c != last_c) {
+		uint32_t r = notify_post(ax_cache_names[0]);
+		say("hakios26: ax[%s]: Reduce Transparency now %d: posted %s (%u)\n", getprogname(), c, ax_cache_names[0], r);
+	}
+	if (last_m >= 0 && m != last_m) {
+		uint32_t r = notify_post(ax_cache_names[1]);
+		say("hakios26: ax[%s]: Reduce Motion now %d: posted %s (%u)\n", getprogname(), m, ax_cache_names[1], r);
+	}
+	last_c = c;
+	last_m = m;
+}
+
 static void
 ax_poll(void *unused)
 {
 	(void)unused;
+	ax_post_changes();
 	ax_report("poll");
 	dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), NULL, ax_poll);
 }
@@ -116,6 +207,7 @@ ax_debug_start(void)
 			ax_report("notify");
 		});
 	}
+	ax_post_changes();
 	ax_report("start");
 	dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), NULL, ax_poll);
 }

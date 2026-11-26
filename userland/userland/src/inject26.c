@@ -520,6 +520,9 @@ input_thread(__unused void *arg)
 	int device;
 
 	pthread_setname_np("hakios input");
+	/* the touches' way in is the event system's own work, and at user-interactive QoS, as Apple's HID threads are: at the default QoS
+	 * (inherited from the creator) it waits behind every busy thread of the P cluster, and a lower one prefers the E cores (amp=1) */
+	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 	{
 		char arguments[1024] = "";
 		size_t size = sizeof(arguments) - 1;
@@ -541,7 +544,8 @@ input_thread(__unused void *arg)
 			say("hakios: input: no HID client of type %d\n", types[i]);
 			continue;
 		}
-		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("hakios.input", NULL));
+		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("hakios.input", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+		    QOS_CLASS_USER_INTERACTIVE, 0)));
 		screen = make_service(client, "HakiOS touch screen", HID_PAGE_DIGITIZER, HID_USAGE_TOUCH_SCREEN, true);
 		if (screen == NULL) {
 			say("hakios: input: a HID client of type %d may not create services\n", types[i]);
@@ -612,6 +616,21 @@ input_thread(__unused void *arg)
 		} else {
 			send_touch(screen, &t);
 			if (touch_latency) {
+				uint64_t sent_at = mach_absolute_time(), now_us_ = micros(sent_at);
+				static uint64_t sum_pr, max_pr, sum_rs, max_rs, n_ev, since;
+				uint64_t pr = micros(read_at) - micros(t.time), rs = micros(sent_at) - micros(read_at);
+
+				sum_pr += pr; sum_rs += rs; n_ev++;
+				max_pr = pr > max_pr ? pr : max_pr;
+				max_rs = rs > max_rs ? rs : max_rs;
+				if (since == 0) {
+					since = now_us_;
+				} else if (now_us_ - since >= 5000000) {
+					say("touch: %llu events, kernel queue->user read avg/max %llu/%llu us, read->IOHID dispatch %llu/%llu us\n",
+					    n_ev, sum_pr / n_ev, max_pr, sum_rs / n_ev, max_rs);
+					sum_pr = max_pr = sum_rs = max_rs = n_ev = 0;
+					since = now_us_;
+				}
 				say("tl: i %u posted %llu read %llu sent %llu\n", t.type, micros(t.time), micros(read_at),
 				    micros(mach_absolute_time()));
 			}
