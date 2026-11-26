@@ -22,6 +22,7 @@
 #include <objc/message.h>
 #include <notify.h>
 #include <os/lock.h>
+#include <math.h>
 #include <pthread.h>
 #include <dlfcn.h>
 #include <stdarg.h>
@@ -623,9 +624,28 @@ input_thread(__unused void *arg)
 				sum_pr += pr; sum_rs += rs; n_ev++;
 				max_pr = pr > max_pr ? pr : max_pr;
 				max_rs = rs > max_rs ? rs : max_rs;
+				static uint64_t g_t0, g_last, g_n, g_maxgap;
+				static double g_x0, g_y0, g_x1, g_y1;
+
+				if (t.type == HAKIOS_TOUCH_DOWN || g_n == 0) {
+					g_t0 = micros(t.time); g_n = 0; g_maxgap = 0;
+					g_x0 = t.x; g_y0 = t.y;
+				} else if (micros(t.time) - g_last > g_maxgap) {
+					g_maxgap = micros(t.time) - g_last;
+				}
+				g_last = micros(t.time); g_x1 = t.x; g_y1 = t.y; g_n++;
+				if (t.type == HAKIOS_TOUCH_UP && g_last > g_t0) {
+					/* the panel is 1080 x 2340: the gesture's length and speed in panel pixels, from the kernel's stamps */
+					double dx = (g_x1 - g_x0) * 1080 / 65535, dy = (g_y1 - g_y0) * 2340 / 65535, us = (double)(g_last - g_t0);
+
+					say("touch: gesture %llu samples in %.0f ms (%.0f Hz, longest gap %llu us), moved %.0f,%.0f px = %.0f px/s\n",
+					    g_n, us / 1000, g_n * 1e6 / us, g_maxgap, dx, dy, sqrt(dx * dx + dy * dy) * 1e6 / us);
+					g_n = 0;
+				}
 				if (since == 0) {
 					since = now_us_;
-				} else if (now_us_ - since >= 5000000) {
+				}
+				if (now_us_ - since >= 5000000 || t.type == HAKIOS_TOUCH_UP) {
 					say("touch: %llu events, kernel queue->user read avg/max %llu/%llu us, read->IOHID dispatch %llu/%llu us\n",
 					    n_ev, sum_pr / n_ev, max_pr, sum_rs / n_ev, max_rs);
 					sum_pr = max_pr = sum_rs = max_rs = n_ev = 0;
