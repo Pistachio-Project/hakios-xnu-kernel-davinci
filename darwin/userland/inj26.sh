@@ -59,6 +59,7 @@ $DYN -fblocks -dynamiclib -install_name /hakios/lib/libhakios-store.dylib -frame
 $DYN -fblocks -dynamiclib -install_name /hakios/lib/libhakios-mad.dylib -framework CoreFoundation -lobjc -Wl,-undefined,dynamic_lookup -o "$O/libhakios-mad.dylib" "$RN/../components/apple-id/src/inject_mad.c"
 # the layer tree of any application on the notification com.hakios.layers (rwtouch notify): inject_sb.c alone, which in a
 # program that is not SpringBoard does only that (root26-darwin.sh LAYERS="NAME ...")
+$DYN -fblocks -dynamiclib -install_name /hakios/lib/libhakios-axdbg.dylib -framework CoreFoundation -o "$O/libhakios-axdbg.dylib" "$O/src/inject_axdbg.c"
 $DYN -dynamiclib -install_name /hakios/lib/libhakios-layers.dylib -framework CoreFoundation -framework IOKit -lobjc -o "$O/libhakios-layers.dylib" "$O/src/inject_sb.c"
 $DYN -dynamiclib -install_name /hakios/lib/libhakios-statusbar.dylib -framework CoreFoundation -framework IOKit -lobjc -o "$O/libhakios-statusbar.dylib" -I"$O/boards" "$RN/../components/statusbar/inject_statusbar.c" "$RN/userland/uncaught.c"
 # the audio server's output device (AudioServerPlugIn, arm64e: the audio server is): the speaker route and its

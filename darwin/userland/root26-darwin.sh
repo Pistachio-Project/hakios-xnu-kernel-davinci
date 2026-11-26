@@ -380,6 +380,7 @@ echo "/hakios/lib/libhakios-backlight.dylib SpringBoard" >> $T/etc/inject.conf
 # hw.backlight; backboardd for CoreBrightness's own side (src: components/brightness/inject_brightness.c). It does
 # nothing where the kernel has no backlight (boot-arg backlight=0).
 echo "/hakios/lib/libhakios-brightness.dylib SpringBoard backboardd Preferences" >> $T/etc/inject.conf
+echo "/hakios/lib/libhakios-axdbg.dylib SpringBoard backboardd Preferences" >> $T/etc/inject.conf
 # UIKit's feedback generators (Settings' switches, long presses) played on the motor (components/haptic/inject_haptic.c)
 echo "/hakios/lib/libhakios-haptic.dylib @apps SpringBoard" >> $T/etc/inject.conf
 # cameracaptured, iOS 27's camera daemon: the flashlight's server given the kernel's flashlight (src:
