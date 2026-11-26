@@ -561,8 +561,9 @@ serve(void)
 		}
 		__atomic_store_n(&writing, false, __ATOMIC_SEQ_CST);
 		if (fast && state == IDLE && !leaving) {
-			/* asleep until a waveform begins (or 5 ms: the run's end and trouble are looked at as before) */
-			assert_wait_timeout((event_t)&wake_event, THREAD_UNINT, 5, NSEC_PER_MSEC);
+			/* asleep until a waveform begins (the write wakes the thread; 100 ms, not 5, for the run's end and trouble:
+			 * 200 wakeups a second for nothing while the motor is idle) */
+			assert_wait_timeout((event_t)&wake_event, THREAD_UNINT, 100, NSEC_PER_MSEC);
 			if (onset_us != handled) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
 				continue;

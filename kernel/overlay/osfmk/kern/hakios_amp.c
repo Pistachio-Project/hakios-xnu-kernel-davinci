@@ -27,6 +27,10 @@
 #include <pexpert/pexpert.h>
 #include <os/atomic_private.h>
 #include <kern/misc_protos.h>
+#include <arm/cpu_data_internal.h>
+#include <arm/machine_routines.h>
+#include <mach/arm/thread_status.h>
+#include <sys/bsdtask_info.h>
 #include <string.h>
 
 extern uint32_t hakios_amp_enabled;
@@ -36,6 +40,9 @@ extern void loader_log_line(const char *line);
 void hakios_amp_start(void);
 
 #define AMP_PERIOD_MS   5000
+#define KT_MAX          512             /* kernel threads whose run time is remembered between two lines */
+#define KT_TOP          10
+#define KT_BT           6
 #define AMP_THREADS     64              /* threads of a process remembered between two lines */
 
 static const char *const bucket_name[TH_BUCKET_SCHED_MAX] = {
@@ -79,13 +86,13 @@ find_task(const char *name)
 }
 
 /*
- * The sampler (boot-arg amp_samp=MS, default 2; 0: none): every MS it looks at what each processor runs and
+ * The sampler (boot-arg amp_samp=MS, default 10 (was 2: 500 wakeups a second of the kernel's own); 0: none): every MS it looks at what each processor runs and
  * counts, per process (by its task pointer, resolved to a name only when a line is made), the samples by
  * scheduling bucket on P and on E. The thread it reads is never dereferenced beyond its bucket and task.
  */
 #define AMP_TASKS 128
 static struct { task_t task; uint16_t n[2][TH_BUCKET_SCHED_MAX]; } samp[AMP_TASKS];
-static uint32_t samp_ms = 2;
+static uint32_t samp_ms = 10;
 static uint64_t samp_unit_us;   /* the length of a sample of the last 5 s, in us */
 
 static void
@@ -122,6 +129,142 @@ sample_once(void)
 		if (i < AMP_TASKS) {
 			samp[i].n[e][b]++;
 		}
+	}
+}
+
+
+/*
+ * kernel_task by thread: every report the kernel threads' P and E run time since the last (the per-thread
+ * hk_cluster_time of the scheduler hook), the ten largest:
+ *
+ *   amp: ktop N 'name' tid T P ms X E ms Y cont C bt a b c d e f     (slide S in the amp: ktopslide line)
+ *
+ * name: thread_set_thread_name, if the driver gave one; cont: the continuation of a thread blocked with one; bt:
+ * the return addresses of a blocked thread's kernel stack (nm the unstripped kernel on the host: addr - slide).
+ * A thread that runs at that moment has neither. Switch: boot-arg amp_ktop=0.
+ */
+static uint32_t ktop_on = 1;
+static struct { uint64_t tid, p, e; } kt_prev[KT_MAX];
+
+struct kt_row {
+	uint64_t tid, p, e, cont, bt[KT_BT];
+	char name[24];
+	uint8_t nbt;
+	bool running;
+};
+
+static void
+kt_stack(thread_t t, struct kt_row *r)
+{
+	vm_offset_t stk = t->kernel_stack;
+	const arm_kernel_saved_state_t *ks;
+	uint64_t fp;
+
+	if (stk == 0 || t->machine.kstackptr == NULL) {
+		return;
+	}
+	ks = &((thread_kernel_state_t)t->machine.kstackptr)->machine.ss;
+	r->bt[r->nbt++] = ks->lr;
+	fp = ks->fp;
+	while (r->nbt < KT_BT && fp >= stk && fp + 16 <= stk + kernel_stack_size && (fp & 7) == 0) {
+		uint64_t ra = ((uint64_t *)fp)[1], next = ((uint64_t *)fp)[0];
+
+		if (ra != 0) {
+			r->bt[r->nbt++] = ra;
+		}
+		if (next <= fp) {
+			break;
+		}
+		fp = next;
+	}
+}
+
+static void
+report_ktop(void)
+{
+	static struct { uint64_t tid, p, e; } now_t[KT_MAX];
+	struct kt_row top[KT_TOP];
+	unsigned int ntop = 0, nnow = 0;
+	uint64_t tot_p = 0, tot_e = 0;
+	thread_t t;
+	char line[300];
+
+	bzero(top, sizeof(top));
+	task_lock(kernel_task);
+	queue_iterate(&kernel_task->threads, t, thread_t, task_threads) {
+		uint64_t tid = t->thread_id, p = t->hk_cluster_time[0], e = t->hk_cluster_time[1], dp = p, de = e;
+		unsigned int i, at;
+		uint64_t ms;
+		spl_t s;
+
+		for (i = 0; i < KT_MAX && kt_prev[i].tid != 0; i++) {
+			if (kt_prev[i].tid == tid) {
+				dp = p - kt_prev[i].p;
+				de = e - kt_prev[i].e;
+				break;
+			}
+		}
+		if (nnow < KT_MAX) {
+			now_t[nnow].tid = tid;
+			now_t[nnow].p = p;
+			now_t[nnow].e = e;
+			nnow++;
+		}
+		dp = to_ms(dp);
+		de = to_ms(de);
+		tot_p += dp;
+		tot_e += de;
+		ms = dp + de;
+		if (ms == 0) {
+			continue;
+		}
+		for (at = 0; at < ntop && top[at].p + top[at].e >= ms; at++) {
+		}
+		if (at >= KT_TOP) {
+			continue;
+		}
+		if (ntop < KT_TOP) {
+			ntop++;
+		}
+		memmove(&top[at + 1], &top[at], (ntop - 1 - at) * sizeof(top[0]));
+		bzero(&top[at], sizeof(top[at]));
+		top[at].tid = tid;
+		top[at].p = dp;
+		top[at].e = de;
+		s = splsched();
+		thread_lock(t);
+		top[at].cont = (uintptr_t)t->continuation;
+		if ((t->state & (TH_WAIT | TH_RUN)) == TH_WAIT) {
+			kt_stack(t, &top[at]);
+		} else {
+			top[at].running = true;
+		}
+		thread_unlock(t);
+		splx(s);
+		if (get_bsdthread_info(t) != NULL) {
+			char nm[MAXTHREADNAMESIZE];
+
+			bzero(nm, sizeof(nm));
+			bsd_getthreadname(get_bsdthread_info(t), nm);
+			strlcpy(top[at].name, nm, sizeof(top[at].name));
+		}
+	}
+	task_unlock(kernel_task);
+	bzero(kt_prev, sizeof(kt_prev));
+	memcpy(kt_prev, now_t, nnow * sizeof(now_t[0]));
+	snprintf(line, sizeof(line), "amp: ktopslide %#lx kernel_task %u threads P ms %llu E ms %llu\n",
+	    (unsigned long)vm_kernel_slide, nnow, (unsigned long long)tot_p, (unsigned long long)tot_e);
+	amp_say(line);
+	for (unsigned int i = 0; i < ntop; i++) {
+		int at = snprintf(line, sizeof(line), "amp: ktop %u '%s' tid %llu P ms %llu E ms %llu cont %#llx%s", i, top[i].name,
+		    (unsigned long long)top[i].tid, (unsigned long long)top[i].p, (unsigned long long)top[i].e,
+		    (unsigned long long)top[i].cont, top[i].running ? " (running)" : " bt");
+
+		for (unsigned int k = 0; k < top[i].nbt; k++) {
+			at += snprintf(line + at, sizeof(line) - at, " %#llx", (unsigned long long)top[i].bt[k]);
+		}
+		snprintf(line + at, sizeof(line) - at, "\n");
+		amp_say(line);
 	}
 }
 
@@ -338,6 +481,9 @@ amp_thread(void *arg __unused, wait_result_t wr __unused)
 		if (samp_ms) {
 			report_top(now - then);
 		}
+		if (ktop_on) {
+			report_ktop();
+		}
 		then = now;
 	}
 }
@@ -352,6 +498,7 @@ hakios_amp_start(void)
 		return;
 	}
 	PE_parse_boot_argn("amp_samp", &samp_ms, sizeof(samp_ms));
+	PE_parse_boot_argn("amp_ktop", &ktop_on, sizeof(ktop_on));
 	PE_parse_boot_argn("amp_ui", &ui_mode, sizeof(ui_mode));
 	if (kernel_thread_start(amp_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);

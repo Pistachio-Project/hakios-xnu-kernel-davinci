@@ -3855,6 +3855,7 @@ gpu_pm_thread(__unused void *arg, __unused wait_result_t result)
 {
 	uint32_t top = gpu_speed, level = top, quiet_windows = 0, window_busy = 0, window_looks = 0;
 	uint64_t said, period, last_submissions = gpu_submissions;
+	uint32_t look_ms = 10;          /* the next look: 100 ms once the core is idle at its lowest level (a submission wakes the thread) */
 
 	nanoseconds_to_absolutetime(5 * NSEC_PER_SEC, &period);
 	said = mach_absolute_time();
@@ -3863,7 +3864,7 @@ gpu_pm_thread(__unused void *arg, __unused wait_result_t result)
 		uint64_t now, deadline;
 		uint32_t idle_ms, want;
 
-		clock_interval_to_deadline(10, NSEC_PER_MSEC, &deadline);
+		clock_interval_to_deadline(look_ms, NSEC_PER_MSEC, &deadline);
 		assert_wait_deadline((event_t)&gpu_pm_event, THREAD_UNINT, deadline);
 		thread_block(THREAD_CONTINUE_NULL);
 		if (!gpu_kept) {
@@ -3907,6 +3908,7 @@ gpu_pm_thread(__unused void *arg, __unused wait_result_t result)
 			gpu_pm_set(level, now);
 		}
 		gpu_pm_low = level < top;
+		look_ms = (level == 1 && gpu_pm_low && (gpu_pm_dark || idle_ms >= gpu_pm_idle_ms)) ? 100 : 10;
 		if (gpu_submissions != last_submissions) {
 			gpu_pm_stat.submissions_seen += (uint32_t)(gpu_submissions - last_submissions);
 			last_submissions = gpu_submissions;

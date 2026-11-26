@@ -621,7 +621,8 @@ bl_thread(__unused void *argument, __unused wait_result_t result)
 		if (now == goal << 10 && by_hand && (!behind || broken)) {
 			assert_wait(&poke, THREAD_UNINT);
 		} else {
-			assert_wait_timeout(&poke, THREAD_UNINT, TICK_MS, NSEC_PER_MSEC);
+			/* (automatic and settled: the light is looked at 4 times a second, not 20) */
+			assert_wait_timeout(&poke, THREAD_UNINT, (now == goal << 10 && !behind) ? 4 * TICK_MS : TICK_MS, NSEC_PER_MSEC);
 		}
 		/*
 		 * A poke that came after this turn read what it acted on and before the wait above was
