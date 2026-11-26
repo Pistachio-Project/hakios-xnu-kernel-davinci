@@ -147,6 +147,7 @@ static BOOL (*original_has)(id, SEL);
 static id (*original_init)(id, SEL);
 static void (*original_turn_on)(id, SEL, id);
 static bool has_done, init_done, turn_done, off_done, avail_done, tap_done;
+static void try_hooks(void);
 static BOOL (*original_avail)(id, SEL);
 static void (*original_turn_off)(id, SEL, id);
 static void (*original_tap)(id, SEL, id, id);
@@ -168,6 +169,10 @@ static id
 flash_init(id self, SEL _cmd)
 {
 	id made = original_init(self, _cmd);
+
+	if (!tap_done) {
+		try_hooks();
+	}
 
 	say("hakios: flash: -[AVFlashlight init] gives %s\n", made != nil ? "a flashlight (its server answered)" : "NOTHING");
 	return made;
@@ -194,6 +199,11 @@ static BOOL
 flash_avail(id self, SEL _cmd)
 {
 	BOOL was = original_avail(self, _cmd);
+
+	/* the module's class is registered after its image is added: this is asked for when its view loads, before any tap */
+	if (!tap_done) {
+		try_hooks();
+	}
 
 	if ((int)was != avail_was) {
 		avail_was = was;
