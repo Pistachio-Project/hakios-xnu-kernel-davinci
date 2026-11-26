@@ -101,6 +101,7 @@
 #include <sys/systm.h>
 
 #include "kernel.h"
+#include <kern/sched_prim.h>
 
 extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
 #include "board.h"
@@ -719,6 +720,105 @@ static uint32_t int_found_intr_cfg;     /* INT's interrupt detection as found, a
 static bool latch_armed;
 static bool powered;                    /* bring-up has begun to change things: there is something to put back */
 
+/*
+ * Boot-arg touch_irq=1: the pin's falling edge is taken as an interrupt instead of the latch being polled. The pin
+ * controller's summary interrupt (the tlmm node's `interrupts = <0 208 0>' in Android's sdmmagpie DT: SPI 208, GIC
+ * interrupt 240, level) is attached to the interrupt controller; the pin is armed as the latch is (falling edge,
+ * goodix,irq-flags = 2) and also enabled and targeted at the apps processor (INTR_CFG: enable bit 0, polarity 1,
+ * detection 2:3, raw status 4, target 5:7 = 4, Linux pinctrl-msm.c INTR_TARGET_PROC_APPS, dir-conn off). The handler
+ * looks at this pin's status alone, clears it, and wakes the thread, which reads the chip as the polling does. A report
+ * waiting when it is enabled is found by the line's level. If edges show in the latch and no interrupt comes for
+ * IRQ_SILENT_US, or the summary fires without our pin (IRQ_STORM times), the interrupt is given up and the latch polled.
+ */
+#define TLMM_SUMMARY_SPI        208
+#define TLMM_SUMMARY_INTID      (TLMM_SUMMARY_SPI + 32)
+#define INTR_TARGET_MASK        (7u << 5)
+#define INTR_TARGET_APPS        (4u << 5)
+#define IRQ_SILENT_US           2000000
+#define IRQ_STORM               20000
+
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+
+static uint32_t irq_want;               /* boot-arg touch_irq */
+static bool irq_attached, irq_mode;     /* the interrupt is ours / it is what the thread waits for */
+static uint32_t irq_pending, irq_event, irq_storm;
+static uint64_t irq_at_us, irq_count, irq_spurious, irq_reported;
+
+static void
+irq_handler(__unused void *context, __unused uint32_t intid)
+{
+	if (rd(GPIO_INTR_STATUS(PIN_INT)) & 1) {
+		wr(GPIO_INTR_STATUS(PIN_INT), 0);
+		__atomic_fetch_add(&irq_count, 1, __ATOMIC_SEQ_CST);
+		if (__atomic_exchange_n(&irq_pending, 1, __ATOMIC_SEQ_CST) == 0) {
+			__atomic_store_n(&irq_at_us, now_us(), __ATOMIC_SEQ_CST);
+		}
+		thread_wakeup((event_t)&irq_event);
+	} else if (__atomic_add_fetch(&irq_spurious, 1, __ATOMIC_SEQ_CST) > IRQ_STORM && !__atomic_exchange_n(&irq_storm, 1, __ATOMIC_SEQ_CST)) {
+		gic_v3_spi_mask(TLMM_SUMMARY_INTID);    /* (a level interrupt that is not ours and will not go away) */
+		thread_wakeup((event_t)&irq_event);
+	}
+}
+
+/* the interrupt given up (thread): masked, and the pin back to the latch alone */
+static void
+irq_stop(const char *why)
+{
+	if (!irq_mode) {
+		return;
+	}
+	gic_v3_spi_mask(TLMM_SUMMARY_INTID);
+	irq_mode = false;
+	if (latch_armed) {
+		gpio_edge_latch_arm(PIN_INT);
+	}
+	say("gt9889: touch_irq: given up (%s): %llu interrupts, %llu spurious; the latch is polled\n", why, irq_count, irq_spurious);
+}
+
+static void
+irq_start(void)
+{
+	uint32_t cfg;
+	kern_return_t kr;
+
+	if (irq_want != 1 || !latch_armed) {
+		return;
+	}
+	kr = gic_v3_spi_attach(TLMM_SUMMARY_INTID, false, irq_handler, NULL);
+	if (kr != KERN_SUCCESS) {
+		say("gt9889: touch_irq: the pin controller's interrupt (SPI %u) could not be taken (%d): polling\n", TLMM_SUMMARY_SPI, (int)kr);
+		return;
+	}
+	irq_attached = true;
+	cfg = rd(GPIO_INTR_CFG(PIN_INT));
+	cfg &= ~(INTR_ENABLE | INTR_DETECTION_MASK | INTR_DIR_CONN_EN | INTR_TARGET_MASK);
+	cfg |= INTR_RAW_STATUS_EN | INTR_DETECTION_EDGE_FALLING | INTR_POLARITY | INTR_TARGET_APPS;
+	wr(GPIO_INTR_CFG(PIN_INT), cfg);
+	wr(GPIO_INTR_STATUS(PIN_INT), 0);
+	irq_mode = true;
+	/* a report already waiting (the line is low) is not an edge that will come: */
+	if (!gpio_get(PIN_INT)) {
+		__atomic_store_n(&irq_at_us, now_us(), __ATOMIC_SEQ_CST);
+		__atomic_store_n(&irq_pending, 1, __ATOMIC_SEQ_CST);
+	}
+	wr(GPIO_INTR_CFG(PIN_INT), cfg | INTR_ENABLE);
+	say("gt9889: touch_irq: the pin controller's summary interrupt (SPI %u) is ours, gpio%u falling edge enabled (cfg 0x%x)\n",
+	    TLMM_SUMMARY_SPI, PIN_INT, rd(GPIO_INTR_CFG(PIN_INT)));
+}
+
+/* wait for the pin's interrupt for at most `us' */
+static void
+irq_sleep(uint32_t us)
+{
+	assert_wait_timeout((event_t)&irq_event, THREAD_UNINT, us, NSEC_PER_USEC);
+	if (__atomic_load_n(&irq_pending, __ATOMIC_SEQ_CST)) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+		return;
+	}
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
 static void
 pins_record(void)
 {
@@ -753,6 +853,10 @@ power_off(void)
 	}
 	if (WIRED->io_supply != NULL) {
 		supply_off(WIRED->io_supply, &io_supply_at);
+	}
+	if (irq_attached) {
+		gic_v3_spi_mask(TLMM_SUMMARY_INTID);    /* (before the pin's registers go back) */
+		irq_mode = false;
 	}
 	if (latch_armed) {
 		wr(GPIO_INTR_CFG(PIN_INT), int_found_intr_cfg);         /* (then the latch, which putting the detection back may set) */
@@ -1184,7 +1288,7 @@ lift_if_silent(uint64_t now)
  */
 static uint32_t lat_on;
 static struct {
-	uint64_t n, wake_sum, wake_max, read_sum, read_max, post_sum, post_max, wakes, since_us, last_rep_us, cont_n, cont_us, gap_max;
+	uint64_t n, wake_sum, wake_max, read_sum, read_max, post_sum, post_max, wakes, since_us, last_rep_us, cont_n, cont_us, gap_max, irq_lat_n, irq_lat_sum, irq_lat_max;
 } lat;
 
 static void
@@ -1210,6 +1314,13 @@ lat_flush(uint64_t now)
 		    lat.n, lat.wakes ? lat.wake_sum / lat.wakes : 0, lat.wake_max, lat.wakes, lat.n ? lat.read_sum / lat.n : 0, lat.read_max,
 		    lat.n ? lat.post_sum / lat.n : 0, lat.post_max);
 	}
+	if (irq_mode || irq_count != 0) {
+		uint64_t c = __atomic_load_n(&irq_count, __ATOMIC_SEQ_CST);
+
+		say("touch: gt9889 irq: %llu interrupts, irq->read %llu/%llu us avg/max, spurious %llu\n", c - irq_reported,
+		    lat.irq_lat_n ? lat.irq_lat_sum / lat.irq_lat_n : 0, lat.irq_lat_max, __atomic_load_n(&irq_spurious, __ATOMIC_SEQ_CST));
+		irq_reported = c;
+	}
 	if (lat.cont_us != 0) {
 		say("touch: gt9889 while touching %llu reports/s (%llu intervals), longest gap between reports %llu us\n",
 		    lat.cont_n * 1000000 / lat.cont_us, lat.cont_n, lat.gap_max);
@@ -1227,6 +1338,7 @@ lat_flush(uint64_t now)
 static bool
 poll_once(unsigned tick)
 {
+	uint64_t irq_got_us = 0;
 	uint8_t report_bytes[GT9889_REPORT_MAX];
 	struct gt9889_frame frame;
 	unsigned bytes = 0;
@@ -1242,9 +1354,35 @@ poll_once(unsigned tick)
 	}
 	if (armed) {
 		/* the latch is cleared before the read, so that an edge during it is the next report's */
-		edge = gpio_edge_latched(PIN_INT);
-		if (edge) {
-			gpio_edge_clear(PIN_INT);
+		if (irq_mode) {
+			/* (the handler clears the latch: what it finds there is an interrupt that is late, or one that never comes) */
+			static uint64_t miss_since, miss_count;
+			uint64_t t = now_us(), c = __atomic_load_n(&irq_count, __ATOMIC_SEQ_CST);
+
+			if (__atomic_load_n(&irq_storm, __ATOMIC_SEQ_CST)) {
+				irq_stop("the summary interrupt fires without this pin");
+			} else if (gpio_edge_latched(PIN_INT) && !__atomic_load_n(&irq_pending, __ATOMIC_SEQ_CST)) {
+				if (miss_since == 0 || c != miss_count) {
+					miss_since = t;
+					miss_count = c;
+				} else if (t - miss_since > IRQ_SILENT_US) {
+					irq_stop("the latch shows edges and no interrupt arrives");
+				}
+			} else {
+				miss_since = 0;
+			}
+			if (irq_mode) {
+				edge = __atomic_exchange_n(&irq_pending, 0, __ATOMIC_SEQ_CST) != 0;
+				if (edge) {
+					irq_got_us = __atomic_load_n(&irq_at_us, __ATOMIC_SEQ_CST);
+				}
+			}
+		}
+		if (!irq_mode) {
+			edge = gpio_edge_latched(PIN_INT);
+			if (edge) {
+				gpio_edge_clear(PIN_INT);
+			}
 		}
 		asked = edge;
 		if (!edge) {
@@ -1263,6 +1401,10 @@ poll_once(unsigned tick)
 	seen.looks++;
 	got = report_read(report_bytes, &bytes);
 	now = now_us();
+	if (irq_got_us != 0 && lat_on && now >= irq_got_us) {
+		lat.irq_lat_n++;
+		lat_add(&lat.irq_lat_sum, &lat.irq_lat_max, now - irq_got_us);
+	}
 	if (got && trace && seen.raw_dumped < 60) {
 		/* gt9889_trace=1: each read as it came, before it is judged (the first 60), to tell the bus from the chip's format */
 		char hex[3 * GT9889_REPORT_MAX + 1];
@@ -1395,7 +1537,8 @@ gt9889_thread(__unused void *parameter, __unused wait_result_t result)
 	chip_start();
 	done();
 	say("gt9889: step 5: touch screen ready, %u x %u, %u fingers; the interrupt line (gpio%u) is looked at every %u ms (%s)\n", panel_x,
-	    panel_y, contacts, PIN_INT, POLL_MS, latch_armed ? "its falling edges latched" : "by its level");
+	    panel_y, contacts, PIN_INT, POLL_MS, irq_mode ? "its falling edges by interrupt" : latch_armed ? "its falling edges latched" : "by its level");
+	irq_start();
 	trouble.last_good_us = now_us();
 	uint64_t tick_us = now_us();
 	for (unsigned tick = 1; begin(); ) {
@@ -1412,13 +1555,21 @@ gt9889_thread(__unused void *parameter, __unused wait_result_t result)
 
 			if (fingers_down() != 0 && !__atomic_load_n(&leaving, __ATOMIC_SEQ_CST)) {
 				want_us = FAST_POLL_US;
-				sleep_us(FAST_POLL_US);
+				if (irq_mode) {
+					irq_sleep(FAST_POLL_US);
+				} else {
+					sleep_us(FAST_POLL_US);
+				}
 				if (now_us() - tick_us >= POLL_MS * 1000) {
 					tick++;
 					tick_us = now_us();
 				}
 			} else {
-				wait_ms(POLL_MS);
+				if (irq_mode && !__atomic_load_n(&leaving, __ATOMIC_SEQ_CST)) {
+					irq_sleep(POLL_MS * 1000);
+				} else {
+					wait_ms(POLL_MS);
+				}
 				tick++;
 				tick_us = now_us();
 			}
@@ -1486,6 +1637,7 @@ hakios_gt9889_init(void)
 	PE_parse_boot_argn("gt9889_steps", &steps, sizeof(steps));
 	PE_parse_boot_argn("gt9889_doze", &doze, sizeof(doze));
 	PE_parse_boot_argn("touch_lat", &lat_on, sizeof(lat_on));
+	PE_parse_boot_argn("touch_irq", &irq_want, sizeof(irq_want));
 	if (steps == 0) {
 		say("gt9889: gt9889_steps=0: nothing is done\n");
 		return;
