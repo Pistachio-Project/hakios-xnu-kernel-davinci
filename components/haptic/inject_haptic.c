@@ -46,6 +46,7 @@ say(const char *format, ...)
 }
 
 static int motor = -1;
+static bool through_engine;     /* HAKIOS_UIHAPTIC_ENGINE=1 */
 static uint64_t last_pulse;
 static unsigned pulses;
 
@@ -134,6 +135,16 @@ wrapper(id self, SEL cmd, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5
 			    class_getName(object_getClass(self)), sel_getName(cmd));
 		}
 		pulse(sel_getName(cmd));
+		/*
+		 * A generator's own play call (-[UIFeedbackGenerator _playFeedback:atLocation:] and the like) ends here: the motor has
+		 * had its pulse, and the engine below it (CoreHaptics' engine and the audio server's actuator chain, which cost the audio
+		 * server most of a core for as long as they run, silence or not) is not started for it. HAKIOS_UIHAPTIC_ENGINE=1 goes on
+		 * to it as before. (These calls have no block to be called back.)
+		 */
+		if (!through_engine && at != NULL && suffix(class_getName(at), "FeedbackGenerator") &&
+		    strncmp(sel_getName(cmd), "_playFeedback", 13) == 0 && method_getNumberOfArguments(class_getInstanceMethod(at, cmd)) <= 4) {
+			return 0;
+		}
 	}
 	if (original != NULL) {
 		resume = class_getSuperclass(at);
@@ -247,5 +258,6 @@ start(void)
 	if (getenv("HAKIOS_NO_UIHAPTIC") != NULL) {
 		return;
 	}
+	through_engine = getenv("HAKIOS_UIHAPTIC_ENGINE") != NULL;
 	try_install(0);
 }

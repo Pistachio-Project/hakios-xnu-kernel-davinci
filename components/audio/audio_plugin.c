@@ -59,6 +59,8 @@
 #include <math.h>
 #include <sys/ioctl.h>
 #include <sys/sysctl.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -164,6 +166,7 @@ enum {
 	kAudioDevicePropertySafetyOffset = 'saft', kAudioDevicePropertyNominalSampleRate = 'nsrt',
 	kAudioDevicePropertyAvailableNominalSampleRates = 'nsr#', kAudioDevicePropertyIsHidden = 'hidn',
 	kAudioDevicePropertyPreferredChannelsForStereo = 'dch2', kAudioDevicePropertyZeroTimeStampPeriod = 'ring',
+	kAudioDevicePropertyBufferFrameSize = 'fsiz', kAudioDevicePropertyBufferFrameSizeRange = 'fsz#',
 	kAudioSelectorControlClassID = 'slct', kAudioDataSourceControlClassID = 'dsrc',
 	kAudioSelectorControlPropertyCurrentItem = 'scci', kAudioSelectorControlPropertyAvailableItems = 'scai',
 	kAudioSelectorControlPropertyItemName = 'scin', kAudioSelectorControlPropertyItemKind = 'clkk',
@@ -259,6 +262,7 @@ static struct device devices[] = {
 #define MANUFACTURER            CFSTR("HakiOS")
 /* how often a device says where its clock is, in frames: also the largest I/O buffer the HAL will use */
 #define TIMESTAMP_PERIOD        16384
+#define ACTUATOR_BUFFER_FRAMES  512
 
 static AudioServerPlugInHostRef host;
 /*
@@ -660,6 +664,16 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 		case kAudioDevicePropertyNominalSampleRate:
 			v.u.number = HAKIOS_AUDIO_RATE;
 			v.size = sizeof(Float64);
+			break;
+		case kAudioDevicePropertyBufferFrameSize:
+			/* the actuator's cycles are what its signal processing chain costs per cycle, silence or not: 512 frames, not 256 */
+			v.u.words[0] = d->object == OBJECT_ACTUATOR ? ACTUATOR_BUFFER_FRAMES : 512;
+			v.size = sizeof(UInt32);
+			break;
+		case kAudioDevicePropertyBufferFrameSizeRange:
+			v.u.range.mMinimum = 64;
+			v.u.range.mMaximum = TIMESTAMP_PERIOD;
+			v.size = sizeof(AudioValueRange);
 			break;
 		case kAudioDevicePropertyAvailableNominalSampleRates:
 			v.u.range.mMinimum = v.u.range.mMaximum = HAKIOS_AUDIO_RATE;
@@ -1204,6 +1218,29 @@ haptic_stopped(void)
 	    __atomic_load_n(&haptic, __ATOMIC_ACQUIRE) >= 0 ? "" : " (no /dev/hakios-haptic: not felt)");
 }
 
+static unsigned long io_cycles, io_silent;
+static uint64_t io_said;
+
+/* every 5 s while the actuator runs: its cycles and the audio server's CPU time (this plug-in is in it), from the I/O thread but for one line */
+static void
+io_report(void)
+{
+	uint64_t now = mach_absolute_time();
+	struct rusage ru;
+
+	if (io_said == 0) {
+		io_said = now;
+	}
+	if (mach_us(now - io_said) < 5000000) {
+		return;
+	}
+	io_said = now;
+	getrusage(RUSAGE_SELF, &ru);
+	say("hakios: audio: io cycles %lu (silent %lu), cpu %llu ms\n", io_cycles, io_silent,
+	    (unsigned long long)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000 +
+	    (unsigned long long)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000);
+}
+
 static void
 actuator_write(const int16_t *samples, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle)
 {
@@ -1215,9 +1252,13 @@ actuator_write(const int16_t *samples, UInt32 frames, const AudioServerPlugInIOC
 
 		peak = v > peak ? v : peak;
 	}
-	if (fd >= 0) {
+	/* (silence is not written: the driver takes a gap of 30 ms for it, and a write per cycle is a call for nothing) */
+	if (fd >= 0 && peak > 0) {
 		(void)write(fd, samples, (size_t)frames * 2);
 	}
+	io_cycles++;
+	io_report();
+	io_silent += peak == 0;
 	if (haptic_trace > 0 && peak > 256) {
 		uint64_t now = mach_absolute_time();
 
