@@ -4678,6 +4678,7 @@ static struct {
 	struct block mdp;
 	uint32_t mode, saved[SCANOUT_REGS], panel_w, panel_h;
 	uint32_t shown;                         /* frames put on the pipe */
+	const char *why;                        /* the last refusal or failure, for the display driver's log */
 } scanout;
 
 /* stats of the flips, per 5 s line of the display driver (hakios_display_scanout_stats) */
@@ -4816,6 +4817,21 @@ hakios_display_te_irqs(void)
 	return te_on && !te_given_up ? __atomic_load_n(&te_count, __ATOMIC_SEQ_CST) : 0;
 }
 
+/* Why the last show failed (a string), and the permission to try again: a miss is not for good unless the display driver says so. */
+const char *hakios_display_scanout_why(void);
+void hakios_display_scanout_rearm(void);
+const char *
+hakios_display_scanout_why(void)
+{
+	return scanout.why != NULL ? scanout.why : "unknown";
+}
+
+void
+hakios_display_scanout_rearm(void)
+{
+	scanout.broken = false;
+}
+
 /* The display driver's call when the refresh interrupt has seen the last flip taken over (interrupt context: wake a thread, nothing more). */
 void hakios_display_scanout_on_latch(void (*hook)(void));
 void
@@ -4951,10 +4967,11 @@ hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint
 	bool first = !scanout.on;
 
 	if (!scanout.open || scanout.broken || (phys & 0xf) || (stride & 0xf)) {
-		printf("adreno: scanout: show refused: open %d broken %d phys %#x stride %u\n", scanout.open, scanout.broken, phys, stride);
+		scanout.why = !scanout.open ? "scan-out not open" : scanout.broken ? "scan-out marked broken" : "surface or stride not 16-byte aligned";
 		return false;
 	}
 	if (!scanout_wait(true)) {
+		scanout.why = "the flip before this frame was not taken over in 60 ms";
 		printf("adreno: scanout: the flip before frame %u was not taken in 60 ms\n", scanout.shown);
 		scanout.broken = true;
 		hakios_display_scanout_restore();
@@ -5008,6 +5025,7 @@ hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint
 		scanout_kick();
 	}
 	if (!taken) {
+		scanout.why = "this flip was not taken over in 60 ms";
 		printf("adreno: scanout: the display did not take frame %u (surface at %#x) in 60 ms: the firmware's picture goes back\n",
 		    scanout.shown, phys);
 		scanout.broken = true;

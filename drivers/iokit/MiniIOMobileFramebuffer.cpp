@@ -327,6 +327,10 @@ extern "C" uint64_t hakios_display_te_irqs(void);
 static uint64_t gScanoutLatchSeenAt, gScanoutLatchTe;   /* (ring=2) when a flip's taking over was first seen here, and the refresh interrupts counted then */
 static uint64_t gScanoutDeferredAt;                     /* ... when the oldest swap not completed was deferred */
 static uint64_t gScanoutTimedOut, gScanoutDeferredCount;
+static uint32_t gScanoutFails;                         /* consecutive flips (zero copy) that were not taken */
+#define SCANOUT_FAILS_MAX 10
+extern "C" const char * hakios_display_scanout_why(void);
+extern "C" void hakios_display_scanout_rearm(void);
 /* fb_scanout_par=0 (default 1): the ring copy is made by the presenter alone, not shared out with the scaling's helper threads (fb_threads) */
 static TUNABLE(uint32_t, gScanoutPar, "fb_scanout_par", 1);
 /* fb_scanout_late=0 (default 1): the flip is waited for and kicked before the swap completes, as before (late: after it) */
@@ -2331,13 +2335,30 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 	scanoutLetGo();
 	if (!settled || !hakios_display_scanout_show(s->scanoutAddr, s->info.bytesPerRow, s->info.width, s->info.height,
 	    gScanoutAsync == 0)) {
-		gScanoutGaveUp = true;
+		/* a miss is not for good: the pipe goes back to the firmware's picture, this frame is copied, the next tries again */
+		const char * reason = hakios_display_scanout_why();
+
+		gScanoutFails++;
 		scanoutRelease();
+		hakios_display_scanout_restore();
+		hakios_display_scanout_rearm();
+		IOLog("MiniIOMobileFramebuffer: fb_scanout: the display did not take a frame (settled %d, surface %u at %#x stride %u: %s), "
+		    "miss %u of %u in a row: this frame is copied\n", settled, s->sid, s->scanoutAddr, s->info.bytesPerRow, reason, gScanoutFails,
+		    SCANOUT_FAILS_MAX);
+		if (gScanoutFails >= SCANOUT_FAILS_MAX) {
+			gScanoutFails = 0;
+			if (gScanoutRing == 2) {
+				gScanoutRing = 1;               /* (the ring copy, as the default does) */
+				IOLog("MiniIOMobileFramebuffer: fb_scanout: ring 2 gives up: the ring copy (ring 1) from now on\n");
+			} else {
+				gScanoutGaveUp = true;
+				IOLog("MiniIOMobileFramebuffer: fb_scanout: the display did not take frames: frames are copied from now on\n");
+			}
+		}
 		IOLockUnlock(gScanoutLock);
-		printf("MiniIOMobileFramebuffer: fb_scanout: the display did not take a frame (settled %d, surface %u at %#x stride %u): frames are copied from now on\n", settled, s->sid, s->scanoutAddr, s->info.bytesPerRow);
-		IOLog("MiniIOMobileFramebuffer: fb_scanout: the display did not take a frame: frames are copied from now on\n");
 		return false;
 	}
+	gScanoutFails = 0;
 	if (!fGraphics) {
 		/* the first picture: the kernel's text console must stop drawing over it */
 		fGraphics = true;
