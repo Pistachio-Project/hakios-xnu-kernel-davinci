@@ -453,6 +453,23 @@ teLog(uint64_t now)
 	gTe.pMin = gTe.pMax = gTe.pSum = gTe.pN = 0;
 }
 
+/*
+ * The watch and the 5 s line must not depend on the window server asking for vsync: iOS 27's backboardd registers notification
+ * ports for types 7 and 9 and never asks for 5 (kFBNotifyVSync), so armVSync() never runs. A call of its own, every 250 ms.
+ */
+static thread_call_t gTeTickCall;
+static void
+teTick(thread_call_param_t unused0, thread_call_param_t unused1)
+{
+	uint64_t at;
+
+	(void) unused0;
+	(void) unused1;
+	teWatch();
+	clock_interval_to_deadline(250, NSEC_PER_MSEC, &at);
+	thread_call_enter_delayed(gTeTickCall, at);
+}
+
 static void
 teThread(thread_call_param_t unused0, thread_call_param_t unused1)
 {
@@ -1024,6 +1041,10 @@ IOMobileFramebuffer::start(IOService * provider)
 		gTe.fed = !gPanel.ok;           /* (a model from the counters is not replaced: the interrupts only measure) */
 		gTe.startedAt = mach_absolute_time();
 		gTe.started = gTeCall != NULL && hakios_display_te_start(teIrq);
+		gTeTickCall = thread_call_allocate(teTick, NULL);
+		if (gTe.started && gTeTickCall != NULL) {
+			thread_call_enter(gTeTickCall);
+		}
 		if (!gTe.started) {
 			gTe.fed = false;
 			IOLog("MiniIOMobileFramebuffer: fb_te_vsync=1: no TE interrupt on this board: the timer carries the vsync\n");
@@ -3055,6 +3076,14 @@ IOMobileFramebufferUserClient::method(uint32_t selector, IOExternalMethodArgumen
 	case kFBMethodNotifications:                    /* in: callback (0 = off), its argument, type, 0 */
 		if (args->scalarInputCount < 3 || in[2] >= kFBNotifyTypes) {
 			return kIOReturnBadArgument;
+		}
+		{
+			static uint32_t notified;
+
+			if (notified < 24 && true) {
+				notified++;
+				IOLog("MiniIOMobileFramebuffer: notifications: type %llu callback %#llx\n", in[2], in[0]);
+			}
 		}
 		IOLockLock(fLock);
 		fCallbacks[in[2]] = in[0];
