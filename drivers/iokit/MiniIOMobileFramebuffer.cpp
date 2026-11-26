@@ -350,6 +350,150 @@ usToAbs(uint64_t us)
 	return t;
 }
 
+/*
+ * Boot-arg fb_te_vsync=1 (default 0): the panel's refresh as an interrupt. The tear check of ping-pong 0 raises its RD_PTR
+ * interrupt a line after every tear-effect pulse of the panel (bsd-side: drivers/board/adreno.c hakios_display_te_start(): MDP
+ * INTR bit 12 through SPI 83), which this panel's INTF counters (standing still: fb_scan finds nothing) cannot say. Each
+ * interrupt's time becomes the model's start and the smoothed distance of them its period, so that the vsync told to the
+ * window server (armVSync(), vsync()) and the presenter's targets follow the panel and not a timer of ours. No interrupt for
+ * 100 ms (or the interrupt given up): the model goes off and the timer is what it was. Every 5 s a line says how it went.
+ */
+extern "C" bool hakios_display_te_start(void (*callback)(uint64_t at));
+extern "C" bool hakios_display_te_alive(void);
+static TUNABLE(uint32_t, gTeVsync, "fb_te_vsync", 0);
+#define TE_SILENT_US    100000
+struct te_state {
+	bool            started, fed, silent;   /* fed: gPanel is kept from the interrupts (no INTF counters) */
+	volatile uint64_t irqAt;                /* the latest interrupt, set by its handler */
+	uint64_t        startedAt, seenAt, t0, n0;
+	uint64_t        count, coalesced, fallbacks, period;
+	uint32_t        good;
+	uint64_t        pMin, pMax, pSum, pN;   /* this window */
+	uint64_t        framesSeen, repeated, skipped;
+	uint64_t        logAt, logCount;
+};
+static te_state gTe;
+static thread_call_t gTeCall;
+static uint64_t gFramesOut, gFramesAt;          /* frames put on the panel (approximately: swaps completed), and the last one's time */
+
+static void
+teIrq(uint64_t at)
+{
+	gTe.irqAt = at;
+	if (gTeCall != NULL) {
+		thread_call_enter(gTeCall);
+	}
+}
+
+/* Is the interrupt silent? Then the model is off (and says so once); the timer carries the vsync as before. */
+static void
+teWatch(void)
+{
+	uint64_t now = mach_absolute_time(), last = gTe.irqAt;
+
+	if (!gTe.started) {
+		return;
+	}
+	if (!hakios_display_te_alive() || now - (last != 0 ? last : gTe.startedAt) > usToAbs(TE_SILENT_US)) {
+		if (gTe.fed && gPanel.ok) {
+			gPanel.ok = false;
+		}
+		gTe.good = 0;
+		if (!gTe.silent) {
+			gTe.silent = true;
+			gTe.fallbacks++;
+			printf("MiniIOMobileFramebuffer: vsync: no TE interrupt for %u ms (%llu so far%s): the timer carries the vsync\n",
+			    TE_SILENT_US / 1000, gTe.count, hakios_display_te_alive() ? "" : ", the interrupt was given up");
+		}
+	}
+}
+
+static void
+teThread(thread_call_param_t unused0, thread_call_param_t unused1)
+{
+	uint64_t at = gTe.irqAt, now = mach_absolute_time(), nominal, p;
+	uint64_t k = 1;
+
+	(void) unused0;
+	(void) unused1;
+	if (at == 0 || at == gTe.seenAt) {
+		return;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &nominal);
+	p = gTe.period != 0 ? gTe.period : nominal;
+	if (gTe.seenAt != 0) {
+		uint64_t dt = at - gTe.seenAt, diff;
+
+		k = (dt + p / 2) / p;
+		diff = dt > k * p ? dt - k * p : k * p - dt;
+		if (k >= 1 && k < 16 && diff < p / 5) {
+			if (k > 1) {
+				gTe.coalesced += k - 1;         /* (interrupts that were not taken one by one) */
+			} else {
+				uint64_t gain = gTe.good < 16 ? 4 : 32;
+
+				gTe.period = gTe.period != 0 ? (dt > gTe.period ? gTe.period + (dt - gTe.period) / gain : gTe.period - (gTe.period - dt) / gain) : dt;
+				gTe.good++;
+				gTe.pMin = gTe.pMin == 0 || dt < gTe.pMin ? dt : gTe.pMin;
+				gTe.pMax = dt > gTe.pMax ? dt : gTe.pMax;
+				gTe.pSum += dt;
+				gTe.pN++;
+			}
+		} else {
+			gTe.good = 0;                           /* (a jump: the panel's mode changed, or the interrupt was lost for long) */
+			gTe.t0 = 0;
+		}
+	}
+	if (gTe.t0 == 0) {
+		gTe.t0 = at;
+		gTe.n0 = 0;
+	} else {
+		gTe.n0 += k;
+	}
+	gTe.seenAt = at;
+	gTe.count++;
+	if (gTe.fed && gTe.period != 0) {
+		gPanel.line_ticks = gTe.period * 52 / 100 / (gPanel.lines != 0 ? gPanel.lines : 1);   /* (a readout takes about half a refresh) */
+		gPanel.period = gTe.period;
+		gPanel.start = at;
+		gPanel.frame = (uint32_t) gTe.count;
+		if (gTe.good >= 8 && gPanel.lines != 0) {
+			if (gTe.silent) {
+				printf("MiniIOMobileFramebuffer: vsync: TE interrupts are back\n");
+			}
+			gTe.silent = false;
+			gPanel.ok = true;
+		}
+	}
+	{
+		/* what the window server got since the last refresh: none (the panel read the frame again), two or more (all but one never seen) */
+		uint64_t out = __atomic_load_n(&gFramesOut, __ATOMIC_SEQ_CST), n = out - gTe.framesSeen;
+
+		gTe.framesSeen = out;
+		if (n == 0 && gFramesAt != 0 && now - gFramesAt < 3 * p) {
+			gTe.repeated++;
+		} else if (n >= 2) {
+			gTe.skipped += n - 1;
+		}
+	}
+	if (gTe.logAt == 0) {
+		gTe.logAt = now;
+	} else if (now - gTe.logAt >= usToAbs(5000000)) {
+		int64_t drift = (int64_t) (at - gTe.t0) - (int64_t) (gTe.n0 * nominal);
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(drift < 0 ? (uint64_t) -drift : (uint64_t) drift, &ns);
+		printf("MiniIOMobileFramebuffer: vsync: %llu TE interrupts (%llu in 5 s, %llu coalesced), period %llu us (min/max %llu/%llu), "
+		    "timer drift corrected: a free-running %u Hz timer would be %s%llu us off the panel since %llu refreshes, "
+		    "%llu timer fallbacks, frames shown twice %llu, skipped %llu\n", gTe.count, gTe.count - gTe.logCount, gTe.coalesced,
+		    micros(gTe.pN ? gTe.pSum / gTe.pN : 0), micros(gTe.pMin), micros(gTe.pMax), refreshHz(), drift < 0 ? "-" : "", ns / 1000,
+		    gTe.n0, gTe.fallbacks, gTe.repeated, gTe.skipped);
+		gTe.logAt = now;
+		gTe.logCount = gTe.count;
+		gTe.pMin = gTe.pMax = gTe.pSum = gTe.pN = 0;
+	}
+}
+
 /* Read the counters once; while a readout is going on, it says exactly when it began. */
 static void
 scanObserve(void)
@@ -357,6 +501,10 @@ scanObserve(void)
 	uint32_t frame, line;
 	uint64_t now;
 
+	teWatch();
+	if (gTe.fed) {
+		return;                         /* (kept by the interrupts, teThread()) */
+	}
 	if (!gPanel.ok || !hakios_display_scan(&frame, &line)) {
 		gPanel.ok = false;
 		return;
@@ -839,6 +987,20 @@ IOMobileFramebuffer::start(IOService * provider)
 	fScanLead = usToAbs(gScanLeadUs >= 1000 && gScanLeadUs <= 8000 ? gScanLeadUs : 2000);
 	if (gScan) {
 		scanCalibrate();
+	}
+	if (gTeVsync == 1 && !gTe.started) {
+		gTeCall = thread_call_allocate(teThread, NULL);
+		gPanel.lines = fPanelHeight;
+		gTe.fed = !gPanel.ok;           /* (a model from the counters is not replaced: the interrupts only measure) */
+		gTe.startedAt = mach_absolute_time();
+		gTe.started = gTeCall != NULL && hakios_display_te_start(teIrq);
+		if (!gTe.started) {
+			gTe.fed = false;
+			printf("MiniIOMobileFramebuffer: fb_te_vsync=1: no TE interrupt on this board: the timer carries the vsync\n");
+		} else {
+			printf("MiniIOMobileFramebuffer: fb_te_vsync=1: the vsync follows the panel's TE interrupt (timer after %u ms without)\n",
+			    TE_SILENT_US / 1000);
+		}
 	}
 	if (gScanout >= 1 && gScanout <= 2 && !gScanoutGaveUp) {
 		gScanoutReady = hakios_display_scanout_open(gScanout, fPanelWidth, fPanelHeight, fRowBytes);
@@ -2368,6 +2530,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fSwapsWaiting--;
 	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 	IOLockUnlock(fSwapLock);
+	gFramesAt = mach_absolute_time();
+	__atomic_fetch_add(&gFramesOut, 1, __ATOMIC_SEQ_CST);
 	if (direct && gScanoutLate && gScanoutRing != 0) {
 		scanoutFlip();
 	}
@@ -2639,6 +2803,7 @@ IOMobileFramebufferUserClient::armVSync(void)
 {
 	uint64_t period, now = mach_absolute_time();
 
+	teWatch();
 	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
 	if (gPanel.ok) {
 		/*
@@ -2654,7 +2819,8 @@ IOMobileFramebufferUserClient::armVSync(void)
 				next += period;
 			}
 			fVSyncTime = next;
-			thread_call_enter_delayed(fVSyncCall, fVSyncTime);
+			/* (TE-fed: a little after the interrupt it is for, so that vsync() finds its time) */
+			thread_call_enter_delayed(fVSyncCall, fVSyncTime + (gTe.fed ? usToAbs(300) : 0));
 			return;
 		}
 	}
@@ -2680,6 +2846,14 @@ IOMobileFramebufferUserClient::vsync(void)
 
 	IOLockLock(fLock);
 	now = fVSyncTime;
+	if (gTe.fed && gPanel.ok) {
+		/* the panel's own interrupt for this refresh, when it has come: its time, not the prediction from the one before */
+		uint64_t real = gTe.irqAt, half = gPanel.period / 2;
+
+		if (real != 0 && real + half > now && real < now + half) {
+			now = real;
+		}
+	}
 	if (fClosed || fCallbacks[kFBNotifyVSync] == 0 || fPorts[kFBNotifyVSync] == NULL) {
 		fVSyncRunning = false;
 	} else {

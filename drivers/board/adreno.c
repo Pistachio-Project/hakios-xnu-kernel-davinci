@@ -5113,6 +5113,119 @@ hakios_display_scan(uint32_t *frame, uint32_t *line)
 }
 
 /*
+ * The panel's refresh as an interrupt (boot-arg fb_te_vsync=1, asked by the display driver). A command-mode panel's INTF
+ * counters stand still (above), but the tear check of ping-pong 0 (cmdpanel.c, panel_autorefresh=2) counts lines from every
+ * tear-effect pulse of the panel, and raises the ping-pong's RD_PTR interrupt when its counter reaches RD_PTR_IRQ (vdisplay+1:
+ * a line after the pulse, the moment the panel starts being read). So the interrupt comes once a refresh, locked to the panel.
+ *   - registers (MDP's top block, `qcom,sde-off = <0x1000>' in Android's xiaomi-sdmmagpie DT, so 0xae01000 with mdp_phys
+ *     0xae00000; Linux dpu_hwio.h): INTR_EN +0x10, INTR_STATUS +0x14, INTR_CLEAR +0x18; the bit is
+ *     DPU_INTR_PING_PONG_0_RD_PTR = BIT(12) (dpu_hw_interrupts.c). The MDSS top level has only HW_INTR_STATUS (+0x10 of
+ *     0xae00000, no enable): the line to the GIC is the MDP's status & enable.
+ *   - the line: mdss_mdp `interrupts = <0 83 0>' there: SPI 83, GIC interrupt 115, attached as a level interrupt.
+ * The handler clears the bit and calls back with mach_absolute_time(). It gives up (masks the interrupt) if the line is
+ * raised by something that is not the bit, 20000 times.
+ */
+#define TE_MDP_TOP              0x1000u         /* from the block's page (mdp_phys 0xae00000): qcom,sde-off */
+#define TE_PP0_OFFSET           0x71000u        /* qcom,sde-pp-off[0]: where the board's display { pingpong } is from mdp_phys */
+#define TE_INTR_EN              0x10u
+#define TE_INTR_STATUS          0x14u
+#define TE_INTR_CLEAR           0x18u
+#define TE_PP0_RD_PTR           (1u << 12)
+#define TE_MDSS_SPI             83
+#define TE_STORM                20000
+#define TE_PP_TEAR_CHECK_EN     0x000u
+#define TE_PP_SYNC_CONFIG_VSYNC 0x004u
+#define TE_PP_RD_PTR_IRQ        0x020u
+
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+bool hakios_display_te_start(void (*callback)(uint64_t at));
+bool hakios_display_te_alive(void);
+
+static vm_offset_t te_top;
+static void (*te_callback)(uint64_t at);
+static bool te_on, te_attached, te_given_up;
+static uint64_t te_count, te_spurious, te_last;
+
+static void
+te_handler(__unused void *context, __unused uint32_t intid)
+{
+	uint32_t status = rd(te_top + TE_INTR_STATUS), enabled = rd(te_top + TE_INTR_EN);
+
+	if (status & TE_PP0_RD_PTR) {
+		uint64_t at = mach_absolute_time();
+
+		wr(te_top + TE_INTR_CLEAR, TE_PP0_RD_PTR);
+		__atomic_store_n(&te_last, at, __ATOMIC_SEQ_CST);
+		__atomic_fetch_add(&te_count, 1, __ATOMIC_SEQ_CST);
+		if (te_callback != NULL) {
+			te_callback(at);
+		}
+	} else {
+		if (status & enabled) {
+			wr(te_top + TE_INTR_CLEAR, status & enabled);   /* (a bit somebody left enabled) */
+		}
+		if (__atomic_add_fetch(&te_spurious, 1, __ATOMIC_SEQ_CST) > TE_STORM && !te_given_up) {
+			te_given_up = true;
+			gic_v3_spi_mask(TE_MDSS_SPI + 32);
+		}
+	}
+}
+
+/* False: not started (the reason is said), the display driver keeps its timer. */
+bool
+hakios_display_te_start(void (*callback)(uint64_t at))
+{
+	const struct hakios_board *board = hakios_board();
+	vm_offset_t pp;
+	uint32_t en, line;
+	kern_return_t kr;
+
+	if (te_on) {
+		return !te_given_up;
+	}
+	if (board == NULL || board->display.pingpong < TE_PP0_OFFSET || !display_layout_known() || !display_block_up()) {
+		printf("adreno: te: the board does not say where ping-pong 0 is, or the display block is not up: no TE interrupt\n");
+		return false;
+	}
+	pp = ml_io_map(board->display.pingpong, 0x100);
+	te_top = ml_io_map(board->display.pingpong - TE_PP0_OFFSET + TE_MDP_TOP, 0x1000);
+	if (pp == 0 || te_top == 0) {
+		printf("adreno: te: the registers could not be mapped\n");
+		return false;
+	}
+	if (!(rd(pp + TE_PP_TEAR_CHECK_EN) & 1) || !(rd(pp + TE_PP_SYNC_CONFIG_VSYNC) & (1u << 19))) {
+		printf("adreno: te: ping-pong 0's tear check is off (panel_autorefresh=2 programs it): no TE interrupt\n");
+		return false;
+	}
+	line = rd(pp + 0x02c);
+	en = rd(te_top + TE_INTR_EN);
+	printf("adreno: te: mdp top %#x: intr_en %#x status %#x; pp0 rd_ptr_irq line %u, line counter %u\n",
+	    (uint32_t)(board->display.pingpong - TE_PP0_OFFSET + TE_MDP_TOP), en, rd(te_top + TE_INTR_STATUS),
+	    rd(pp + TE_PP_RD_PTR_IRQ), line);
+	te_callback = callback;
+	kr = gic_v3_spi_attach(TE_MDSS_SPI + 32, false, te_handler, NULL);
+	if (kr != KERN_SUCCESS) {
+		printf("adreno: te: the display's interrupt (SPI %d) could not be taken (%d)\n", TE_MDSS_SPI, (int)kr);
+		return false;
+	}
+	te_attached = true;
+	wr(te_top + TE_INTR_CLEAR, TE_PP0_RD_PTR);
+	wr(te_top + TE_INTR_EN, en | TE_PP0_RD_PTR);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	te_on = true;
+	printf("adreno: te: ping-pong 0's RD_PTR interrupt on (SPI %d, level): once a refresh\n", TE_MDSS_SPI);
+	return true;
+}
+
+/* Interrupts keep coming (not given up). */
+bool
+hakios_display_te_alive(void)
+{
+	return te_on && !te_given_up;
+}
+
+/*
  * Boot-arg gpu=1: is this the phone, and is its GPU's firmware in the small image? Then the
  * GPU is started and kept for the system to draw with, which is what
  * "adreno=21 adreno_skip=0x1c00 adreno_pause=0 adreno_keep=1" asks for at length: the steps
