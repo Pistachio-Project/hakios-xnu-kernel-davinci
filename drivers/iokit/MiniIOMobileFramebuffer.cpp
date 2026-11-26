@@ -309,7 +309,20 @@ static TUNABLE(uint32_t, gScanoutAsync, "fb_scanout_async", 1);
  * that is neither on the panel nor on its way there (frame k is written to buffer k mod 3: k-1 is flipping, k-2 may be fetched until k-1 latches).
  * 0: the surface itself is fetched (zero copy), held and counted as in use until its successor has latched (nothing keeps the window server out).
  */
+/*
+ * fb_scanout_ring=2: zero copy done safely. The window server's surface is fetched itself (as with 0), but a swap is completed (its queue slot
+ * given back to the window server, SwapEnd) not when its flip is issued but when it has latched -- the panel's refresh interrupt (RD_PTR of the
+ * INTF's tear check, fb_te_vsync) has seen ctl0's flush taken over -- and the surface before it is let go at the same moment. The window server
+ * then never draws into a surface the display still fetches, and the presenter copies nothing (no 6 MB memcpy a frame). The flips wait for the
+ * latch on that interrupt (adreno.c), and poll after 20 ms without one.
+ */
 static TUNABLE(uint32_t, gScanoutRing, "fb_scanout_ring", 1);
+static uint64_t gScanoutKickAt;                 /* when the latest flip was kicked (for how long a surface is held after) */
+static uint64_t gScanoutReleaseSum, gScanoutReleaseMax, gScanoutReleaseN;
+static unsigned gScanoutDeferred;               /* (fb_scanout_ring=2) swaps whose flip is on its way and which are not completed yet */
+static class IOMobileFramebuffer * gScanoutDeferredFb;
+extern "C" void hakios_display_scanout_on_latch(void (*hook)(void));
+extern "C" void hakios_display_scanout_stats(uint64_t out[8]);
 /* fb_scanout_par=0 (default 1): the ring copy is made by the presenter alone, not shared out with the scaling's helper threads (fb_threads) */
 static TUNABLE(uint32_t, gScanoutPar, "fb_scanout_par", 1);
 /* fb_scanout_late=0 (default 1): the flip is waited for and kicked before the swap completes, as before (late: after it) */
@@ -326,6 +339,7 @@ static MiniIOSurface * gScanoutPrev;            /* the surface before it, while 
 static IOLock * gScanoutLock;                   /* around the two and the pipe's registers */
 static thread_call_t gScanoutCall;
 static void scanoutTimer(thread_call_param_t unused0, thread_call_param_t unused1);
+static void scanoutOnLatch(void);
 static uint32_t gScanoutSettled, gScanoutWaits;  /* stats: flips found latched, flips that waited for the one before */
 static uint64_t gScanoutWaited, gScanoutWaitedMax;      /* ... and for how long (absolute time) */
 static uint32_t gScanoutFrames, gScanoutCopied, gScanoutWhy[8];
@@ -710,7 +724,7 @@ public:
 	IOLock *        fSwapLock;              /* around the next five */
 	uint8_t         fSwap[SWAP_QUEUE][SWAP_SIZE];   /* the swaps on their way to the panel (fb_queue), from fSwapFirst on */
 	MiniIOSurface * fSwapSurfaces[SWAP_QUEUE][SWAP_LAYERS]; /* ... their surfaces, held from SwapEnd on: their maker may let go of them */
-	unsigned        fSwapFirst, fSwapsWaiting;
+	unsigned        fSwapFirst, fSwapsWaiting, fSwapsDeferred;     /* (fSwapsDeferred: fb_scanout_ring=2, flipped, not yet latched) */
 	/*
 	 * ... and not whenever the GPU happens to be done, but on a beat of the refresh rate
 	 * (boot-arg fb_beat=0: at once): frames then follow each other at an even pace whatever
@@ -771,6 +785,7 @@ public:
 	bool scanoutFrame(const uint8_t * swap, MiniIOSurface ** surfaces);
 	void ringCopy(uint8_t * to, const uint8_t * from, size_t bytes);
 	void scanoutFlip(void);
+	void scanoutComplete(void);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -1069,6 +1084,7 @@ IOMobileFramebuffer::start(IOService * provider)
 		if (gScanoutReady) {
 			gScanoutLock = IOLockAlloc();
 			gScanoutCall = thread_call_allocate(scanoutTimer, NULL);
+			hakios_display_scanout_on_latch(scanoutOnLatch);
 			if (gScanoutLock == NULL || gScanoutCall == NULL) {
 				gScanoutReady = false;
 			}
@@ -1948,11 +1964,11 @@ IOMobileFramebuffer::present(const uint8_t * swap)
 	IOLockLock(fSwapLock);
 	fStatSwapsLate += fSwapTime != 0 && now - fSwapTime > period && now - fSwapTime < pause;
 	fSwapTime = now;
-	fStatHeld += fSwapsWaiting >= swapQueue();
-	uint64_t heldFrom = fSwapsWaiting >= swapQueue() ? mach_absolute_time() : 0;
-	while (fSwapsWaiting >= swapQueue()) {
+	fStatHeld += fSwapsWaiting + fSwapsDeferred >= swapQueue();
+	uint64_t heldFrom = fSwapsWaiting + fSwapsDeferred >= swapQueue() ? mach_absolute_time() : 0;
+	while (fSwapsWaiting + fSwapsDeferred >= swapQueue()) {
 		if (IOLockSleepDeadline(fSwapLock, &fSwapsWaiting, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
-		    fSwapsWaiting >= swapQueue()) {
+		    fSwapsWaiting + fSwapsDeferred >= swapQueue()) {
 			fStatLost++;                    /* (the GPU has stopped answering: the frame before is waiting for it) */
 			IOLockUnlock(fSwapLock);
 			return;
@@ -2046,15 +2062,55 @@ scanoutLetGo(void)
 	}
 }
 
+void
+IOMobileFramebuffer::scanoutComplete(void)
+{
+	IOLockLock(fSwapLock);
+	if (fSwapsDeferred != 0) {
+		fSwapsDeferred--;
+	}
+	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+	IOLockUnlock(fSwapLock);
+}
+
+/* The refresh interrupt saw a flip taken over (interrupt context): the thread call looks at what can be let go. */
+static void
+scanoutOnLatch(void)
+{
+	if (gScanoutCall != NULL) {
+		thread_call_enter(gScanoutCall);
+	}
+}
+
 static void
 scanoutTimer(thread_call_param_t unused0 __unused, thread_call_param_t unused1 __unused)
 {
 	bool again;
+	IOMobileFramebuffer * complete = NULL;
 
 	IOLockLock(gScanoutLock);
+	if (gScanoutPrev != NULL && hakios_display_scanout_latched()) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - gScanoutKickAt, &ns);
+		gScanoutReleaseSum += ns;
+		gScanoutReleaseN++;
+		gScanoutReleaseMax = ns > gScanoutReleaseMax ? ns : gScanoutReleaseMax;
+	}
 	scanoutLetGo();
-	again = gScanoutPrev != NULL;
+	if (gScanoutDeferred != 0 && (hakios_display_scanout_latched() || gScanoutGaveUp)) {
+		gScanoutDeferred--;
+		complete = gScanoutDeferredFb;
+	}
+	again = gScanoutPrev != NULL || gScanoutDeferred != 0;
 	IOLockUnlock(gScanoutLock);
+	if (complete != NULL) {
+		complete->scanoutComplete();
+		/* (a second one deferred, with the flip after the first latched already: the next call of this finds it) */
+		IOLockLock(gScanoutLock);
+		again = again || gScanoutDeferred != 0;
+		IOLockUnlock(gScanoutLock);
+	}
 	if (again) {
 		AbsoluteTime deadline;
 
@@ -2147,7 +2203,7 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 		    dst[2] != (int32_t) fWidth || dst[3] != (int32_t) fHeight)))) {
 			why = "not the whole surface onto the whole display";
 			reason = 4;
-		} else if (gScanoutRing != 0) {
+		} else if (gScanoutRing == 1) {
 			/* (the surface is only read, by the processor: any memory will do) */
 		} else if (s->scanoutAddr == 0) {
 			why = "its memory is not in one piece below 4 GB";
@@ -2159,7 +2215,7 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 			    s->info.bytesPerRow, s->info.width, s->info.height,
 			    s->scanoutState == 1 ? "the display's SMMU context maps it to itself" : "NOT mapped to itself by the display's SMMU context");
 		}
-		if (why == NULL && gScanoutRing == 0 && s->scanoutState != 1) {
+		if (why == NULL && gScanoutRing != 1 && s->scanoutState != 1) {
 			why = "the display's SMMU context does not map it to itself";
 			reason = 6;
 		}
@@ -2177,7 +2233,7 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 		gScanoutCopied++;
 		return false;
 	}
-	if (gScanoutRing != 0) {
+	if (gScanoutRing == 1) {
 		uint32_t bytes = s->info.bytesPerRow * s->info.height;
 		unsigned k = gScanoutRingNext;
 		uint64_t began = mach_absolute_time();
@@ -2255,6 +2311,7 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 	 * Held, and in use to the window server, while the display fetches it: this surface from now, the one before it until this one has
 	 * latched (then scanoutLetGo(): at once if the flip was waited for, else by the timer or the next flip).
 	 */
+	gScanoutKickAt = mach_absolute_time();
 	gScanoutPrev = gScanoutHeld;
 	gScanoutHeld = MiniIOSurfaceCopy(s->sid);
 	if (gScanoutHeld != NULL) {
@@ -2587,14 +2644,27 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 * Only now is the frame in the panel's memory: the swap after it may be handed over. Given back any
 	 * earlier, the window server would draw a frame more ahead of the panel than fb_queue says.
 	 */
+	bool deferred = direct && gScanoutRing == 2 && gScanoutReady && !gScanoutGaveUp;
+
 	IOLockLock(fSwapLock);
 	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
 	fSwapsWaiting--;
-	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+	if (deferred) {
+		fSwapsDeferred++;               /* (given back when its flip has latched: scanoutComplete()) */
+	} else {
+		IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
+	}
 	IOLockUnlock(fSwapLock);
+	if (deferred) {
+		IOLockLock(gScanoutLock);
+		gScanoutDeferredFb = this;
+		gScanoutDeferred++;
+		IOLockUnlock(gScanoutLock);
+		thread_call_enter(gScanoutCall);        /* (at once if the flip has latched already, else on the refresh interrupt or the poll) */
+	}
 	gFramesAt = mach_absolute_time();
 	__atomic_fetch_add(&gFramesOut, 1, __ATOMIC_SEQ_CST);
-	if (direct && gScanoutLate && gScanoutRing != 0) {
+	if (direct && gScanoutLate && gScanoutRing == 1) {
 		scanoutFlip();
 	}
 	drawn = mach_absolute_time();
@@ -2656,11 +2726,22 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			IOLog("MiniIOMobileFramebuffer: fb_scanout%s: %u flips found the one before latched, %u waited for it, %llu us on average (%llu at most)\n",
 			    gScanoutAsync ? " (async)" : "", gScanoutSettled, gScanoutWaits,
 			    gScanoutSettled + gScanoutWaits ? micros(gScanoutWaited / (gScanoutSettled + gScanoutWaits)) : 0, micros(gScanoutWaitedMax));
-			if (gScanoutRing != 0) {
+			if (gScanoutRing == 1) {
 				IOLog("MiniIOMobileFramebuffer: fb_scanout ring: the picture copied into the ring buffer in %llu us on average (%llu at most); "
 				    "no surface of the window server's is fetched\n", gScanoutFrames ? micros(gScanoutCopyTime / gScanoutFrames) : 0,
 				    micros(gScanoutCopyMax));
 				gScanoutCopyTime = gScanoutCopyMax = 0;
+			}
+			{
+				uint64_t st[8];
+
+				hakios_display_scanout_stats(st);
+				IOLog("MiniIOMobileFramebuffer: fb_scanout flips: %llu flips, taken over seen by the refresh interrupt %llu, by poll %llu; "
+				    "flip to taken over %llu us on average (%llu at most); %llu waits on the interrupt, %llu of them timed out (20 ms); "
+				    "ring=%u: surface let go %llu us after its successor's flip on average (%llu at most) over %llu\n", st[0], st[1], st[2],
+				    st[5] ? st[3] / st[5] / 1000 : 0, st[4] / 1000, st[6], st[7], gScanoutRing,
+				    gScanoutReleaseN ? gScanoutReleaseSum / gScanoutReleaseN / 1000 : 0, gScanoutReleaseMax / 1000, gScanoutReleaseN);
+				gScanoutReleaseSum = gScanoutReleaseMax = gScanoutReleaseN = 0;
 			}
 			gScanoutSettled = gScanoutWaits = 0;
 			gScanoutWaited = gScanoutWaitedMax = 0;

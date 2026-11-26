@@ -96,6 +96,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -4663,12 +4664,26 @@ static const uint32_t scanout_regs[] = { SSPP_SRC_SIZE, SSPP_SRC_IMG_SIZE, SSPP_
 	DPU_QSEED + QSEED_STEP(0), DPU_QSEED + QSEED_STEP(1), DPU_QSEED + QSEED_STEP(2), DPU_QSEED + QSEED_STEP(3) };
 #define SCANOUT_REGS (sizeof(scanout_regs) / sizeof(scanout_regs[0]))
 
+/* (the interrupt of the panel's refresh, below: it wakes a flip's wait and sees the flush taken over) */
+static bool te_on, te_given_up;
+static uint64_t te_count;
+static uint32_t te_wake_event;
+static void (*scanout_latch_hook)(void);
+
 static struct {
-	bool open, on, broken, pending;
+	bool open, on, broken;
+	uint32_t pend;                          /* 0: the last flush has been taken over; else the number of the kick not seen taken yet */
+	uint32_t seq;
+	uint64_t kick_at;
 	struct block mdp;
 	uint32_t mode, saved[SCANOUT_REGS], panel_w, panel_h;
 	uint32_t shown;                         /* frames put on the pipe */
 } scanout;
+
+/* stats of the flips, per 5 s line of the display driver (hakios_display_scanout_stats) */
+static struct {
+	uint64_t flips, by_irq, by_poll, lat_sum, lat_max, lat_n, irq_waits, irq_timeouts;
+} scanout_stats;
 
 static void
 scanout_put(uint32_t offset, uint32_t value)
@@ -4682,37 +4697,107 @@ scanout_get(uint32_t offset)
 	return rd(scanout.mdp.base + DPU_VIG0 + offset);
 }
 
-/* ctl0's flush of vig0; the display takes it over at the next frame start and then clears the bit (scanout.pending: not seen yet) */
+/* ctl0's flush of vig0; the display takes it over at the next frame start and then clears the bit (scanout.pend: not seen yet) */
 static void
 scanout_kick(void)
 {
+	uint32_t n = ++scanout.seq ? scanout.seq : ++scanout.seq;
+
 	__asm__ volatile ("dsb sy" ::: "memory");
+	scanout.kick_at = mach_absolute_time();
 	wr(scanout.mdp.base + DPU_CTL0 + DPU_CTL_FLUSH, DPU_FLUSH_VIG0);
-	scanout.pending = true;
+	__atomic_store_n(&scanout.pend, n, __ATOMIC_SEQ_CST);
+	scanout_stats.flips++;
+}
+
+/* Is the last flush taken over? The one who sees it first (the refresh interrupt, or a poll) clears `pend`, counts how, and says how long it took. */
+static bool
+scanout_try_latch(bool by_irq)
+{
+	uint32_t p = __atomic_load_n(&scanout.pend, __ATOMIC_SEQ_CST);
+
+	if (p == 0) {
+		return true;
+	}
+	if (rd(scanout.mdp.base + DPU_CTL0 + DPU_CTL_FLUSH) & DPU_FLUSH_VIG0) {
+		return false;
+	}
+	if (__atomic_compare_exchange_n(&scanout.pend, &p, 0, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+		uint64_t ns, lat = mach_absolute_time() - scanout.kick_at;
+
+		absolutetime_to_nanoseconds(lat, &ns);
+		if (by_irq) {
+			scanout_stats.by_irq++;
+		} else {
+			scanout_stats.by_poll++;
+		}
+		scanout_stats.lat_sum += ns;
+		scanout_stats.lat_n++;
+		scanout_stats.lat_max = ns > scanout_stats.lat_max ? ns : scanout_stats.lat_max;
+		return true;
+	}
+	return __atomic_load_n(&scanout.pend, __ATOMIC_SEQ_CST) == 0;
 }
 
 static bool
 scanout_latched(void)
 {
-	if (scanout.pending && !(rd(scanout.mdp.base + DPU_CTL0 + DPU_CTL_FLUSH) & DPU_FLUSH_VIG0)) {
-		scanout.pending = false;
-	}
-	return !scanout.pending;
+	return scanout_try_latch(false);
 }
 
-/* the wait for the display to take the last flush over: false: it did not in 60 ms */
+/*
+ * the wait for the display to take the last flush over: false: it did not in 60 ms. With the refresh interrupt running the thread sleeps
+ * until one comes (the flush is taken over about at a refresh's start) and looks at once, for up to half a millisecond more; none within
+ * 20 ms and it polls every 200 us as before.
+ */
 static bool
 scanout_wait(bool may_sleep)
 {
-	for (int i = 0; i < (may_sleep ? 300 : 300000); i++) {
+	if (scanout_latched()) {
+		return true;
+	}
+	if (!may_sleep) {
+		for (int i = 0; i < 300000; i++) {
+			if (scanout_latched()) {
+				return true;
+			}
+		}
+		return false;
+	}
+	uint64_t until = mach_absolute_time() + 0, now;
+	uint64_t limit;
+
+	nanoseconds_to_absolutetime(60 * NSEC_PER_MSEC, &limit);
+	until += limit;
+	while ((now = mach_absolute_time()) < until) {
+		if (te_on && !te_given_up) {
+			uint64_t before = __atomic_load_n(&te_count, __ATOMIC_SEQ_CST);
+
+			scanout_stats.irq_waits++;
+			assert_wait_timeout((event_t)&te_wake_event, THREAD_UNINT, 20000, NSEC_PER_USEC);
+			if (scanout_latched()) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+				return true;
+			}
+			thread_block(THREAD_CONTINUE_NULL);
+			if (__atomic_load_n(&te_count, __ATOMIC_SEQ_CST) == before) {
+				scanout_stats.irq_timeouts++;           /* (no refresh interrupt in 20 ms: poll below) */
+			} else {
+				for (unsigned i = 0; i < 25; i++) {
+					if (scanout_try_latch(true)) {
+						return true;
+					}
+					spin_us(20);
+				}
+				continue;
+			}
+		}
 		if (scanout_latched()) {
 			return true;
 		}
-		if (may_sleep) {
-			sleep_us(200);
-		}
+		sleep_us(200);
 	}
-	return false;
+	return scanout_latched();
 }
 
 static bool
@@ -4723,6 +4808,30 @@ scanout_flush(bool may_sleep)
 }
 
 /* Has the display taken the last flush over (the surface before it is not fetched any more)? Does not wait. */
+/* The display driver's call when the refresh interrupt has seen the last flip taken over (interrupt context: wake a thread, nothing more). */
+void hakios_display_scanout_on_latch(void (*hook)(void));
+void
+hakios_display_scanout_on_latch(void (*hook)(void))
+{
+	scanout_latch_hook = hook;
+}
+
+/* Read and reset: flips, taken over seen by the interrupt / by a poll, the latch's latency (kick to seen, ns) sum, max and count, waits on the interrupt, ones that timed out. */
+void hakios_display_scanout_stats(uint64_t out[8]);
+void
+hakios_display_scanout_stats(uint64_t out[8])
+{
+	out[0] = scanout_stats.flips;
+	out[1] = scanout_stats.by_irq;
+	out[2] = scanout_stats.by_poll;
+	out[3] = scanout_stats.lat_sum;
+	out[4] = scanout_stats.lat_max;
+	out[5] = scanout_stats.lat_n;
+	out[6] = scanout_stats.irq_waits;
+	out[7] = scanout_stats.irq_timeouts;
+	memset(&scanout_stats, 0, sizeof(scanout_stats));
+}
+
 bool
 hakios_display_scanout_latched(void)
 {
@@ -5156,8 +5265,8 @@ bool hakios_display_te_alive(void);
 
 static vm_offset_t te_top, te_pp, te_itear, te_intf;
 static void (*te_callback)(uint64_t at);
-static bool te_on, te_attached, te_given_up;
-static uint64_t te_count, te_spurious, te_last, te_intf_count;
+static bool te_attached;
+static uint64_t te_spurious, te_last, te_intf_count;
 
 static void
 te_handler(__unused void *context, __unused uint32_t intid)
@@ -5179,6 +5288,13 @@ te_handler(__unused void *context, __unused uint32_t intid)
 		}
 		__atomic_store_n(&te_last, at, __ATOMIC_SEQ_CST);
 		__atomic_fetch_add(&te_count, 1, __ATOMIC_SEQ_CST);
+		if (scanout.open) {
+			scanout_try_latch(true);
+		}
+		thread_wakeup((event_t)&te_wake_event);
+		if (scanout_latch_hook != NULL) {
+			scanout_latch_hook();
+		}
 		if (te_callback != NULL) {
 			te_callback(at);
 		}
