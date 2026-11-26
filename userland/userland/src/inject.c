@@ -1148,6 +1148,24 @@ input_thread(__unused void *arg)
 	 * (inherited from the creator) it waits behind every busy thread of the P cluster, and a lower one prefers the E cores (amp=1) */
 	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 	{
+		/*
+		 * Measured (touch_lat=1): a sample waits 15-95 ms for this thread though the kernel wakes it at once -- it is
+		 * behind the window server's busy threads of the same QoS. A fixed priority (round robin, 62: above every
+		 * timeshare thread, under the kernel's) puts it ahead of them. Boot-arg touch_rt=0: not.
+		 */
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+		struct sched_param param = { .sched_priority = 62 };
+
+		if (!(sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "touch_rt=0") != NULL)) {
+			int error = pthread_setschedparam(pthread_self(), SCHED_RR, &param);
+
+			if (error != 0) {
+				say("hakios: input: fixed priority: %s\n", strerror(error));
+			}
+		}
+	}
+	{
 		char arguments[1024] = "";
 		size_t size = sizeof(arguments) - 1;
 
@@ -1247,8 +1265,21 @@ input_thread(__unused void *arg)
 				waking &= ~(1u << (t.finger & 31));
 			}
 		} else {
+			struct timespec c0, c1;
+			static uint64_t cpu_sum, cpu_max;
+
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
 			send_touch(screen, &t);
+			clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
 			if (touch_latency) {
+				uint64_t cpu = (uint64_t)((c1.tv_sec - c0.tv_sec) * 1000000 + (c1.tv_nsec - c0.tv_nsec) / 1000);
+
+				cpu_sum += cpu;
+				cpu_max = cpu > cpu_max ? cpu : cpu_max;
+				if (t.type == HAKIOS_TOUCH_UP) {
+					say("touch: dispatch cpu time %llu us total, max %llu us (against the wall time of read->IOHID dispatch)\n", cpu_sum, cpu_max);
+					cpu_sum = cpu_max = 0;
+				}
 				uint64_t sent_at = mach_absolute_time(), now_us_ = micros(sent_at);
 				static uint64_t sum_pr, max_pr, sum_rs, max_rs, n_ev, since;
 				uint64_t pr = micros(read_at) - micros(t.time), rs = micros(sent_at) - micros(read_at);
