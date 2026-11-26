@@ -59,11 +59,30 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define AUTOREFRESH_ENABLE      0x80000000u
 #define AUTOREFRESH_ON          (AUTOREFRESH_ENABLE | 1u)       /* every pulse */
 
+/*
+ * SDE 5.x (sm8150, and the Mi 9T's sm7150 as far as its DT shows: `qcom,sde-intf-size = <0x2b8>' reaches the INTF's tear block) keeps the
+ * tear check in the INTF block, not the ping-pong (Android's sde_hw_catalog.c: ping-pong TE only below major 5, SDE_INTF_TE for
+ * major 5; sde_hw_intf.c INTF_TEAR_*): the same registers 0x280 above the INTF's base, VSYNC_SEL first. Programmed alongside.
+ */
+#define INTF_TEAR_MDP_VSYNC_SEL         0x280u
+#define INTF_TEAR_TEAR_CHECK_EN         0x284u
+#define INTF_TEAR_SYNC_CONFIG_VSYNC     0x288u
+#define INTF_TEAR_SYNC_CONFIG_HEIGHT    0x28cu
+#define INTF_TEAR_SYNC_WRCOUNT          0x290u
+#define INTF_TEAR_VSYNC_INIT_VAL        0x294u
+#define INTF_TEAR_SYNC_THRESH           0x29cu
+#define INTF_TEAR_START_POS             0x2a0u
+#define INTF_TEAR_RD_PTR_IRQ            0x2a4u
+#define INTF_TEAR_LINE_COUNT            0x2b0u
+#define INTF_TEAR_AUTOREFRESH_CONFIG    0x2b4u
+
 #define HAKIOS_TLMM             tlmm
 static vm_offset_t tlmm;
 #include "tlmm.h"
 
 void hakios_cmdpanel_init(void);
+int hakios_cmdpanel_te_level(void);
+
 
 static uint32_t
 arg(const char *name, uint32_t fallback)
@@ -71,6 +90,13 @@ arg(const char *name, uint32_t fallback)
 	uint32_t value;
 
 	return PE_parse_boot_argn(name, &value, sizeof(value)) ? value : fallback;
+}
+
+/* The TE pin's level (-1: not mapped), for the display driver's check that the panel pulses it. */
+int
+hakios_cmdpanel_te_level(void)
+{
+	return tlmm != 0 ? (int) gpio_get(arg("panel_te_pin", 10)) : -1;
 }
 
 /* The display block must be powered and its register clock running: read only, nothing turned on here. */
@@ -153,6 +179,29 @@ tearcheck_program(const struct hakios_board *board, vm_offset_t block)
 	TC_WRITE(PP_SYNC_WRCOUNT, vdisplay + TE_THRESHOLD + 1);
 	TC_WRITE(PP_TEAR_CHECK_EN, 1);
 	__asm__ volatile ("dsb sy" ::: "memory");
+	if (board->display.intf != 0) {
+		vm_offset_t ib = ml_io_map(board->display.intf, 0x300);
+
+		if (ib != 0) {
+			uint32_t vsync = VSYNC_COUNTER_EN | (pin != 0 ? VSYNC_HW_TE : 0) | count;
+
+			wr(ib + INTF_TEAR_MDP_VSYNC_SEL, 0);    /* (qcom,panel-te-source = <0>: VSYNC0, the TE pin) */
+			wr(ib + INTF_TEAR_SYNC_CONFIG_VSYNC, vsync);
+			wr(ib + INTF_TEAR_SYNC_CONFIG_HEIGHT, TE_SYNC_HEIGHT);
+			wr(ib + INTF_TEAR_VSYNC_INIT_VAL, vdisplay);
+			wr(ib + INTF_TEAR_RD_PTR_IRQ, vdisplay + 1);
+			wr(ib + INTF_TEAR_START_POS, vdisplay);
+			wr(ib + INTF_TEAR_SYNC_THRESH, TE_THRESHOLD << 16 | TE_THRESHOLD);
+			wr(ib + INTF_TEAR_SYNC_WRCOUNT, vdisplay + TE_THRESHOLD + 1);
+			wr(ib + INTF_TEAR_TEAR_CHECK_EN, 1);
+			wr(ib + INTF_TEAR_AUTOREFRESH_CONFIG, AUTOREFRESH_ON);
+			__asm__ volatile ("dsb sy" ::: "memory");
+			hakios_say("cmdpanel: intf tear check (INTF block %#x +0x280): vsync_sel %#x en %#x cfg %#x height %#x init %#x rd_ptr %#x "
+			    "autorefresh %#x line %u\n", board->display.intf, rd(ib + INTF_TEAR_MDP_VSYNC_SEL), rd(ib + INTF_TEAR_TEAR_CHECK_EN),
+			    rd(ib + INTF_TEAR_SYNC_CONFIG_VSYNC), rd(ib + INTF_TEAR_SYNC_CONFIG_HEIGHT), rd(ib + INTF_TEAR_VSYNC_INIT_VAL),
+			    rd(ib + INTF_TEAR_RD_PTR_IRQ), rd(ib + INTF_TEAR_AUTOREFRESH_CONFIG), rd(ib + INTF_TEAR_LINE_COUNT));
+		}
+	}
 	line[0] = rd(block + PP_LINE_COUNT);
 	spin_us(5000);
 	line[1] = rd(block + PP_LINE_COUNT);

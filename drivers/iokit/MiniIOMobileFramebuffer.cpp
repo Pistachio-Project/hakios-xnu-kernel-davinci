@@ -362,6 +362,7 @@ usToAbs(uint64_t us)
  */
 extern "C" bool hakios_display_te_start(void (*callback)(uint64_t at));
 extern "C" bool hakios_display_te_alive(void);
+extern "C" void hakios_display_te_info2(uint64_t * intf_irqs, uint32_t * intf_line, uint32_t * intf_en, uint32_t * intf_status, uint32_t * gpio);
 extern "C" void hakios_display_te_info(uint64_t * irqs, uint64_t * spurious, uint32_t * status, uint32_t * enable, uint32_t * line, uint32_t * tear);
 static TUNABLE(uint32_t, gTeVsync, "fb_te_vsync", 0);
 #define TE_SILENT_US    100000
@@ -433,6 +434,14 @@ teLog(uint64_t now)
 	drift = (int64_t) (gTe.seenAt - gTe.t0) - (int64_t) (gTe.n0 * nominal);
 	absolutetime_to_nanoseconds(drift < 0 ? (uint64_t) -drift : (uint64_t) drift, &ns);
 	hakios_display_te_info(&irqs, &spur, &status, &enable, &line, &tear);
+	{
+		uint64_t iirq;
+		uint32_t iline, ien, istat, gpio;
+
+		hakios_display_te_info2(&iirq, &iline, &ien, &istat, &gpio);
+		IOLog("MiniIOMobileFramebuffer: vsync: intf tear: %llu RD_PTR interrupts, line counter %u, irq enable %#x status %#x; TE pin gpio10 over 17.5 ms: "
+		    "%u high samples of 700, %u level changes\n", iirq, iline, ien, istat, gpio >> 16, gpio & 0xffff);
+	}
 	if (gTe.logCount == 0 && gTe.logFirst == 0) {
 		gTe.logFirst = 1;
 		uint32_t line2, d1, d2, d3, d4;

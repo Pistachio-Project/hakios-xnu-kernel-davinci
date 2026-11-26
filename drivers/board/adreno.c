@@ -5131,6 +5131,18 @@ hakios_display_scan(uint32_t *frame, uint32_t *line)
 #define TE_INTR_STATUS          0x14u
 #define TE_INTR_CLEAR           0x18u
 #define TE_PP0_RD_PTR           (1u << 12)
+/*
+ * SDE 5.x keeps the tear check in the INTF (cmdpanel.c), with its own small interrupt block: Android's sde_hw_interrupts.c
+ * MDP_INTF_TEAR_INTF_1_IRQ_OFF 0x6e800 from mdp_phys (INTF_1 = qcom,sde-intf-off[1] 0x6b800), EN +0 STATUS +4 CLEAR +8,
+ * SDE_INTR_INTF_TEAR_RD_PTR = BIT(2); same MDSS line.
+ */
+#define TE_ITEAR_OFFSET         0x6e800u
+#define TE_INTF1_OFFSET         0x6b800u
+#define TE_ITEAR_EN             0x0u
+#define TE_ITEAR_STATUS         0x4u
+#define TE_ITEAR_CLEAR          0x8u
+#define TE_ITEAR_RD_PTR         (1u << 2)
+#define TE_INTF_TEAR_LINE_COUNT 0x2b0u
 #define TE_MDSS_SPI             83
 #define TE_STORM                20000
 #define TE_PP_TEAR_CHECK_EN     0x000u
@@ -5142,20 +5154,29 @@ extern void gic_v3_spi_mask(uint32_t intid);
 bool hakios_display_te_start(void (*callback)(uint64_t at));
 bool hakios_display_te_alive(void);
 
-static vm_offset_t te_top, te_pp;
+static vm_offset_t te_top, te_pp, te_itear, te_intf;
 static void (*te_callback)(uint64_t at);
 static bool te_on, te_attached, te_given_up;
-static uint64_t te_count, te_spurious, te_last;
+static uint64_t te_count, te_spurious, te_last, te_intf_count;
 
 static void
 te_handler(__unused void *context, __unused uint32_t intid)
 {
 	uint32_t status = rd(te_top + TE_INTR_STATUS), enabled = rd(te_top + TE_INTR_EN);
+	uint32_t istatus = te_itear ? rd(te_itear + TE_ITEAR_STATUS) : 0;
 
-	if (status & TE_PP0_RD_PTR) {
+	if ((status & TE_PP0_RD_PTR) || (istatus & TE_ITEAR_RD_PTR)) {
 		uint64_t at = mach_absolute_time();
 
-		wr(te_top + TE_INTR_CLEAR, TE_PP0_RD_PTR);
+		if (status & TE_PP0_RD_PTR) {
+			wr(te_top + TE_INTR_CLEAR, TE_PP0_RD_PTR);
+		}
+		if (istatus) {
+			wr(te_itear + TE_ITEAR_CLEAR, istatus);
+		}
+		if (istatus & TE_ITEAR_RD_PTR) {
+			__atomic_fetch_add(&te_intf_count, 1, __ATOMIC_SEQ_CST);
+		}
 		__atomic_store_n(&te_last, at, __ATOMIC_SEQ_CST);
 		__atomic_fetch_add(&te_count, 1, __ATOMIC_SEQ_CST);
 		if (te_callback != NULL) {
@@ -5204,6 +5225,16 @@ hakios_display_te_start(void (*callback)(uint64_t at))
 	    (uint32_t)(board->display.pingpong - TE_PP0_OFFSET + TE_MDP_TOP), en, rd(te_top + TE_INTR_STATUS),
 	    rd(pp + TE_PP_RD_PTR_IRQ), line);
 	te_pp = pp;
+	te_intf = ml_io_map(board->display.intf, 0x300);
+	te_itear = ml_io_map(board->display.pingpong - TE_PP0_OFFSET + TE_ITEAR_OFFSET, 0x100);
+	{
+		vm_offset_t mdss = ml_io_map(board->display.pingpong - TE_PP0_OFFSET, 0x1000);
+
+		printf("adreno: te: MDSS hw rev %#x; intf tear block: vsync_sel %#x en %#x cfg %#x line %u; its irq block en %#x status %#x\n",
+		    mdss ? rd(mdss) : 0, te_intf ? rd(te_intf + 0x280) : 0, te_intf ? rd(te_intf + 0x284) : 0, te_intf ? rd(te_intf + 0x288) : 0,
+		    te_intf ? rd(te_intf + TE_INTF_TEAR_LINE_COUNT) : 0, te_itear ? rd(te_itear + TE_ITEAR_EN) : 0,
+		    te_itear ? rd(te_itear + TE_ITEAR_STATUS) : 0);
+	}
 	te_callback = callback;
 	kr = gic_v3_spi_attach(TE_MDSS_SPI + 32, false, te_handler, NULL);
 	if (kr != KERN_SUCCESS) {
@@ -5213,6 +5244,10 @@ hakios_display_te_start(void (*callback)(uint64_t at))
 	te_attached = true;
 	wr(te_top + TE_INTR_CLEAR, TE_PP0_RD_PTR);
 	wr(te_top + TE_INTR_EN, en | TE_PP0_RD_PTR);
+	if (te_itear != 0) {
+		wr(te_itear + TE_ITEAR_CLEAR, 0xffffffffu);
+		wr(te_itear + TE_ITEAR_EN, rd(te_itear + TE_ITEAR_EN) | TE_ITEAR_RD_PTR);
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 	te_on = true;
 	printf("adreno: te: ping-pong 0's RD_PTR interrupt on (SPI %d, level): once a refresh\n", TE_MDSS_SPI);
@@ -5220,7 +5255,39 @@ hakios_display_te_start(void (*callback)(uint64_t at))
 }
 
 /* What the interrupt sees, for the display driver's periodic line: handler runs, ones that were not ours, MDP status/enable, PP0's line counter and tear check. */
+extern int hakios_cmdpanel_te_level(void);
+/* The TE pin's level sampled 700 times 25 us apart (a refresh and a bit): (high samples) << 16 | level changes. */
+static uint32_t
+te_gpio_toggles(void)
+{
+	uint32_t high = 0, changes = 0;
+	int last = hakios_cmdpanel_te_level(), now;
+
+	if (last < 0) {
+		return 0xffffffffu;
+	}
+	for (unsigned i = 0; i < 700; i++) {
+		spin_us(25);
+		now = hakios_cmdpanel_te_level();
+		high += now > 0;
+		changes += now != last;
+		last = now;
+	}
+	return high << 16 | changes;
+}
+
 void hakios_display_te_info(uint64_t *irqs, uint64_t *spurious, uint32_t *status, uint32_t *enable, uint32_t *line, uint32_t *tear);
+void hakios_display_te_info2(uint64_t *intf_irqs, uint32_t *intf_line, uint32_t *intf_en, uint32_t *intf_status, uint32_t *gpio);
+void
+hakios_display_te_info2(uint64_t *intf_irqs, uint32_t *intf_line, uint32_t *intf_en, uint32_t *intf_status, uint32_t *gpio)
+{
+	*intf_irqs = te_intf_count;
+	*intf_line = te_intf ? rd(te_intf + TE_INTF_TEAR_LINE_COUNT) : 0;
+	*intf_en = te_itear ? rd(te_itear + TE_ITEAR_EN) : 0;
+	*intf_status = te_itear ? rd(te_itear + TE_ITEAR_STATUS) : 0;
+	*gpio = te_gpio_toggles();
+}
+
 void
 hakios_display_te_info(uint64_t *irqs, uint64_t *spurious, uint32_t *status, uint32_t *enable, uint32_t *line, uint32_t *tear)
 {
