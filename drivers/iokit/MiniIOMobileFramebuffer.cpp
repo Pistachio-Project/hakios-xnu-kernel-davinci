@@ -360,6 +360,7 @@ usToAbs(uint64_t us)
  */
 extern "C" bool hakios_display_te_start(void (*callback)(uint64_t at));
 extern "C" bool hakios_display_te_alive(void);
+extern "C" void hakios_display_te_info(uint64_t * irqs, uint64_t * spurious, uint32_t * status, uint32_t * enable, uint32_t * line, uint32_t * tear);
 static TUNABLE(uint32_t, gTeVsync, "fb_te_vsync", 0);
 #define TE_SILENT_US    100000
 struct te_state {
@@ -385,6 +386,8 @@ teIrq(uint64_t at)
 	}
 }
 
+static void teLog(uint64_t now);
+
 /* Is the interrupt silent? Then the model is off (and says so once); the timer carries the vsync as before. */
 static void
 teWatch(void)
@@ -394,6 +397,7 @@ teWatch(void)
 	if (!gTe.started) {
 		return;
 	}
+	teLog(now);
 	if (!hakios_display_te_alive() || now - (last != 0 ? last : gTe.startedAt) > usToAbs(TE_SILENT_US)) {
 		if (gTe.fed && gPanel.ok) {
 			gPanel.ok = false;
@@ -406,6 +410,36 @@ teWatch(void)
 			    TE_SILENT_US / 1000, gTe.count, hakios_display_te_alive() ? "" : ", the interrupt was given up");
 		}
 	}
+}
+
+/* Every 5 s, also with no interrupt at all (then the raw state says why). */
+static void
+teLog(uint64_t now)
+{
+	uint64_t nominal, irqs, spur, ns;
+	uint32_t status, enable, line, tear;
+	int64_t drift;
+
+	if (gTe.logAt == 0) {
+		gTe.logAt = now;
+		return;
+	}
+	if (now - gTe.logAt < usToAbs(5000000)) {
+		return;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &nominal);
+	drift = (int64_t) (gTe.seenAt - gTe.t0) - (int64_t) (gTe.n0 * nominal);
+	absolutetime_to_nanoseconds(drift < 0 ? (uint64_t) -drift : (uint64_t) drift, &ns);
+	hakios_display_te_info(&irqs, &spur, &status, &enable, &line, &tear);
+	printf("MiniIOMobileFramebuffer: vsync: %llu TE interrupts (%llu in 5 s, %llu coalesced), period %llu us (min/max %llu/%llu), "
+	    "timer drift corrected: a free-running %u Hz timer would be %s%llu us off the panel since %llu refreshes, "
+	    "%llu timer fallbacks, frames shown twice %llu, skipped %llu; irq handler %llu runs %llu not ours, mdp status %#x enable %#x, "
+	    "pp0 line counter %u tear check %u\n", gTe.count, gTe.count - gTe.logCount, gTe.coalesced,
+	    micros(gTe.pN ? gTe.pSum / gTe.pN : 0), micros(gTe.pMin), micros(gTe.pMax), refreshHz(), drift < 0 ? "-" : "", ns / 1000,
+	    gTe.n0, gTe.fallbacks, gTe.repeated, gTe.skipped, irqs, spur, status, enable, line, tear);
+	gTe.logAt = now;
+	gTe.logCount = gTe.count;
+	gTe.pMin = gTe.pMax = gTe.pSum = gTe.pN = 0;
 }
 
 static void
@@ -476,22 +510,7 @@ teThread(thread_call_param_t unused0, thread_call_param_t unused1)
 			gTe.skipped += n - 1;
 		}
 	}
-	if (gTe.logAt == 0) {
-		gTe.logAt = now;
-	} else if (now - gTe.logAt >= usToAbs(5000000)) {
-		int64_t drift = (int64_t) (at - gTe.t0) - (int64_t) (gTe.n0 * nominal);
-		uint64_t ns;
-
-		absolutetime_to_nanoseconds(drift < 0 ? (uint64_t) -drift : (uint64_t) drift, &ns);
-		printf("MiniIOMobileFramebuffer: vsync: %llu TE interrupts (%llu in 5 s, %llu coalesced), period %llu us (min/max %llu/%llu), "
-		    "timer drift corrected: a free-running %u Hz timer would be %s%llu us off the panel since %llu refreshes, "
-		    "%llu timer fallbacks, frames shown twice %llu, skipped %llu\n", gTe.count, gTe.count - gTe.logCount, gTe.coalesced,
-		    micros(gTe.pN ? gTe.pSum / gTe.pN : 0), micros(gTe.pMin), micros(gTe.pMax), refreshHz(), drift < 0 ? "-" : "", ns / 1000,
-		    gTe.n0, gTe.fallbacks, gTe.repeated, gTe.skipped);
-		gTe.logAt = now;
-		gTe.logCount = gTe.count;
-		gTe.pMin = gTe.pMax = gTe.pSum = gTe.pN = 0;
-	}
+	teLog(now);
 }
 
 /* Read the counters once; while a readout is going on, it says exactly when it began. */

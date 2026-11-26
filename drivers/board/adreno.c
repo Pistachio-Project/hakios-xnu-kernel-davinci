@@ -5142,7 +5142,7 @@ extern void gic_v3_spi_mask(uint32_t intid);
 bool hakios_display_te_start(void (*callback)(uint64_t at));
 bool hakios_display_te_alive(void);
 
-static vm_offset_t te_top;
+static vm_offset_t te_top, te_pp;
 static void (*te_callback)(uint64_t at);
 static bool te_on, te_attached, te_given_up;
 static uint64_t te_count, te_spurious, te_last;
@@ -5203,6 +5203,7 @@ hakios_display_te_start(void (*callback)(uint64_t at))
 	printf("adreno: te: mdp top %#x: intr_en %#x status %#x; pp0 rd_ptr_irq line %u, line counter %u\n",
 	    (uint32_t)(board->display.pingpong - TE_PP0_OFFSET + TE_MDP_TOP), en, rd(te_top + TE_INTR_STATUS),
 	    rd(pp + TE_PP_RD_PTR_IRQ), line);
+	te_pp = pp;
 	te_callback = callback;
 	kr = gic_v3_spi_attach(TE_MDSS_SPI + 32, false, te_handler, NULL);
 	if (kr != KERN_SUCCESS) {
@@ -5216,6 +5217,19 @@ hakios_display_te_start(void (*callback)(uint64_t at))
 	te_on = true;
 	printf("adreno: te: ping-pong 0's RD_PTR interrupt on (SPI %d, level): once a refresh\n", TE_MDSS_SPI);
 	return true;
+}
+
+/* What the interrupt sees, for the display driver's periodic line: handler runs, ones that were not ours, MDP status/enable, PP0's line counter and tear check. */
+void hakios_display_te_info(uint64_t *irqs, uint64_t *spurious, uint32_t *status, uint32_t *enable, uint32_t *line, uint32_t *tear);
+void
+hakios_display_te_info(uint64_t *irqs, uint64_t *spurious, uint32_t *status, uint32_t *enable, uint32_t *line, uint32_t *tear)
+{
+	*irqs = te_count;
+	*spurious = te_spurious;
+	*status = te_top ? rd(te_top + TE_INTR_STATUS) : 0;
+	*enable = te_top ? rd(te_top + TE_INTR_EN) : 0;
+	*line = te_pp ? rd(te_pp + 0x02c) : 0;
+	*tear = te_pp ? rd(te_pp + TE_PP_TEAR_CHECK_EN) : 0;
 }
 
 /* Interrupts keep coming (not given up). */
