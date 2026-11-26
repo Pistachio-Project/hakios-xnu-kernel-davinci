@@ -725,7 +725,7 @@ static bool powered;                    /* bring-up has begun to change things: 
  * controller's summary interrupt (the tlmm node's `interrupts = <0 208 0>' in Android's sdmmagpie DT: SPI 208, GIC
  * interrupt 240, level) is attached to the interrupt controller; the pin is armed as the latch is (falling edge,
  * goodix,irq-flags = 2) and also enabled and targeted at the apps processor (INTR_CFG: enable bit 0, polarity 1,
- * detection 2:3, raw status 4, target 5:7 = 4, Linux pinctrl-msm.c INTR_TARGET_PROC_APPS, dir-conn off). The handler
+ * detection 2:3, raw status 4, target 5:7 = 3, intr_target_kpss_val of kernel_xiaomi_sm6150 pinctrl-sdmmagpie.c, dir-conn off). The handler
  * looks at this pin's status alone, clears it, and wakes the thread, which reads the chip as the polling does. A report
  * waiting when it is enabled is found by the line's level. If edges show in the latch and no interrupt comes for
  * IRQ_SILENT_US, or the summary fires without our pin (IRQ_STORM times), the interrupt is given up and the latch polled.
@@ -733,17 +733,31 @@ static bool powered;                    /* bring-up has begun to change things: 
 #define TLMM_SUMMARY_SPI        208
 #define TLMM_SUMMARY_INTID      (TLMM_SUMMARY_SPI + 32)
 #define INTR_TARGET_MASK        (7u << 5)
-#define INTR_TARGET_APPS        (4u << 5)
+#define INTR_TARGET_APPS        (3u << 5)    /* kpss_val 3 on sdmmagpie (4 is a later SoC's) */
 #define IRQ_SILENT_US           2000000
 #define IRQ_STORM               20000
 
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
 extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_state(uint32_t intid, uint32_t *flags, uint64_t *route);
+
+static uint32_t irq_pending, irq_event, irq_storm;
+static uint64_t irq_at_us, irq_count, irq_spurious, irq_reported;
+
+static void
+irq_dump(const char *when)
+{
+	uint32_t f;
+	uint64_t r;
+
+	gic_v3_spi_state(TLMM_SUMMARY_INTID, &f, &r);
+	say("gt9889: touch_irq %s: gpio%u INTR_CFG 0x%x STATUS 0x%x line %u; GIC %u: enabled %u pending %u active %u group1 %u cfg %u route 0x%llx; %llu interrupts\n",
+	    when, PIN_INT, rd(GPIO_INTR_CFG(PIN_INT)), rd(GPIO_INTR_STATUS(PIN_INT)), gpio_get(PIN_INT), TLMM_SUMMARY_INTID, f & 1, f >> 1 & 1,
+	    f >> 2 & 1, f >> 3 & 1, f >> 4 & 3, r, irq_count);
+}
 
 static uint32_t irq_want;               /* boot-arg touch_irq */
 static bool irq_attached, irq_mode;     /* the interrupt is ours / it is what the thread waits for */
-static uint32_t irq_pending, irq_event, irq_storm;
-static uint64_t irq_at_us, irq_count, irq_spurious, irq_reported;
 
 static void
 irq_handler(__unused void *context, __unused uint32_t intid)
@@ -773,6 +787,7 @@ irq_stop(const char *why)
 	if (latch_armed) {
 		gpio_edge_latch_arm(PIN_INT);
 	}
+	irq_dump("giving up");
 	say("gt9889: touch_irq: given up (%s): %llu interrupts, %llu spurious; the latch is polled\n", why, irq_count, irq_spurious);
 }
 
@@ -803,6 +818,7 @@ irq_start(void)
 		__atomic_store_n(&irq_pending, 1, __ATOMIC_SEQ_CST);
 	}
 	wr(GPIO_INTR_CFG(PIN_INT), cfg | INTR_ENABLE);
+	irq_dump("enabled");
 	say("gt9889: touch_irq: the pin controller's summary interrupt (SPI %u) is ours, gpio%u falling edge enabled (cfg 0x%x)\n",
 	    TLMM_SUMMARY_SPI, PIN_INT, rd(GPIO_INTR_CFG(PIN_INT)));
 }
@@ -1363,6 +1379,9 @@ poll_once(unsigned tick)
 				irq_stop("the summary interrupt fires without this pin");
 			} else if (gpio_edge_latched(PIN_INT) && !__atomic_load_n(&irq_pending, __ATOMIC_SEQ_CST)) {
 				if (miss_since == 0 || c != miss_count) {
+					if (miss_since == 0) {
+						irq_dump("first latched edge, no interrupt");
+					}
 					miss_since = t;
 					miss_count = c;
 				} else if (t - miss_since > IRQ_SILENT_US) {

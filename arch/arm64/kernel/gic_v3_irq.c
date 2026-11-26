@@ -240,6 +240,23 @@ gic_v3_spi_mask(uint32_t intid)
 	}
 }
 
+/* for a driver's debug line: enable, pending, active, config (2 bits), group and the route of an SPI */
+void
+gic_v3_spi_state(uint32_t intid, uint32_t *flags, uint64_t *route)
+{
+	uint32_t b = 1u << (intid % 32);
+
+	*flags = 0;
+	*route = 0;
+	if (gicd_base == 0 || intid < GIC_INTID_SPI_MIN || intid >= GIC_INTID_SPURIOUS_MIN) {
+		return;
+	}
+	*flags = (gic_read32(gicd_base + GICD_ISENABLER(intid / 32)) & b ? 1 : 0) | (gic_read32(gicd_base + 0x200 + 4 * (intid / 32)) & b ? 2 : 0) |
+	    (gic_read32(gicd_base + 0x300 + 4 * (intid / 32)) & b ? 4 : 0) | (gic_read32(gicd_base + 0x080 + 4 * (intid / 32)) & b ? 8 : 0) |
+	    ((gic_read32(gicd_base + GICD_ICFGR(intid / 16)) >> (intid % 16 * 2) & 3) << 4);
+	*route = *(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid));
+}
+
 void
 gic_v3_spi_unmask(uint32_t intid)
 {
