@@ -479,7 +479,7 @@ static struct gpu_sublog {
 	uint32_t words[4];
 	const uint8_t * kernel[4];
 } gSubLog[GPU_SUBLOG];
-static uint32_t gBusyWaitOn = 1;
+static uint32_t gBusyWaitOn = 0;   /* diagnostic sampler: gpu_busywait=1 turns it on (it costs CPU on every fence wait) */
 static uint64_t gBusyWaitLast, gBusyWaitAt;            /* the last look, and the last line */
 static uint32_t gBusyWaitLines;
 static struct { char name[17]; uint64_t ns; } gHeld[8];

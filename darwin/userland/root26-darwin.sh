@@ -251,7 +251,8 @@ done
 # EDRSERVER=1 (build time; default off) keeps the name and the boot-arg edrserver=1 starts libEDR's own server
 # in backboardd (inject.c: answers at once, SDR only). The two go together: the name without the server stalls
 # every client for 40 s, so EDRSERVER=1 images must boot with edrserver=1 (and not edrstub=1).
-python3 - "$J/com.apple.backboardd.plist" "${EDRSERVER:-0}" <<'PY'
+EDRSERVER=${EDRSERVER:-$([ "${BOARD:-}" = davinci ] && echo 1 || echo 0)}   # (davinci boots with edrserver=1 by default)
+python3 - "$J/com.apple.backboardd.plist" "$EDRSERVER" <<'PY'
 import plistlib, sys
 if sys.argv[2] == '1':
     print('  backboardd: com.apple.libEDR.Notification kept (boot with edrserver=1)')
