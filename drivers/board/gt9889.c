@@ -739,6 +739,7 @@ static bool powered;                    /* bring-up has begun to change things: 
 
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
 extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
 extern void gic_v3_spi_state(uint32_t intid, uint32_t *flags, uint64_t *route);
 
 static uint32_t irq_pending, irq_event, irq_storm;
@@ -762,15 +763,18 @@ static bool irq_attached, irq_mode;     /* the interrupt is ours / it is what th
 static void
 irq_handler(__unused void *context, __unused uint32_t intid)
 {
+	/*
+	 * The summary is level: masked here, and the thread (which clears the pin's latch before it reads the chip, as the
+	 * polling does, and unmasks before it sleeps) is the only one to clear the latch, so that no edge is ever lost.
+	 */
+	gic_v3_spi_mask(TLMM_SUMMARY_INTID);
 	if (rd(GPIO_INTR_STATUS(PIN_INT)) & 1) {
-		wr(GPIO_INTR_STATUS(PIN_INT), 0);
 		__atomic_fetch_add(&irq_count, 1, __ATOMIC_SEQ_CST);
 		if (__atomic_exchange_n(&irq_pending, 1, __ATOMIC_SEQ_CST) == 0) {
 			__atomic_store_n(&irq_at_us, now_us(), __ATOMIC_SEQ_CST);
 		}
 		thread_wakeup((event_t)&irq_event);
 	} else if (__atomic_add_fetch(&irq_spurious, 1, __ATOMIC_SEQ_CST) > IRQ_STORM && !__atomic_exchange_n(&irq_storm, 1, __ATOMIC_SEQ_CST)) {
-		gic_v3_spi_mask(TLMM_SUMMARY_INTID);    /* (a level interrupt that is not ours and will not go away) */
 		thread_wakeup((event_t)&irq_event);
 	}
 }
@@ -827,6 +831,9 @@ irq_start(void)
 static void
 irq_sleep(uint32_t us)
 {
+	if (!__atomic_load_n(&irq_storm, __ATOMIC_SEQ_CST)) {
+		gic_v3_spi_unmask(TLMM_SUMMARY_INTID);  /* (an edge latched meanwhile fires at once) */
+	}
 	assert_wait_timeout((event_t)&irq_event, THREAD_UNINT, us, NSEC_PER_USEC);
 	if (__atomic_load_n(&irq_pending, __ATOMIC_SEQ_CST)) {
 		clear_wait(current_thread(), THREAD_AWAKENED);
@@ -1391,9 +1398,14 @@ poll_once(unsigned tick)
 				miss_since = 0;
 			}
 			if (irq_mode) {
+				/* the latch is the truth (it is sticky), the interrupt only wakes: either is a report to read */
 				edge = __atomic_exchange_n(&irq_pending, 0, __ATOMIC_SEQ_CST) != 0;
 				if (edge) {
 					irq_got_us = __atomic_load_n(&irq_at_us, __ATOMIC_SEQ_CST);
+				}
+				if (gpio_edge_latched(PIN_INT)) {
+					gpio_edge_clear(PIN_INT);
+					edge = true;
 				}
 			}
 		}
