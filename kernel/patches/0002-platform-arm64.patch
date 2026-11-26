@@ -250,8 +250,7 @@ diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
  	pmap_clear_user_ttb();
  	flush_mmu_tlb();
  #endif
-@@ -876,7 +974,14 @@ arm_init_idle_cpu(
- 		arm_debug_set(NULL);
+@@ -873,6 +972,13 @@ arm_init_idle_cpu(
  	}
  
  	fiq_context_init(FALSE);
@@ -484,22 +483,24 @@ diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
  		platform_cache_idle_enter();
  #endif
  
-@@ -611,7 +616,15 @@ cpu_idle(void)
+@@ -610,9 +615,17 @@ cpu_idle(void)
+ 		__builtin_arm_dsb(DSB_SY);
  #if HAS_RETENTION_STATE
  		arm64_retention_wfi();
- #else
++#else
 +#if defined(GENERIC_PSCI_SMP)
 +		{
 +			extern void hakios_idle_enter(cpu_data_t *);
 +
 +			hakios_idle_enter(cpu_data_ptr);        /* hakios: WFI, or a deeper state of the firmware's (pm_idle=) */
 +		}
-+#else
+ #else
  		__builtin_arm_wfi();
-+#endif
  #endif
++#endif
  
  #if defined(APPLETYPHOON)
+ 		// <rdar://problem/15827409> CPU1 Stuck in WFIWT Because of MMU Prefetch
 diff --git a/osfmk/arm64/kpc.c b/osfmk/arm64/kpc.c
 --- a/osfmk/arm64/kpc.c
 +++ b/osfmk/arm64/kpc.c
@@ -1035,7 +1036,7 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
  	while (1) {
  		;
  	}
-@@ -1140,6 +1146,61 @@ ml_read_chip_revision(unsigned int *rev __unused)
+@@ -1140,6 +1146,62 @@ ml_read_chip_revision(unsigned int *rev __unused)
  #endif
  }
  
@@ -1051,6 +1052,7 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 + * first, stays alone: the scheduler idles a secondary while its primary runs a real-time
 + * thread.)
 + */
++uint32_t hakios_amp_enabled = 0;                /* boot-arg amp=1: the loader's small cores are an E cluster, the others a P cluster */
 +static uint32_t small_cores_apart = 2;          /* boot-arg small_cores, read in ml_parse_cpu_topology() (before tunables are) */
 +static int ml_slow_core_partner[MAX_CPUS];      /* by cpu_id: the faster core it is paired with, -1 if none */
 +
@@ -1097,15 +1099,16 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
  void
  ml_parse_cpu_topology(void)
  {
-@@ -1153,6 +1214,7 @@ ml_parse_cpu_topology(void)
+@@ -1153,6 +1215,8 @@ ml_parse_cpu_topology(void)
  	int64_t cluster_max_cpu_phys_id[MAX_CPU_CLUSTER_PHY_ID + 1];
  	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
  	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
 +	PE_parse_boot_argn("small_cores", &small_cores_apart, sizeof(small_cores_apart));
++	PE_parse_boot_argn("amp", &hakios_amp_enabled, sizeof(hakios_amp_enabled));
  
  	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
  	// so that we trigger a panic later in the boot process, once serial is enabled.
-@@ -1218,6 +1280,11 @@ ml_parse_cpu_topology(void)
+@@ -1218,6 +1282,11 @@ ml_parse_cpu_topology(void)
  
  		cpu->phys_id = (uint32_t)ml_readprop(child, "reg", ML_READPROP_MANDATORY);
  
@@ -1117,7 +1120,32 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
  		cpu->l2_cache_size = (uint32_t)ml_readprop(child, "l2-cache-size", 0);
  		cpu->l2_cache_id = (uint32_t)ml_readprop(child, "l2-cache-id", 0);
  		cpu->l3_cache_size = (uint32_t)ml_readprop(child, "l3-cache-size", 0);
-@@ -1334,6 +1401,7 @@ ml_parse_cpu_topology(void)
+@@ -1226,9 +1295,23 @@ ml_parse_cpu_topology(void)
+ 		ml_read_reg_range(child, "cpu-uttdbg-reg", &cpu->cpu_UTTDBG_pa, &cpu->cpu_UTTDBG_len);
+ 		ml_read_reg_range(child, "cpu-impl-reg", &cpu->cpu_IMPL_pa, &cpu->cpu_IMPL_len);
+ 		ml_read_reg_range(child, "coresight-reg", &cpu->coresight_pa, &cpu->coresight_len);
+-		cpu->cluster_type = CLUSTER_TYPE_SMP;
++		/*
++		 * The scheduler is built for AMP (osfmk/kern/sched.h: __AMP__ -> Edge): there is no SMP
++		 * pset type.  Without amp=1 every core is a P core of one cluster (the P/E split of
++		 * the loader's small cores is only made with it, or by "cluster-type" in the device tree).
++		 */
++		cpu->cluster_type = CLUSTER_TYPE_P;
+ 
+ 		int cluster_type = (int)ml_readprop(child, "cluster-type", 0);
++		if (hakios_amp_enabled && cluster_type == 0 && ml_readprop(child, "small-core", 0) != 0) {
++			cluster_type = 'E';
++		}
++		if (hakios_amp_enabled == 2 && (cpu->cpu_id & 1) && !is_boot_cpu) {
++			cluster_type = 'E';     /* amp=2 (a test, e.g. QEMU, whose cores are alike): every other core is an E core */
++		}
++		if (!hakios_amp_enabled) {
++			cluster_type = 'P';
++		}
+ 		if (cluster_type == 'E') {
+ 			cpu->cluster_type = CLUSTER_TYPE_E;
+ 		} else if (cluster_type == 'M') {
+@@ -1334,6 +1417,7 @@ ml_parse_cpu_topology(void)
  	cluster_offsets[0] = 0;
  #endif
  	assert(topology_info.boot_cpu != NULL);
@@ -1125,7 +1153,7 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
  	ml_read_chip_revision(&topology_info.chip_revision);
  	ml_cluster_power_override(&topology_info.cluster_power_down);
  
-@@ -1414,7 +1482,7 @@ ml_get_boot_cluster_type(void)
+@@ -1414,7 +1498,7 @@ ml_get_boot_cluster_type(void)
  int
  ml_get_cpu_number(uint32_t phys_id)
  {
@@ -1134,7 +1162,7 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
  
  	for (unsigned i = 0; i < topology_info.num_cpus; i++) {
  		if (topology_info.cpus[i].phys_id == phys_id) {
-@@ -1705,6 +1773,12 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+@@ -1705,6 +1789,12 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
  
  	processor_t processor = PERCPU_GET_WITH_BASE(other_percpu_base(this_cpu_datap->cpu_number), processor);
  	*processor_out = processor;
@@ -1147,7 +1175,7 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
  	if (!is_boot_cpu) {
  		smr_cpu_init(*processor_out);
  	}
-@@ -2708,11 +2782,19 @@ _enable_virtual_timer(void)
+@@ -2708,11 +2798,19 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64(KERNEL_CNTV_CTL_EL0, cntvctl);
@@ -1167,7 +1195,7 @@ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
  }
  
  void
-@@ -3394,6 +3476,17 @@ ml_unsafe_kernel_text_init(void)
+@@ -3394,6 +3492,17 @@ ml_unsafe_kernel_text_init(void)
  	    size == sizeof(int)) {
  		_unsafe_kernel_text_initialized = true;
  		_unsafe_kernel_text = (0 == *(const int *)value);
@@ -2059,7 +2087,7 @@ diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_
 +
 +#define MAX_L2_CLINE                   6
 +#define MAX_CPUS                       8 /* QEMU virt / standard ARMv9 bring-up */
-+#define MAX_CPU_CLUSTERS               1
++#define MAX_CPU_CLUSTERS               2 /* P and E (amp=1); one without it */
 +
 +#define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
 +#endif  /* ARM64_BOARD_CONFIG_BCM2837 */

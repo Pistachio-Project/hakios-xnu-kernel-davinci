@@ -992,7 +992,8 @@ park_start(void)
 	 * times as much on an A55 (logs/113203-run.log: 28 us a draw on an A76, 80 to 110 on an A55).
 	 */
 	PE_parse_boot_argn("park_busy", &park_busy, sizeof(park_busy));
-	uint32_t on = 1;
+	extern uint32_t hakios_amp_enabled;
+	uint32_t on = hakios_amp_enabled ? 0 : 1;       /* (amp=1: the scheduler places work on the E cluster itself; park_small=1 still parks) */
 	thread_t thread;
 
 	PE_parse_boot_argn("park_small", &on, sizeof(on));
@@ -1019,6 +1020,7 @@ hakios_cpufreq_init(void)
 	uint32_t enabled = 0, cores[CPUFREQ_GROUPS] = { 0 }, before, here;
 
 	hakios_cpuload_start();
+	hakios_amp_start();             /* (boot-arg amp=1: osfmk/kern/hakios_amp.c) */
 	hakios_pm_idle_init();          /* (boot-arg pm_idle=: the cores' idle states; arch/arm64/kernel/cpu_idle.c) */
 	PE_parse_boot_argn("pm_screen", &pm_screen_mode, sizeof(pm_screen_mode));
 	PE_parse_boot_argn("cpufreq", &enabled, sizeof(enabled));

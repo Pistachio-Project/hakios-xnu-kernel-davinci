@@ -93,6 +93,7 @@ void hakios_net_init(void);            /* en0, if there is something to carry it
 void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
 void hakios_ddr_init(bool with_cpufreq); /* boot-arg ddr=: the memory's bandwidth, asked of RPMh (bsd/dev/board/ddr.c) */
 void hakios_ddr_quiesce(void);         /* ... and given back on the way to the loader */
+void hakios_amp_start(void);              /* boot-arg amp=1: every 5 s per-cluster load and QoS placement (osfmk/kern/hakios_amp.c) */
 void hakios_cpuload_start(void);        /* boot-arg cpuload=MS: how busy each core is, to the loader's log (bsd/dev/board/bench.c) */
 void hakios_membench(void);             /* boot-arg membench=: how fast the cores get at memory */
 void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */

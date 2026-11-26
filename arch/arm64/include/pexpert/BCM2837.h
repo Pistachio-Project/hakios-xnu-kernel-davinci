@@ -15,6 +15,14 @@
 #define GENERIC_PSCI_SMP                  1 /* more cores are started through PSCI, see osfmk/arm64/psci_smp.c */
 
 /*
+ * The scheduler is the Edge one (clutch + per-cluster psets), always.  Which clusters there are is the
+ * boot-arg amp= (osfmk/arm64/machine_routines.c, ml_parse_cpu_topology()): amp=1 makes the loader's
+ * "small-core" cores an E cluster and the rest a P cluster; without it every core is one P cluster,
+ * which schedules like the plain clutch scheduler did.
+ */
+#define __ARM_AMP__               1
+
+/*
  * The cores this kernel really runs on (Cortex-A55/A78, QEMU cortex-a76) are
  * ARMv8.2: they set PSTATE.PAN on every exception entry, so the kernel must
  * know to lift it around user memory accesses.

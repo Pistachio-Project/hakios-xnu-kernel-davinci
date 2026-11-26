@@ -347,6 +347,93 @@ diff --git a/osfmk/kern/sched.h b/osfmk/kern/sched.h
 +extern bool sched_slow_secondaries;
 +
  #endif  /* _KERN_SCHED_H_ */
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -1379,6 +1379,28 @@ sched_clutch_bucket_init(
+ 	queue_init(&clutch_bucket->scb_thread_timeshare_queue);
+ }
+ 
++/*
++ * There is no performance controller (CLPC) here to say which cluster a thread group's QoS levels
++ * prefer, so the Edge scheduler starts each of them at a fixed policy, as on an iPhone with the
++ * controller idle: the lower levels (utility, background) at an E pset, everything else at a P pset;
++ * the edges' defaults (P -> E weighted spill, E -> P none) let the P cluster's overflow run on E.
++ * With one cluster type only (no amp= boot-arg) every level prefers the boot pset.
++ */
++static pset_id_t
++sched_edge_default_preferred_pset(sched_bucket_t bucket)
++{
++	pset_type_t want = (bucket == TH_BUCKET_SHARE_UT || bucket == TH_BUCKET_SHARE_BG) ? PSET_AMP_E : PSET_AMP_P;
++
++	if (sched_num_psets > 1) {
++		for (pset_id_t id = 0; id < sched_num_psets; id++) {
++			if (pset_array[id] != PROCESSOR_SET_NULL && pset_array[id]->pset_type == want) {
++				return id;
++			}
++		}
++	}
++	return sched_boot_pset->pset_id;
++}
++
+ /*
+  * sched_clutch_bucket_group_init()
+  *
+@@ -1401,7 +1423,7 @@ sched_clutch_bucket_group_init(
+ 
+ 	os_atomic_store(&clutch_bucket_group->scbg_timeshare_tick, 0, relaxed);
+ 	os_atomic_store(&clutch_bucket_group->scbg_pri_shift, INT8_MAX, relaxed);
+-	os_atomic_store(&clutch_bucket_group->scbg_preferred_pset, sched_boot_pset->pset_id, relaxed);
++	os_atomic_store(&clutch_bucket_group->scbg_preferred_pset, sched_edge_default_preferred_pset(bucket), relaxed);
+ 	/*
+ 	 * All thread groups should be initialized to be interactive; this allows the newly launched
+ 	 * thread groups to fairly compete with already running thread groups.
+@@ -5038,9 +5060,11 @@ __enum_decl(sched_edge_stp_state_t, uint8_t, {
+ static_assert(SCHED_EDGE_STP_MAX <= bits_mask(SESTP_BITS_PER_CORE),
+     "Per-core stir-the-pot request state must fit in per-core bits");
+ 
+-#if OS_ATOMIC_USE_LLSC
+-#error "Expecting CAS implementation of os_atomic_rmw_loop()"
+-#endif /* OS_ATOMIC_USE_LLSC */
++/*
++ * hakios: Apple's arm64 targets are ARMv8.2 and use CAS here; this kernel is built for any arm64 core
++ * and so uses LL/SC.  The loops below only compute on the registry word and a few cpu bitmaps between
++ * the load and the store, so they work, but are not starvation free (OS_ATOMIC_USE_LLSC).
++ */
+ 
+ static cpumap_t sched_edge_p_core_map = 0ULL;
+ static cpumap_t sched_edge_non_p_core_map = 0ULL;
+@@ -6353,6 +6377,15 @@ sched_edge_cpu_init_completed(void)
+ 	sched_clutch_edge free_spill = (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 1, .sce_steal_allowed = 1};
+ 	sched_clutch_edge no_spill = (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 0, .sce_steal_allowed = 0};
+ 	sched_clutch_edge weighted_spill = (sched_clutch_edge){.sce_migration_weight = 64, .sce_migration_allowed = 1, .sce_steal_allowed = 1};
++	/* hakios, boot-arg amp_spill=N: the P -> E edge's weight in us (the default 64); 0: nothing of the P cluster's overflow goes to E */
++	uint32_t amp_spill = 64;
++	if (PE_parse_boot_argn("amp_spill", &amp_spill, sizeof(amp_spill))) {
++		if (amp_spill == 0) {
++			weighted_spill = no_spill;
++		} else {
++			weighted_spill.sce_migration_weight = amp_spill;
++		}
++	}
+ 	/* P -> P */
+ 	edge_config_defaults[PSET_AMP_P][PSET_AMP_P] = free_spill;
+ 	/* E -> E */
+diff --git a/osfmk/kern/sched_common.c b/osfmk/kern/sched_common.c
+--- a/osfmk/kern/sched_common.c
++++ b/osfmk/kern/sched_common.c
+@@ -142,7 +142,10 @@ bool
+ sched_is_standard_topology(void)
+ {
+ 	extern bool cpu_config_modified;
+-	return !cpu_config_modified;
++	/* hakios: without amp=1 every core is one P cluster: a topology of one core type is not the standard one */
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	return !cpu_config_modified && topology->cluster_type_num_clusters[CLUSTER_TYPE_E] != 0 &&
++	       topology->cluster_type_num_clusters[CLUSTER_TYPE_P] != 0;
+ }
+ 
+ #endif /* __AMP__ */
 diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
 --- a/osfmk/kern/sched_prim.c
 +++ b/osfmk/kern/sched_prim.c
@@ -445,6 +532,39 @@ diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
  				/* secondary can only run realtime thread */
  				if (select_outcome == IDLE_NONE) {
  					select_outcome = IDLE_SMT_PAIR_REALTIME;
+@@ -3428,6 +3466,24 @@ thread_csw_callout(
+ }
+ 
+ 
++/*
++ * boot-arg amp=1 statistics (board/bench.c prints them every 5 s): the time threads ran, by the type of the
++ * pset they ran on and by scheduling bucket; and per thread, in thread->hk_cluster_time.
++ */
++_Atomic uint64_t hakios_amp_time[2][TH_BUCKET_SCHED_MAX];
++
++static inline void
++hakios_amp_account(processor_t processor, thread_t thread, uint64_t ran)
++{
++	unsigned int e = (processor->processor_set->pset_type == PSET_AMP_E);
++
++	if (ran == 0 || ran > (1ULL << 40) || (thread->state & TH_IDLE)) {
++		return;
++	}
++	thread->hk_cluster_time[e] += ran;
++	os_atomic_add(&hakios_amp_time[e][thread->th_sched_bucket], ran, relaxed);
++}
++
+ /*
+  *	thread_dispatch:
+  *
+@@ -3632,6 +3688,7 @@ thread_dispatch(
+ 			}
+ 
+ 			thread->computation_metered += (processor->last_dispatch - thread->computation_epoch);
++			hakios_amp_account(processor, thread, processor->last_dispatch - thread->computation_epoch);
+ 
+ 			if (!(thread->state & TH_WAIT)) {
+ 				/*
 diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
@@ -554,6 +674,17 @@ diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
  uint64_t
  thread_last_run_time(thread_t th)
  {
+diff --git a/osfmk/kern/thread.h b/osfmk/kern/thread.h
+--- a/osfmk/kern/thread.h
++++ b/osfmk/kern/thread.h
+@@ -686,6 +686,7 @@ struct thread {
+ 
+ 	/* Fail-safe computation since last unblock or qualifying yield */
+ 	uint64_t                computation_metered;
++	uint64_t                hk_cluster_time[2];     /* mach_absolute_time units this thread ran on a P pset [0], an E pset [1] (amp= statistics) */
+ 	uint64_t                computation_epoch;
+ 	uint64_t                computation_interrupt_epoch;
+ 	uint64_t                safe_release;           /* when to release fail-safe */
 diff --git a/osfmk/kern/work_interval.c b/osfmk/kern/work_interval.c
 --- a/osfmk/kern/work_interval.c
 +++ b/osfmk/kern/work_interval.c

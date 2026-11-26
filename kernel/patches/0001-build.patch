@@ -147,7 +147,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  
  bsd/libkern/crc32.c			standard
  bsd/libkern/random.c			standard
-@@ -155,6 +207,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +213,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -162,7 +162,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -380,6 +440,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -380,6 +446,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -170,7 +170,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -403,6 +464,7 @@ bsd/kern/kern_debug.c			standard
+@@ -403,6 +470,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -387,7 +387,15 @@ diff --git a/makedefs/MakeInc.top b/makedefs/MakeInc.top
 diff --git a/osfmk/conf/files b/osfmk/conf/files
 --- a/osfmk/conf/files
 +++ b/osfmk/conf/files
-@@ -407,3 +407,6 @@ osfmk/corecrypto/ccsha512_ltc_di.c	standard
+@@ -173,6 +173,7 @@ osfmk/kern/processor.c		standard
+ osfmk/kern/recount.c		standard
+ osfmk/kern/restartable.c		standard
+ osfmk/kern/sched_average.c		standard
++osfmk/kern/hakios_amp.c		standard
+ #ifdef __AMP__
+ osfmk/kern/sched_amp.c		standard
+ osfmk/kern/sched_amp_common.c	standard
+@@ -407,3 +408,6 @@ osfmk/corecrypto/ccsha512_ltc_di.c	standard
  
  osfmk/prng/prng_random.c	standard
  osfmk/prng/entropy.c   standard
