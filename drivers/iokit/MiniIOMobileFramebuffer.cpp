@@ -83,7 +83,9 @@ enum {
 #define SWAP_LAYERS             4
 
 #define kFBNotifyVSync          5
-#define kFBNotifyTypes          8
+#define kFBNotifyTypes          16                      /* iOS 27's backboardd registers a port for type 9: with 8 that was refused (kIOReturnBadArgument) */
+static uint32_t gNotifyPorts[kFBNotifyTypes];           /* notification ports taken, by type */
+static uint32_t gNotifyRefused;                         /* notification ports / callbacks refused for a type out of range */
 #define kFBRefreshHz            60                      /* matches the 60 Hz hardware scanout left by DisplayDxe; overridable via fb_hz */
 
 #define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
@@ -2623,6 +2625,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate);
+		IOLog("MiniIOMobileFramebuffer: notifications: ports taken for types 5/7/9: %u/%u/%u, %u refused; "
+		    "swaps that timed out waiting for a queue slot (%u ms): %u\n", gNotifyPorts[5], gNotifyPorts[7],
+		    gNotifyPorts[9], gNotifyRefused, SWAP_HELD_MS, fStatLost);
 		IOLockLock(fSwapLock);
 		IOLog("MiniIOMobileFramebuffer: SwapEnd: %u calls returned after %llu us on average (%llu at most), %llu us of that held for a free queue slot (%u held); "
 		    "the presenter is not what the window server waits for unless this is large\n", fStatCalls,
@@ -2825,8 +2830,10 @@ IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, UInt32
 
 	IOLog("MiniIOMobileFramebuffer: notification port for type %u\n", (unsigned) type);
 	if (type >= kFBNotifyTypes) {
+		gNotifyRefused++;
 		return kIOReturnBadArgument;
 	}
+	gNotifyPorts[type]++;
 	IOLockLock(fLock);
 	old = fPorts[type];
 	fPorts[type] = port;
@@ -3075,6 +3082,7 @@ IOMobileFramebufferUserClient::method(uint32_t selector, IOExternalMethodArgumen
 
 	case kFBMethodNotifications:                    /* in: callback (0 = off), its argument, type, 0 */
 		if (args->scalarInputCount < 3 || in[2] >= kFBNotifyTypes) {
+			gNotifyRefused++;
 			return kIOReturnBadArgument;
 		}
 		{
