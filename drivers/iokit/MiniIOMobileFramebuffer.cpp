@@ -327,7 +327,8 @@ extern "C" uint64_t hakios_display_te_irqs(void);
 static uint64_t gScanoutLatchSeenAt, gScanoutLatchTe;   /* (ring=2) when a flip's taking over was first seen here, and the refresh interrupts counted then */
 static uint64_t gScanoutDeferredAt;                     /* ... when the oldest swap not completed was deferred */
 static uint64_t gScanoutTimedOut, gScanoutDeferredCount;
-static uint32_t gScanoutFails;                         /* consecutive flips (zero copy) that were not taken */
+static uint32_t gScanoutFails;
+static uint64_t gScanoutDropped;                       /* frames not flipped because the flip before had not been taken over */                         /* consecutive flips (zero copy) that were not taken */
 #define SCANOUT_FAILS_MAX 10
 extern "C" const char * hakios_display_scanout_why(void);
 extern "C" void hakios_display_scanout_rearm(void);
@@ -2333,6 +2334,25 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 	gScanoutWaited += waitBegan;
 	gScanoutWaitedMax = waitBegan > gScanoutWaitedMax ? waitBegan : gScanoutWaitedMax;
 	scanoutLetGo();
+	if (!settled) {
+		/*
+		 * The flip before has not been taken over: nothing is torn down for that. This frame is dropped -- its swap completes without it
+		 * being shown, as a display does when frames come faster than it refreshes -- and the next one flips. Only 10 in a row mean
+		 * the pipe is stuck (then as any failure below).
+		 */
+		static uint32_t reported;
+
+		gScanoutFails++;
+		if (gScanoutFails < SCANOUT_FAILS_MAX) {
+			if (reported++ < 5) {
+				IOLog("MiniIOMobileFramebuffer: fb_scanout: the flip before surface %u is not taken over yet: this frame is dropped (%u in a row)\n",
+				    s->sid, gScanoutFails);
+			}
+			gScanoutDropped++;
+			IOLockUnlock(gScanoutLock);
+			return true;
+		}
+	}
 	if (!settled || !hakios_display_scanout_show(s->scanoutAddr, s->info.bytesPerRow, s->info.width, s->info.height,
 	    gScanoutAsync == 0)) {
 		/* a miss is not for good: the pipe goes back to the firmware's picture, this frame is copied, the next tries again */
@@ -2800,10 +2820,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				hakios_display_scanout_stats(st);
 				IOLog("MiniIOMobileFramebuffer: fb_scanout flips: %llu flips, taken over seen by the refresh interrupt %llu, by poll %llu; "
 				    "flip to taken over %llu us on average (%llu at most); %llu waits on the interrupt, %llu of them timed out (20 ms); "
-				    "ring=%u: surface let go %llu us after its successor's flip on average (%llu at most) over %llu; %llu swaps deferred, %llu completed by the 34 ms limit without a seen latch\n", st[0], st[1], st[2],
+				    "ring=%u: surface let go %llu us after its successor's flip on average (%llu at most) over %llu; %llu swaps deferred, %llu completed by the 34 ms limit without a seen latch, %llu frames dropped (the flip before not taken over yet)\n", st[0], st[1], st[2],
 				    st[5] ? st[3] / st[5] / 1000 : 0, st[4] / 1000, st[6], st[7], gScanoutRing,
-				    gScanoutReleaseN ? gScanoutReleaseSum / gScanoutReleaseN / 1000 : 0, gScanoutReleaseMax / 1000, gScanoutReleaseN, gScanoutDeferredCount, gScanoutTimedOut);
-				gScanoutDeferredCount = gScanoutTimedOut = 0;
+				    gScanoutReleaseN ? gScanoutReleaseSum / gScanoutReleaseN / 1000 : 0, gScanoutReleaseMax / 1000, gScanoutReleaseN, gScanoutDeferredCount, gScanoutTimedOut, gScanoutDropped);
+				gScanoutDeferredCount = gScanoutTimedOut = gScanoutDropped = 0;
 				gScanoutReleaseSum = gScanoutReleaseMax = gScanoutReleaseN = 0;
 			}
 			gScanoutSettled = gScanoutWaits = 0;

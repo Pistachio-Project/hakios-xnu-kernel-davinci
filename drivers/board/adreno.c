@@ -4866,7 +4866,12 @@ hakios_display_scanout_latched(void)
 bool
 hakios_display_scanout_settle(void)
 {
-	return !scanout.open || scanout_wait(true);
+	bool ok = !scanout.open || scanout_wait(true);
+
+	if (!ok) {
+		scanout.why = "the flip before it was not taken over in 60 ms";
+	}
+	return ok;
 }
 
 /* The firmware's picture again (and the scaler off): what the loader draws over. */
