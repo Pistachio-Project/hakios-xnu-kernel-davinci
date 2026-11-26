@@ -323,6 +323,10 @@ static unsigned gScanoutDeferred;               /* (fb_scanout_ring=2) swaps who
 static class IOMobileFramebuffer * gScanoutDeferredFb;
 extern "C" void hakios_display_scanout_on_latch(void (*hook)(void));
 extern "C" void hakios_display_scanout_stats(uint64_t out[8]);
+extern "C" uint64_t hakios_display_te_irqs(void);
+static uint64_t gScanoutLatchSeenAt, gScanoutLatchTe;   /* (ring=2) when a flip's taking over was first seen here, and the refresh interrupts counted then */
+static uint64_t gScanoutDeferredAt;                     /* ... when the oldest swap not completed was deferred */
+static uint64_t gScanoutTimedOut, gScanoutDeferredCount;
 /* fb_scanout_par=0 (default 1): the ring copy is made by the presenter alone, not shared out with the scaling's helper threads (fb_threads) */
 static TUNABLE(uint32_t, gScanoutPar, "fb_scanout_par", 1);
 /* fb_scanout_late=0 (default 1): the flip is waited for and kicked before the swap completes, as before (late: after it) */
@@ -2049,11 +2053,37 @@ scanoutRelease(void)
 	}
 }
 
+/*
+ * With gScanoutLock. The surface before the last flip may be let go. Ring 0: when the flush is seen taken over. Ring 2: at the first refresh
+ * interrupt after that was seen -- one whole refresh later, so that the panel cannot still be scanning it when the window server gets it back
+ * (the taking over is at a refresh's start, the interrupt a line after it; a flip seen taken over at its own interrupt waits for the next).
+ * Without the interrupt, 17 ms after it was seen.
+ */
+static bool
+scanoutReleasable(void)
+{
+	uint64_t now = mach_absolute_time(), te;
+
+	if (!hakios_display_scanout_latched()) {
+		gScanoutLatchSeenAt = 0;
+		return false;
+	}
+	if (gScanoutRing != 2) {
+		return true;
+	}
+	te = hakios_display_te_irqs();
+	if (gScanoutLatchSeenAt == 0) {
+		gScanoutLatchSeenAt = now;
+		gScanoutLatchTe = te;
+	}
+	return te != 0 ? te > gScanoutLatchTe : now - gScanoutLatchSeenAt >= usToAbs(17000);
+}
+
 /* With gScanoutLock: the display has taken the last flip over, so nothing fetches the surface before it any more: let it go. */
 static void
 scanoutLetGo(void)
 {
-	if (gScanoutPrev != NULL && hakios_display_scanout_latched()) {
+	if (gScanoutPrev != NULL && scanoutReleasable()) {
 		MiniIOSurface * previous = gScanoutPrev;
 
 		gScanoutPrev = NULL;
@@ -2089,7 +2119,7 @@ scanoutTimer(thread_call_param_t unused0 __unused, thread_call_param_t unused1 _
 	IOMobileFramebuffer * complete = NULL;
 
 	IOLockLock(gScanoutLock);
-	if (gScanoutPrev != NULL && hakios_display_scanout_latched()) {
+	if (gScanoutPrev != NULL && scanoutReleasable()) {
 		uint64_t ns;
 
 		absolutetime_to_nanoseconds(mach_absolute_time() - gScanoutKickAt, &ns);
@@ -2098,9 +2128,15 @@ scanoutTimer(thread_call_param_t unused0 __unused, thread_call_param_t unused1 _
 		gScanoutReleaseMax = ns > gScanoutReleaseMax ? ns : gScanoutReleaseMax;
 	}
 	scanoutLetGo();
-	if (gScanoutDeferred != 0 && (hakios_display_scanout_latched() || gScanoutGaveUp)) {
-		gScanoutDeferred--;
-		complete = gScanoutDeferredFb;
+	if (gScanoutDeferred != 0) {
+		bool late = mach_absolute_time() - gScanoutDeferredAt >= usToAbs(34000);   /* (two refreshes: never wait longer for a latch) */
+
+		if (hakios_display_scanout_latched() || gScanoutGaveUp || late) {
+			gScanoutTimedOut += late && !hakios_display_scanout_latched() && !gScanoutGaveUp;
+			gScanoutDeferred--;
+			gScanoutDeferredAt = mach_absolute_time();      /* (the next one's time counts from now) */
+			complete = gScanoutDeferredFb;
+		}
 	}
 	again = gScanoutPrev != NULL || gScanoutDeferred != 0;
 	IOLockUnlock(gScanoutLock);
@@ -2298,6 +2334,7 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 		gScanoutGaveUp = true;
 		scanoutRelease();
 		IOLockUnlock(gScanoutLock);
+		printf("MiniIOMobileFramebuffer: fb_scanout: the display did not take a frame (settled %d, surface %u at %#x stride %u): frames are copied from now on\n", settled, s->sid, s->scanoutAddr, s->info.bytesPerRow);
 		IOLog("MiniIOMobileFramebuffer: fb_scanout: the display did not take a frame: frames are copied from now on\n");
 		return false;
 	}
@@ -2312,6 +2349,7 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 	 * latched (then scanoutLetGo(): at once if the flip was waited for, else by the timer or the next flip).
 	 */
 	gScanoutKickAt = mach_absolute_time();
+	gScanoutLatchSeenAt = 0;
 	gScanoutPrev = gScanoutHeld;
 	gScanoutHeld = MiniIOSurfaceCopy(s->sid);
 	if (gScanoutHeld != NULL) {
@@ -2658,7 +2696,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (deferred) {
 		IOLockLock(gScanoutLock);
 		gScanoutDeferredFb = this;
-		gScanoutDeferred++;
+		if (gScanoutDeferred++ == 0) {
+			gScanoutDeferredAt = mach_absolute_time();
+		}
+		gScanoutDeferredCount++;
 		IOLockUnlock(gScanoutLock);
 		thread_call_enter(gScanoutCall);        /* (at once if the flip has latched already, else on the refresh interrupt or the poll) */
 	}
@@ -2738,9 +2779,10 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				hakios_display_scanout_stats(st);
 				IOLog("MiniIOMobileFramebuffer: fb_scanout flips: %llu flips, taken over seen by the refresh interrupt %llu, by poll %llu; "
 				    "flip to taken over %llu us on average (%llu at most); %llu waits on the interrupt, %llu of them timed out (20 ms); "
-				    "ring=%u: surface let go %llu us after its successor's flip on average (%llu at most) over %llu\n", st[0], st[1], st[2],
+				    "ring=%u: surface let go %llu us after its successor's flip on average (%llu at most) over %llu; %llu swaps deferred, %llu completed by the 34 ms limit without a seen latch\n", st[0], st[1], st[2],
 				    st[5] ? st[3] / st[5] / 1000 : 0, st[4] / 1000, st[6], st[7], gScanoutRing,
-				    gScanoutReleaseN ? gScanoutReleaseSum / gScanoutReleaseN / 1000 : 0, gScanoutReleaseMax / 1000, gScanoutReleaseN);
+				    gScanoutReleaseN ? gScanoutReleaseSum / gScanoutReleaseN / 1000 : 0, gScanoutReleaseMax / 1000, gScanoutReleaseN, gScanoutDeferredCount, gScanoutTimedOut);
+				gScanoutDeferredCount = gScanoutTimedOut = 0;
 				gScanoutReleaseSum = gScanoutReleaseMax = gScanoutReleaseN = 0;
 			}
 			gScanoutSettled = gScanoutWaits = 0;

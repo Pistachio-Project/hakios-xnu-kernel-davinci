@@ -4808,6 +4808,14 @@ scanout_flush(bool may_sleep)
 }
 
 /* Has the display taken the last flush over (the surface before it is not fetched any more)? Does not wait. */
+/* How many refresh interrupts so far, and whether they are coming (the display driver releases a surface one refresh after its successor latched). */
+uint64_t hakios_display_te_irqs(void);
+uint64_t
+hakios_display_te_irqs(void)
+{
+	return te_on && !te_given_up ? __atomic_load_n(&te_count, __ATOMIC_SEQ_CST) : 0;
+}
+
 /* The display driver's call when the refresh interrupt has seen the last flip taken over (interrupt context: wake a thread, nothing more). */
 void hakios_display_scanout_on_latch(void (*hook)(void));
 void
@@ -4943,6 +4951,7 @@ hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint
 	bool first = !scanout.on;
 
 	if (!scanout.open || scanout.broken || (phys & 0xf) || (stride & 0xf)) {
+		printf("adreno: scanout: show refused: open %d broken %d phys %#x stride %u\n", scanout.open, scanout.broken, phys, stride);
 		return false;
 	}
 	if (!scanout_wait(true)) {
