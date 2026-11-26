@@ -404,8 +404,14 @@ wp_trap_name(uint64_t t)
 	}
 }
 
+struct wp_pending {
+	struct wp_thr *th;
+	uint32_t cs;
+	uint64_t x0, x4;
+};
+
 static void
-wp_fill_user(struct wp_target *tg, thread_t t, struct wp_wait *w)
+wp_fill_user(thread_t t, struct wp_wait *w, uint64_t *x0, uint64_t *x4)
 {
 	const arm_saved_state_t *us = t->machine.upcb;
 
@@ -416,34 +422,48 @@ wp_fill_user(struct wp_target *tg, thread_t t, struct wp_wait *w)
 	w->ulr = get_saved_state_lr(us) & 0x0000ffffffffffffull;
 	w->ec = (uint32_t)(get_saved_state_esr(us) >> 26);
 	w->trap = get_saved_state_reg(us, 16);
-	if (w->ec == 0x15 && (w->trap == (uint64_t)-31 || w->trap == (uint64_t)-47)) {
-		vm_map_t map = get_task_map_reference(tg->task);
-		uint32_t m[9];
+	*x0 = get_saved_state_reg(us, 0);
+	*x4 = get_saved_state_reg(us, 4);
+}
 
-		if (map == VM_MAP_NULL) {
-			return;
+/* (no locks held: the task's map is read, which may fault) */
+static void
+wp_read_msg(struct wp_target *tg, struct wp_pending *pe)
+{
+	struct wp_thr *th = pe->th;
+	struct wp_wait w = th->w;
+	vm_map_t map = get_task_map_reference(tg->task);
+	uint32_t m[9];
+
+	if (map == VM_MAP_NULL) {
+		return;
+	}
+	bzero(m, sizeof(m));
+	if (w.trap == (uint64_t)-31) {
+		if (vm_map_read_user(map, pe->x0, m, sizeof(m)) == KERN_SUCCESS) {
+			w.msgid = m[5];
+			w.word = m[8];
+			w.has_msg = 1;
 		}
-		bzero(m, sizeof(m));
-		if (w->trap == (uint64_t)-31) {
-			/* mach_msg(header,...): bits size remote local voucher id | NDR(8) | words */
-			if (vm_map_read_user(map, get_saved_state_reg(us, 0), m, sizeof(m)) == KERN_SUCCESS) {
-				w->msgid = m[5];
-				w->word = m[8];
-				w->has_msg = 1;
-			}
+	} else {
+		w.msgid = (uint32_t)(pe->x4 >> 32);
+		if (vm_map_read_user(map, pe->x0, m, 12) == KERN_SUCCESS) {
+			w.word = m[2];
+			w.has_msg = 1;
 		} else {
-			/* mach_msg2(data=body, opts, bits_size, remote_local, voucher_id, ...): the id is the high half of x4 */
-			uint32_t b[3];
-
-			w->msgid = (uint32_t)(get_saved_state_reg(us, 4) >> 32);
-			if (vm_map_read_user(map, get_saved_state_reg(us, 0), b, sizeof(b)) == KERN_SUCCESS) {
-				w->word = b[2];
-				w->has_msg = 1;
-			} else {
-				w->has_msg = 2;
-			}
+			w.has_msg = 2;
 		}
-		vm_map_deallocate(map);
+	}
+	vm_map_deallocate(map);
+	if (th->kind == 1 && th->cs == pe->cs) {        /* (still that wait) */
+		th->w.msgid = w.msgid;
+		th->w.word = w.word;
+		th->w.has_msg = w.has_msg;
+		if (th->agg >= 0) {
+			tg->agg[th->agg].w.msgid = w.msgid;
+			tg->agg[th->agg].w.word = w.word;
+			tg->agg[th->agg].w.has_msg = w.has_msg;
+		}
 	}
 }
 
@@ -552,6 +572,8 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 {
 	thread_t t;
 	task_t task = tg->task;
+	struct wp_pending pend[16];
+	unsigned npend = 0;
 
 	tg->samples++;
 	task_lock(task);
@@ -655,7 +677,9 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 		if (th->kind == 0) {
 			/* a new wait: what made it, read once (the thread is blocked: its state is still) */
 			wp_stack(t, &w);
-			wp_fill_user(tg, t, &w);
+			uint64_t x0 = 0, x4 = 0;
+
+			wp_fill_user(t, &w, &x0, &x4);
 			if ((t->state & (TH_WAIT | TH_RUN)) != TH_WAIT || t->c_switch != cs) {
 				continue;       /* (it woke meanwhile: the reading is not of this wait) */
 			}
@@ -665,6 +689,13 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 			th->began = now_ns;
 			th->w = w;
 			th->agg = wp_agg_for(tg, th, &w);
+			if (w.ec == 0x15 && (w.trap == (uint64_t)-31 || w.trap == (uint64_t)-47) && npend < 16) {
+				pend[npend].th = th;
+				pend[npend].cs = cs;
+				pend[npend].x0 = x0;
+				pend[npend].x4 = x4;
+				npend++;
+			}
 		}
 		th->last = now_ns;
 		if (th->agg >= 0) {
@@ -673,6 +704,9 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 		}
 	}
 	task_unlock(task);
+	for (unsigned i = 0; i < npend; i++) {
+		wp_read_msg(tg, &pend[i]);
+	}
 }
 
 static void
