@@ -93,7 +93,6 @@
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
-#include <kern/sched.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
@@ -102,6 +101,8 @@
 #include <sys/systm.h>
 
 #include "kernel.h"
+
+extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
 #include "board.h"
 #include "log.h"
 #include "gt9889_report.h"
@@ -1457,7 +1458,7 @@ hakios_gt9889_init(void)
 		return;
 	}
 	__atomic_store_n(&started, true, __ATOMIC_SEQ_CST);
-	if (kernel_thread_start_priority(gt9889_thread, NULL, BASEPRI_PREEMPT, &thread) == KERN_SUCCESS) {
+	if (kernel_thread_start_priority(gt9889_thread, NULL, 92 /* BASEPRI_PREEMPT: ahead of the kernel's other threads */, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {
 		__atomic_store_n(&started, false, __ATOMIC_SEQ_CST);
