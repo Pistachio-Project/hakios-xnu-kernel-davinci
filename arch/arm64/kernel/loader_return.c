@@ -1087,7 +1087,7 @@ hk_stack_snapshot(void)
 	 * stalled the snapshot -- most runs ended without one.
 	 */
 	enum { HK_TASKS = 4, HK_THREADS = 96 };
-	char wanted[128] = "backboardd SpringBoard";
+	char wanted[128] = "backboardd SpringBoard Preferences iconservicesagent";
 	char line[200];
 	task_t task, found[HK_TASKS];
 	unsigned nfound = 0;
