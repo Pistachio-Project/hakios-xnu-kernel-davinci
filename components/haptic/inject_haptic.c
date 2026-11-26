@@ -181,6 +181,17 @@ wanted(const char *class_name, const char *sel)
 	return false;
 }
 
+/*
+ * Engines that say they are not enabled: UIKit then does not activate or prewarm CoreHaptics' player for them, and the audio server's
+ * actuator device is not started and kept running (silent cycles of 4 ms of real-time CPU each, 160 times a second: most of a core of
+ * the audio server, the log of 231556). The feedbacks themselves are the pulse above.
+ */
+static uintptr_t
+not_enabled(__unused id self, __unused SEL cmd)
+{
+	return 0;
+}
+
 /* a method this wrapper can stand in for: no structure or floating result, at most four arguments after self and _cmd */
 static bool
 fits(Method m)
@@ -225,6 +236,12 @@ install(void)
 		}
 		for (unsigned m = 0; m < n && hooked < 128; m++) {
 			const char *sel = sel_getName(method_getName(methods[m]));
+
+			if (engine && !through_engine && strcmp(sel, "isEnabled") == 0) {
+				(void)method_setImplementation(methods[m], (IMP)not_enabled);
+				say("hakios: uihaptic: %s: -[%s %s] answers no\n", getprogname(), name, sel);
+				continue;
+			}
 
 			if (wanted(name, sel) && fits(methods[m])) {
 				hooks[hooked].cls = all[i];

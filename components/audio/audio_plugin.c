@@ -1218,7 +1218,7 @@ haptic_stopped(void)
 	    __atomic_load_n(&haptic, __ATOMIC_ACQUIRE) >= 0 ? "" : " (no /dev/hakios-haptic: not felt)");
 }
 
-static unsigned long io_cycles, io_silent;
+static unsigned long io_cycles, io_silent, io_speaker, io_codec;
 static uint64_t io_said;
 
 /* every 5 s while the actuator runs: its cycles and the audio server's CPU time (this plug-in is in it), from the I/O thread but for one line */
@@ -1236,7 +1236,8 @@ io_report(void)
 	}
 	io_said = now;
 	getrusage(RUSAGE_SELF, &ru);
-	say("hakios: audio: io cycles %lu (silent %lu), cpu %llu ms\n", io_cycles, io_silent,
+	say("hakios: audio: io cycles %lu (silent %lu), speaker %lu, codec %lu, cpu %llu ms\n", io_cycles, io_silent, io_speaker,
+	    io_codec,
 	    (unsigned long long)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000 +
 	    (unsigned long long)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000);
 }
@@ -1295,6 +1296,7 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		return kAudioHardwareBadObjectError;
 	}
 	if (operation == kAudioServerPlugInIOOperationReadInput && stream == OBJECT_CODEC_INPUT) {
+		io_codec++;
 		codec_read(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationReadInput) {
 		/* the speaker's and Hawking's inputs: silence */
@@ -1302,6 +1304,7 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames, cycle);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
+		io_speaker++;
 		/* the kernel takes it all or leaves it: this thread must not wait */
 		if (sink < 0 || write(sink, buffer, (size_t)frames * HAKIOS_AUDIO_FRAME) < 0) {
 			refused += frames;
