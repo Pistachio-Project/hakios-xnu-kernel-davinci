@@ -270,6 +270,8 @@ bool pushedRanges(const Stage& s, const Bindings& b, std::vector<PushedRange>* o
             }
             PushedRange p{r.offsetVec4, r.sizeDwords / 4, 0, std::vector<uint32_t>(r.sizeDwords, 0u)};
             const uint8_t* at = static_cast<const uint8_t*>(x.buffer->contents()) + x.offset;
+            phase::slowReads++;
+            phase::slowReadBytes += bytes < uint64_t(r.sizeDwords) * 4 ? bytes : uint64_t(r.sizeDwords) * 4;
             for (uint32_t d = 0; d < r.sizeDwords; d++) {
                 const uint64_t byte = uint64_t(r.startDword + d) * 4;
                 if (byte + 4 <= bytes) memcpy(&p.words[d], at + byte, 4);
@@ -589,6 +591,8 @@ bool placeCopies(std::vector<PushedRange>* ranges, uint32_t* at, const Stage& st
             return refuse(why, std::string(stageName(stage)) + ": a constant buffer is bound at an address the CP cannot load from (not a multiple of 16), the table has no room to copy it to, and it is mapped nowhere to copy from");
         }
         r.copy = false;
+        phase::slowReads++;
+        phase::slowReadBytes += 16ull * r.units;
         r.words.resize(r.units * 4);
         memcpy(r.words.data(), static_cast<const uint8_t*>(r.buffer->contents()) + r.bufferOffset, 16ull * r.units);
     }
@@ -1293,6 +1297,7 @@ namespace {
 bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                 const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
                 const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false, GroupCache* grp = nullptr) {
+    phase::Clock clk;
     const Stage& vs = program.vs;
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
     // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
@@ -1330,6 +1335,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     const bool gLink = ask(kGroupLink, true, nullptr, 0);
     // each stage's pushed constant ranges out of its own [[buffer(n)]] table (Metal's setVertexBuffer / setFragmentBuffer)
     // (each thread's own vectors, emptied here and kept: made anew, they were an allocation or two a draw)
+    clk.mark(phase::kStage);
     thread_local std::vector<PushedRange> vsRanges, fsRanges;
     vsRanges.clear();
     fsRanges.clear();
@@ -1482,6 +1488,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         }
         if (blends[i].enabled) blendMask |= 1u << i;
     }
+    clk.mark(phase::kRanges);
     StageTextures vsTex, fsTex;
     if (!stageTextures(vs, vsBindings, pass, &vsTex, why, gmem) || !stageTextures(fs, fsBindings, pass, &fsTex, why, gmem)) {
         return false;
@@ -1496,6 +1503,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (!gfxIbos(vs, vsBindings, fs, fsBindings, program.fsIboBase, &ibos, why)) {
         return false;
     }
+    clk.mark(phase::kDesc);
     for (int i = 0; i < 4; i++) {
         if (!std::isfinite(draw.blendColor[i])) {
             return refuse(why, "a blend colour with a non-finite channel (channel " + n(uint32_t(i)) + ")");
@@ -1623,6 +1631,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     }
 
     // --- nothing is refused from here on: the table, then the stream ---
+    clk.mark(phase::kCheck);
     if (whole) {
         tableStart(tableCpu);
     }
@@ -1634,6 +1643,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, size_t(fsTex.numSamp) * sizeof fsTex.sampWords[0]);
     memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, size_t(vsTex.numTex) * sizeof vsTex.texWords[0]);
     memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, size_t(vsTex.numSamp) * sizeof vsTex.sampWords[0]);
+    clk.mark(phase::kTable);
     MrtWords mrts[kMaxColorOutputs] = {};
     uint32_t srgbMask = 0;
     for (uint32_t i = 0; gPass && i < numRt; i++) {
@@ -2276,6 +2286,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (whole) {
         passTail(stream, table, o, pass.depth != nullptr);
     }
+    clk.mark(phase::kEmit);
     return true;
 }
 }  // namespace
@@ -3184,6 +3195,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }
+    render::phase::Clock clk;
     // A compressed texture whose rows this processor changed since the GPU last copied them in (Texture::staging): the
     // copy first, by the 2D engine into the UBWC layout, in a pass of its own before this draw's
     if (!freshen(vsBindings, options) || !freshen(fsBindings, options)) return false;
@@ -3248,6 +3260,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
     if (!piece(render::kTableBytes, &table, &why, false)) {
         return fail(std::string("no memory for the draw's table: ") + why);
     }
+    clk.mark(render::phase::kPre);
     // A draw into the open pass's attachments joins it: no batch start, no pass begin and no tail of its own, which a
     // pass per draw spent on every draw (the CCU flush and the cache flush waited for, each time). It joins when the
     // attachments are the same textures, it asks for no Clear (a Clear begins a pass), and the options are the same.
@@ -3354,6 +3367,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
             if ((attached & ~likely) != 0 && render::gmemPlan(pass, &narrow, &unused, likely)) plan = narrow;
         }
     }
+    clk.mark(render::phase::kPlan);
     Piece passTable;
     pm4::Stream head, headSys;
     pm4::Stream& body = drawBody_;
@@ -3381,6 +3395,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
             return refuseWork(why);
         }
     }
+    clk.mark(render::phase::kBegin);
     render::Options encodeOptions = options;
     // The register state a draw's inputs decide in groups (render::GroupCache) is tracked per pass: a group is encoded only for a key
     // the pass has not seen, and written as what changed since the last draw (nothing when the key is the same). Not with
@@ -3424,6 +3439,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
             groupsSys->setProgramKey(key, keyBytes, &program.vs, &program.fs, sizeof(Stage));
         }
     }
+    clk.mark(render::phase::kGroups);
     if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
     if (gmemOff_ & kGmemSysmemUnordered) encodeOptions.fbReadOrderedSysmem = false;
     if (gmem && (gmemOff_ & (kGmemFetchNoBarrier | kGmemOrderAll))) encodeOptions.fbReadBarrier = false;
@@ -3437,6 +3453,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
         gmemClears_ = 0;
         return refuseWork(why);
     }
+    clk.skip();   // (encodeDraw counts its own phases)
     if (dual) {
         // the same draw for sysmem: its table the same words but for a fetch's descriptor, which reads memory there
         Piece sysTable = table;
@@ -3457,6 +3474,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
             return refuseWork(why);
         }
     }
+    clk.skip();   // (a dual pass's second encoding counted itself)
     if (!joins) {
         {
             const Texture* first = pass.color0 != nullptr ? pass.color0 : pass.depth;
@@ -3574,6 +3592,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
         drawsProfiled_.push_back(dt);
         if (timed) drawStamp(uint32_t(2 * dt.slot));
     }
+    clk.mark(render::phase::kOpen);
     if (options.dedupRegs && open_->options.dedupRegs) {
         // the draw deduplicated (its groups' words are in it, where encodeDraw wrote them); a packet that made the deduplication
         // forget what the registers hold makes the groups forget theirs as well
@@ -3586,6 +3605,7 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
         if (open_->dual) appendStream(open_->sysStream, bodySys);
     }
     if (timed) drawStamp(uint32_t(2 * (timedDraws_ - 1) + 1));
+    clk.mark(render::phase::kDedupe);
     counts_.draws++;
     if ((profile_ || tuning_) && !profiled_.empty()) {
         PassTime& pt = profiled_.back();
@@ -3633,6 +3653,8 @@ bool CommandBuffer::drawWith(const Program& program, const RenderPass& pass, con
             }
         }
     }
+    clk.mark(render::phase::kTail);
+    if (clk.active) render::phase::draws++;
     return true;
 }
 

@@ -371,6 +371,55 @@ uint32_t halfBitsOf(float f);
 
 // What a pass owns in GPU memory (one 16 KiB page on the phone): the tail's timestamp words, a zero border colour
 // entry (the TP's base registers point here, as in compute), a hole, room for step two's per-stage descriptor tables.
+// Where a draw's CPU time goes (the plug-in's metal_fps report, "draw cpu:"): cheap counter reads between the phases of
+// CommandBuffer::drawWith and render::encodeDraw, summed here, off unless the plug-in turns them on. Plain counters
+// (the recording thread's; a race with the report loses a count, not more).
+namespace phase {
+enum Slot : uint32_t {
+    kPre,       // drawWith: freshen, null textures, private memory, the programs' addresses, the draw's table piece
+    kPlan,      // the pass decision: joins, GMEM or sysmem, tuning, closePass of the pass before
+    kBegin,     // a pass's first draw: its table and head (encodeBegin)
+    kGroups,    // the state groups' program key (GroupCache::setProgramKey) and what the options decide
+    kStage,     // encodeDraw: stage checks and the groups' first asks
+    kRanges,    // the stages' pushed constant ranges and the copies' places
+    kDesc,      // texture, sampler, constant-buffer and image descriptors
+    kCheck,     // the draw's own checks and the link
+    kTable,     // the draw's table, written into the (write-combined) piece
+    kEmit,      // the registers and packets of the draw, into the stream (or the groups' deltas)
+    kDual,      // drawWith: the second encoding of a dual pass
+    kOpen,      // a pass's bookkeeping (takePass, attachments, areas, per-draw listing)
+    kDedupe,    // appendDeduped: the draw's words onto the pass's stream, register by register
+    kTail,      // the buffers a draw uses and keeps
+    kCount
+};
+inline bool on = false;
+inline uint64_t ticks[kCount];
+inline uint64_t draws;
+inline uint64_t slowReads, slowReadBytes;   // reads of write-combined memory by the encoder (placeCopies' fallback, a range past its pages)
+#if defined(__aarch64__)
+inline uint64_t now() { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
+inline uint64_t frequency() { uint64_t v; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
+#elif defined(__x86_64__)
+inline uint64_t now() { return __builtin_ia32_rdtsc(); }
+inline uint64_t frequency() { return 1000000000ull; }
+#else
+inline uint64_t now() { return 0; }
+inline uint64_t frequency() { return 1; }
+#endif
+struct Clock {
+    uint64_t t = 0;
+    bool active = on;
+    Clock() { if (active) t = now(); }
+    void mark(Slot s) {
+        if (!active) return;
+        const uint64_t n = now();
+        ticks[s] += n - t;
+        t = n;
+    }
+    void skip() { if (active) t = now(); }   // (time spent in a phase another clock counts)
+};
+}  // namespace phase
+
 constexpr uint32_t kTableBytes = 8192;
 constexpr uint32_t kTableTimestampsAt = 0;        // the CCU flush's and the cache flush's values: 4 words
 constexpr uint32_t kTableClearFlushAt = 12;       // ...the fourth: the CCU flush after a Clear's fill, which writes kClearFlushValue

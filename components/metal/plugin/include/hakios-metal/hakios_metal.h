@@ -563,6 +563,17 @@ void hakios_metal_cb_set_bin_draw_time(hakios_metal_cb *cb, int on);
 /* bytes the GMEM passes loaded and stored (whole bins' granules), split passes (a draw the tiles could not replay ended the tiles) and what those stored */
 void hakios_metal_cb_gmem_bytes(hakios_metal_cb *cb, unsigned long long *load, unsigned long long *store, unsigned *split_passes, unsigned long long *split_store);
 int hakios_metal_cb_draw_time(hakios_metal_cb *cb, unsigned i, const char **name, double *us);
+/* where a draw's CPU time goes (metal_fps's "draw cpu:" line): ON counts the encoder's phases from now with cheap counter reads;
+ * hakios_metal_draw_phases then gives each phase's counter ticks since the last call (OUT[0..N), N <= the returned count of phases),
+ * then the draws counted, the reads of write-combined memory the encoder made, and their bytes (the next three slots), and
+ * resets them; *FREQ is the counter's ticks a second. hakios_metal_draw_phase_name: phase I's name, NULL past them */
+void hakios_metal_draw_phases_enable(int on);
+unsigned hakios_metal_draw_phases(unsigned long long *out, unsigned n, unsigned long long *freq);
+const char *hakios_metal_draw_phase_name(unsigned i);
+/* a microbenchmark of what the encoder's memory costs on this processor (a buffer of the GPU's, write-combined on the phone,
+ * against an ordinary heap one): OUT gets nanoseconds a 64-byte line for [0] sequential 16-byte stores into the buffer, [1] 4-byte
+ * stores one a line, [2] 4-byte loads from it, [3] sequential 16-byte loads, [4] the heap's sequential stores, [5] its 4-byte loads */
+void hakios_metal_memory_probe(hakios_metal_device *device, double out[6]);
 /* draw I's pass (an index of hakios_metal_cb_pass_time's) and the pixels it can touch, X0 Y0 X1 Y1; -1 past them */
 int hakios_metal_cb_draw_place(hakios_metal_cb *cb, unsigned i, unsigned *pass, unsigned area[4]);
 void hakios_metal_cb_gmem_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *tiles);

@@ -5870,6 +5870,24 @@ HM_REFUSES_OUT_LOUD
 		return nil;
 	}
 	_queue = hakios_metal_queue_new([device hakiosDevice]);
+	if (_queue != NULL && hm_fps_on()) {
+		/* (once per process: what the encoder's memory costs on this processor, and what a clock read costs) */
+		static dispatch_once_t probed;
+		dispatch_once(&probed, ^{
+			double m[6];
+			double t0 = hm_now();
+			volatile double sink = 0;
+			for (unsigned i = 0; i < 1000; i++) sink += hm_now();
+			const double clockNs = (hm_now() - t0) * 1e9 / 1000;
+			uint64_t tp = 0;
+			const double t1 = hm_now();
+			for (unsigned i = 0; i < 1000; i++) __asm__ volatile("mrs %0, TPIDR_EL0" : "=r"(tp));
+			const double tpNs = (hm_now() - t1) * 1e9 / 1000;
+			hakios_metal_memory_probe([device hakiosDevice], m);
+			hm_print("fps: ... probe (ns a 64-byte line): GPU buffer stores %.0f sequential 16B / %.0f one 4B a line; loads %.0f one 4B a line / %.0f whole; "
+				 "heap stores %.0f, loads %.0f; hm_now() %.0f ns, TPIDR_EL0 read %.0f ns (%g)\n", m[0], m[1], m[2], m[3], m[4], m[5], clockNs, tpNs, sink * 0);
+		});
+	}
 	if (_queue == NULL) {
 		hm_print("refused: a command queue: %s\n", hakios_metal_error());
 		[self release];
@@ -6923,6 +6941,8 @@ hm_fps_on(void)
 			on = 1;   /* the scripted run's window needs the frame counting */
 			hm_bench_register();
 		}
+		/* the encoder's per-phase counters (the "draw cpu:" line), unless metal_phases=0: a few counter reads a draw */
+		if (on && !(got && strstr(args, "metal_phases=0") != NULL)) hakios_metal_draw_phases_enable(1);
 	}
 	return on != 0;
 }
@@ -7374,6 +7394,50 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				}
 			}
 			hm_print("fps: ... draw calls by processor:%s (TPIDR_EL0 %#llx)\n", by, (unsigned long long)hm_fps.lastTpidr);
+			{
+				/* what the process asked of the kernel in this window, per draw call: faults, system calls, context switches, and the time
+				 * the kernel spent for it (a draw that costs 50 us where the host's takes 1 is waiting for something, and this says what) */
+				static struct task_events_info prevEv;
+				static struct task_absolutetime_info prevAbs;
+				struct task_events_info ev;
+				struct task_absolutetime_info ab;
+				mach_msg_type_number_t evN = TASK_EVENTS_INFO_COUNT, abN = TASK_ABSOLUTETIME_INFO_COUNT;
+
+				if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&ev, &evN) == KERN_SUCCESS &&
+				    task_info(mach_task_self(), TASK_ABSOLUTETIME_INFO, (task_info_t)&ab, &abN) == KERN_SUCCESS) {
+					static mach_timebase_info_data_t tb;
+					if (tb.denom == 0) mach_timebase_info(&tb);
+					const double d = (double)hm_fps.drawCalls, ms = (double)tb.numer / tb.denom / 1e6;
+
+					hm_print("fps: ... process per draw call (%u): %.2f faults, %.2f unix + %.2f mach system calls, %.2f context switches, "
+						 "%.2f messages; this window: user %.0f ms, system %.0f ms (all threads)\n", hm_fps.drawCalls,
+						 (ev.faults - prevEv.faults) / d, (ev.syscalls_unix - prevEv.syscalls_unix) / d, (ev.syscalls_mach - prevEv.syscalls_mach) / d,
+						 (ev.csw - prevEv.csw) / d, (ev.messages_sent - prevEv.messages_sent) / d,
+						 (double)(ab.total_user - prevAbs.total_user) * ms, (double)(ab.total_system - prevAbs.total_system) * ms);
+					prevEv = ev;
+					prevAbs = ab;
+				}
+			}
+			{
+				/* where the core's time went, per draw it counted (hakios_metal_draw_phases); "plugin" is ours outside the core */
+				unsigned long long ph[32], freq = 0;
+				const unsigned n = hakios_metal_draw_phases(ph, 32, &freq);
+				char line[400] = "";
+				size_t k = 0;
+
+				if (n != 0 && n + 3 <= 32 && ph[n] != 0 && freq != 0) {
+					const double per1 = 1e6 / (double)freq / (double)ph[n];
+					double sum = 0;
+
+					for (unsigned i = 0; i < n && k < sizeof(line); i++) {
+						sum += (double)ph[i];
+						if (ph[i] != 0) k += (size_t)snprintf(line + k, sizeof(line) - k, " %s %.1f,", hakios_metal_draw_phase_name(i), (double)ph[i] * per1);
+					}
+					hm_print("fps: ... draw cpu (us a draw, of %llu draws counted):%s core %.1f, plugin outside the core %.1f; %llu reads of "
+						 "write-combined memory by the encoder (%llu bytes)\n", ph[n], line, sum * per1,
+						 hm_fps.drawCpu * 1e6 / hm_fps.drawCalls - hm_fps.coreCpu * 1e6 / hm_fps.drawCalls, ph[n + 1], ph[n + 2]);
+				}
+			}
 			memset(hm_fps.drawsOn, 0, sizeof(hm_fps.drawsOn));
 			memset(hm_fps.drawUsOn, 0, sizeof(hm_fps.drawUsOn));
 		}

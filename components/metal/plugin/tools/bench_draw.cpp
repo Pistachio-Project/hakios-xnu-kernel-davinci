@@ -34,6 +34,7 @@ using namespace hakios::metal;
 namespace kernels = hakios::metal::kernels;
 
 int main() {
+    render::phase::on = true;   // (the per-phase counters: printed at the end, ticks being the host's TSC)
     auto f = std::make_unique<FakeGpu>();
     FakeGpu* fake = f.get();
     Gpu gpu(std::move(f));
@@ -150,6 +151,15 @@ int main() {
         cb->commit();
         cb->waitUntilCompleted();
         if (cb->status() != CommandBuffer::kCompleted) { std::printf("not completed: %s | %s\n", cb->error().c_str(), fake->stats().lastFault.c_str()); return 1; }
+    }
+    if (render::phase::draws != 0) {
+        static const char* const names[] = {"pre", "plan", "begin", "groups", "stage", "ranges", "descriptors", "check", "table", "emit", "dual", "open", "dedupe", "tail"};
+        // (rdtsc ticks: read as ticks a draw; scaled by the best draw's ns over their sum)
+        uint64_t sum = 0;
+        for (uint64_t t : render::phase::ticks) sum += t;
+        std::printf("bench_draw[%s]: phases, share of the counted time:", mode);
+        for (uint32_t i = 0; i < render::phase::kCount; i++) std::printf(" %s %.1f%%", names[i], 100.0 * double(render::phase::ticks[i]) / double(sum));
+        std::printf("\n");
     }
     std::printf("bench_draw[%s]: %.0f ns a draw at best, %.0f on average (%d draws a buffer, %d rounds)\n", mode, best * 1e3, sum * 1e3 / rounds, draws, rounds);
     return 0;

@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -1074,6 +1075,69 @@ int hakios_metal_cb_draw_place(hakios_metal_cb* cb, unsigned i, unsigned* pass, 
     if (pass) *pass = cb->drawTimes[i].pass;
     for (int k = 0; area != nullptr && k < 4; k++) area[k] = cb->drawTimes[i].area[k];
     return int(cb->drawTimes.size());
+}
+
+void hakios_metal_draw_phases_enable(int on) { render::phase::on = on != 0; }
+
+unsigned hakios_metal_draw_phases(unsigned long long* out, unsigned n, unsigned long long* freq) {
+    using namespace render::phase;
+    uint64_t all[kCount + 3];
+    memcpy(all, ticks, sizeof ticks);
+    all[kCount] = draws, all[kCount + 1] = slowReads, all[kCount + 2] = slowReadBytes;
+    memset(ticks, 0, sizeof ticks);
+    draws = slowReads = slowReadBytes = 0;
+    for (unsigned i = 0; i < n && i < kCount + 3; i++) out[i] = all[i];
+    if (freq) *freq = frequency();
+    return kCount;
+}
+
+const char* hakios_metal_draw_phase_name(unsigned i) {
+    static const char* const names[render::phase::kCount] = {"pre", "plan", "begin", "groups", "stage", "ranges", "descriptors", "check", "table", "emit", "dual", "open", "dedupe", "tail"};
+    return i < render::phase::kCount ? names[i] : nullptr;
+}
+
+void hakios_metal_memory_probe(hakios_metal_device* d, double out[6]) {
+    using Clk = std::chrono::steady_clock;
+    constexpr uint64_t kBytes = 64 * 1024;
+    constexpr unsigned kRounds = 8;
+    for (int i = 0; i < 6; i++) out[i] = 0;
+    std::string why;
+    std::shared_ptr<Buffer> b = newBuffer(*d->gpu, kBytes, &why);
+    if (b == nullptr || b->contents() == nullptr) return;
+    std::vector<uint32_t> heap(kBytes / 4, 1);
+    volatile uint32_t* wc = static_cast<volatile uint32_t*>(b->contents());
+    volatile uint32_t* hp = heap.data();
+    const unsigned lines = kBytes / 64;
+    auto ns = [&](Clk::time_point t0) { return std::chrono::duration<double, std::nano>(Clk::now() - t0).count() / (double(lines) * kRounds); };
+    uint32_t sink = 0;
+    auto t = Clk::now();
+    for (unsigned r = 0; r < kRounds; r++)
+        for (unsigned l = 0; l < lines; l++)
+            for (unsigned w = 0; w < 16; w += 4) { wc[l * 16 + w] = r; wc[l * 16 + w + 1] = r; wc[l * 16 + w + 2] = r; wc[l * 16 + w + 3] = r; }
+    out[0] = ns(t);
+    t = Clk::now();
+    for (unsigned r = 0; r < kRounds; r++)
+        for (unsigned l = 0; l < lines; l++) wc[l * 16 + 3] = r;
+    out[1] = ns(t);
+    t = Clk::now();
+    for (unsigned r = 0; r < kRounds; r++)
+        for (unsigned l = 0; l < lines; l++) sink += wc[l * 16 + 3];
+    out[2] = ns(t);
+    t = Clk::now();
+    for (unsigned r = 0; r < kRounds; r++)
+        for (unsigned l = 0; l < lines; l++)
+            for (unsigned w = 0; w < 16; w++) sink += wc[l * 16 + w];
+    out[3] = ns(t);
+    t = Clk::now();
+    for (unsigned r = 0; r < kRounds; r++)
+        for (unsigned l = 0; l < lines; l++)
+            for (unsigned w = 0; w < 16; w++) hp[l * 16 + w] = r;
+    out[4] = ns(t);
+    t = Clk::now();
+    for (unsigned r = 0; r < kRounds; r++)
+        for (unsigned l = 0; l < lines; l++) sink += hp[l * 16 + 3];
+    out[5] = ns(t);
+    if (sink == 0x12345678u) out[5] += 1e-9;   // (the loads are used)
 }
 
 int hakios_metal_cb_draw_time(hakios_metal_cb* cb, unsigned i, const char** name, double* us) {
