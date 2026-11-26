@@ -466,7 +466,7 @@ release_all(IOHIDServiceClientRef screen, IOHIDServiceClientRef buttons)
  * the kernel stamped it, when this thread had it, when the event system had the event -- in
  * microseconds of mach_absolute_time, the kernel's own time (tools/latency.py).
  */
-static bool touch_latency;
+static bool touch_latency, touch_latency_events;   /* (touch_lat=2: also a line for every sample: each costs a console write) */
 static mach_timebase_info_data_t timebase;
 
 static uint64_t
@@ -516,7 +516,7 @@ input_thread(__unused void *arg)
 	static const int types[] = { HID_CLIENT_SIMPLE, HID_CLIENT_RATE_CONTROLLED };
 	IOHIDEventSystemClientRef client = NULL;
 	IOHIDServiceClientRef screen = NULL, buttons = NULL;
-	struct hakios_touch t;
+	struct hakios_touch t, batch[64];
 	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
 	int device;
 
@@ -529,7 +529,8 @@ input_thread(__unused void *arg)
 		size_t size = sizeof(arguments) - 1;
 
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
-			touch_latency = strstr(arguments, "touch_lat=1") != NULL;
+			touch_latency_events = strstr(arguments, "touch_lat=2") != NULL;
+			touch_latency = touch_latency_events || strstr(arguments, "touch_lat=1") != NULL;
 		}
 		mach_timebase_info(&timebase);
 	}
@@ -566,10 +567,10 @@ input_thread(__unused void *arg)
 	script_start(screen, buttons);
 
 	for (;;) {
-		ssize_t got = read(device, &t, sizeof(t));
+		ssize_t got = read(device, batch, sizeof(batch));
 		uint64_t read_at = mach_absolute_time();
 
-		if (got != (ssize_t)sizeof(t)) {
+		if (got <= 0 || got % (ssize_t)sizeof(t) != 0) {
 			/*
 			 * A signal (EINTR) took nothing: read again. Anything else may have taken samples with it: what is
 			 * held is let go, and the device opened again -- the thread that ended here left the phone with no
@@ -590,6 +591,17 @@ input_thread(__unused void *arg)
 			continue;
 		}
 
+		/*
+		 * The queue may hold several samples (this thread was late: the event system is slow to take an event, 7 to 130 ms
+		 * a dispatch with the log on): of a run of moves of one finger only the last goes in -- their dispatch is what
+		 * made the backlog (touches seconds late), and the position is where the finger is. The stamps stay the kernel's.
+		 */
+		for (size_t bi = 0; bi < (size_t)got / sizeof(t); bi++) {
+		t = batch[bi];
+		if (t.type == HAKIOS_TOUCH_MOVE && bi + 1 < (size_t)got / sizeof(t) && batch[bi + 1].type == HAKIOS_TOUCH_MOVE &&
+		    batch[bi + 1].finger == t.finger) {
+			continue;
+		}
 		if (t.type == HAKIOS_TOUCH_DOWN || t.type == HAKIOS_TOUCH_UP || count++ < 4) {
 			say("hakios: input: %s finger %u at %u %u (%.0f%% %.0f%%)\n",
 			    t.type == HAKIOS_TOUCH_DOWN ? "DOWN" : t.type == HAKIOS_TOUCH_UP ? "UP  " : "move",
@@ -651,9 +663,12 @@ input_thread(__unused void *arg)
 					sum_pr = max_pr = sum_rs = max_rs = n_ev = 0;
 					since = now_us_;
 				}
-				say("tl: i %u posted %llu read %llu sent %llu\n", t.type, micros(t.time), micros(read_at),
-				    micros(mach_absolute_time()));
+				if (touch_latency_events) {
+					say("tl: i %u posted %llu read %llu sent %llu\n", t.type, micros(t.time), micros(read_at),
+					    micros(mach_absolute_time()));
+				}
 			}
+		}
 		}
 	}
 }

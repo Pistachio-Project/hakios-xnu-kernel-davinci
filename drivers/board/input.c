@@ -66,7 +66,7 @@ latency_lines(void)
 	if (touch_lat == 2) {
 		uint32_t on = 0;
 
-		touch_lat = PE_parse_boot_argn("touch_lat", &on, sizeof(on)) && on != 0;
+		touch_lat = PE_parse_boot_argn("touch_lat", &on, sizeof(on)) && on == 2;   /* (a line for each sample: touch_lat=2 only) */
 	}
 	return touch_lat != 0;
 }

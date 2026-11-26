@@ -138,6 +138,7 @@ gt9889_wait_us(uint32_t us)
 }
 
 #define POLL_MS                 8       /* the interrupt line is looked at 125 times a second */
+#define FAST_POLL_US            2000    /* with a finger down the latch is looked at this often: reports are not merged, and are posted at once */
 #define LATCHLESS_TICKS         125     /* with the latch armed and no edge: the chip is asked once a second */
 #define WRITE_MAX               254     /* the vendor's transfers: 256 bytes with the register's number */
 #define IDLE_LOOKS              4       /* ... and the chip asked on every fourth look whatever the line says (this file's head: interrupt) */
@@ -1183,7 +1184,7 @@ lift_if_silent(uint64_t now)
  */
 static uint32_t lat_on;
 static struct {
-	uint64_t n, wake_sum, wake_max, read_sum, read_max, post_sum, post_max, wakes, since_us;
+	uint64_t n, wake_sum, wake_max, read_sum, read_max, post_sum, post_max, wakes, since_us, last_rep_us, cont_n, cont_us, gap_max;
 } lat;
 
 static void
@@ -1209,7 +1210,16 @@ lat_flush(uint64_t now)
 		    lat.n, lat.wakes ? lat.wake_sum / lat.wakes : 0, lat.wake_max, lat.wakes, lat.n ? lat.read_sum / lat.n : 0, lat.read_max,
 		    lat.n ? lat.post_sum / lat.n : 0, lat.post_max);
 	}
-	memset(&lat, 0, sizeof(lat));
+	if (lat.cont_us != 0) {
+		say("touch: gt9889 while touching %llu reports/s (%llu intervals), longest gap between reports %llu us\n",
+		    lat.cont_n * 1000000 / lat.cont_us, lat.cont_n, lat.gap_max);
+	}
+	{
+		uint64_t last = lat.last_rep_us;
+
+		memset(&lat, 0, sizeof(lat));
+		lat.last_rep_us = last;
+	}
 	lat.since_us = now;
 }
 
@@ -1223,8 +1233,11 @@ poll_once(unsigned tick)
 	enum gt9889_look look = GT9889_BAD;
 	bool armed = __atomic_load_n(&latch_armed, __ATOMIC_SEQ_CST), edge = false, down = fingers_down() != 0, asked, got;
 	uint64_t now, started_us = lat_on ? now_us() : 0, posted_us;
+	static unsigned last_tick;
+	bool fresh = tick != last_tick;         /* (with a finger down the latch is looked at every FAST_POLL_US: the periodic things once a tick) */
 
-	if (esd_on && tick % ESD_TICKS == 0) {
+	last_tick = tick;
+	if (esd_on && fresh && tick % ESD_TICKS == 0) {
 		esd_tick();
 	}
 	if (armed) {
@@ -1235,7 +1248,7 @@ poll_once(unsigned tick)
 		}
 		asked = edge;
 		if (!edge) {
-			if (tick != 1 && tick % LATCHLESS_TICKS != 0) {
+			if (!fresh || (tick != 1 && tick % LATCHLESS_TICKS != 0)) {
 				lift_if_silent(now_us());
 				return true;
 			}
@@ -1243,7 +1256,7 @@ poll_once(unsigned tick)
 	} else {
 		/* (no latch: the line may only pulse for a report, and a board may have it wrong: asked now and then whatever it says) */
 		asked = !gpio_get(PIN_INT) || down;
-		if (!asked && tick % IDLE_LOOKS != 0) {
+		if (!asked && (!fresh || tick % IDLE_LOOKS != 0)) {
 			return true;
 		}
 	}
@@ -1278,6 +1291,14 @@ poll_once(unsigned tick)
 		if (lat_on) {
 			posted_us = now_us();
 			lat.n++;
+			if (lat.last_rep_us != 0 && posted_us - lat.last_rep_us < 100000) {
+				lat.cont_n++;
+				lat.cont_us += posted_us - lat.last_rep_us;
+				if (posted_us - lat.last_rep_us > lat.gap_max) {
+					lat.gap_max = posted_us - lat.last_rep_us;
+				}
+			}
+			lat.last_rep_us = posted_us;
 			lat_add(&lat.read_sum, &lat.read_max, now - started_us);
 			lat_add(&lat.post_sum, &lat.post_max, posted_us - now);
 		}
@@ -1318,7 +1339,7 @@ poll_once(unsigned tick)
 			trouble.failures = 0;
 		}
 	}
-	if (tick % (60 * 1000 / POLL_MS) == 0) {
+	if (fresh && tick % (60 * 1000 / POLL_MS) == 0) {
 		say("gt9889: so far %u reports in %u looks (%u without one, %u reads failed, %u unasked looks unanswered, %u firmware "
 		    "requests), %u finger positions; the interrupt line reads %s\n", seen.reports, seen.looks, seen.bad, seen.reads_failed,
 		    seen.idle_misses, seen.requests, seen.positions, gpio_get(PIN_INT) ? "high" : "low");
@@ -1376,7 +1397,8 @@ gt9889_thread(__unused void *parameter, __unused wait_result_t result)
 	say("gt9889: step 5: touch screen ready, %u x %u, %u fingers; the interrupt line (gpio%u) is looked at every %u ms (%s)\n", panel_x,
 	    panel_y, contacts, PIN_INT, POLL_MS, latch_armed ? "its falling edges latched" : "by its level");
 	trouble.last_good_us = now_us();
-	for (unsigned tick = 1; begin(); tick++) {
+	uint64_t tick_us = now_us();
+	for (unsigned tick = 1; begin(); ) {
 		if (!poll_once(tick)) {
 			release();
 			say("gt9889: stopped: the chip does not come back\n");
@@ -1385,16 +1407,27 @@ gt9889_thread(__unused void *parameter, __unused wait_result_t result)
 			break;
 		}
 		done();
-		if (lat_on) {
-			uint64_t slept = now_us();
+		{
+			uint64_t slept = lat_on ? now_us() : 0, want_us = POLL_MS * 1000;
 
-			wait_ms(POLL_MS);
-			slept = now_us() - slept;
-			lat.wakes++;
-			lat_add(&lat.wake_sum, &lat.wake_max, slept > POLL_MS * 1000 ? slept - POLL_MS * 1000 : 0);
-			lat_flush(now_us());
-		} else {
-			wait_ms(POLL_MS);
+			if (fingers_down() != 0 && !__atomic_load_n(&leaving, __ATOMIC_SEQ_CST)) {
+				want_us = FAST_POLL_US;
+				sleep_us(FAST_POLL_US);
+				if (now_us() - tick_us >= POLL_MS * 1000) {
+					tick++;
+					tick_us = now_us();
+				}
+			} else {
+				wait_ms(POLL_MS);
+				tick++;
+				tick_us = now_us();
+			}
+			if (lat_on) {
+				slept = now_us() - slept;
+				lat.wakes++;
+				lat_add(&lat.wake_sum, &lat.wake_max, slept > want_us ? slept - want_us : 0);
+				lat_flush(now_us());
+			}
 		}
 	}
 	/* (or the run's end has the chip: hakios_gt9889_quiesce() powers it off) */
