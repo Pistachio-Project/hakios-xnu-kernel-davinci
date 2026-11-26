@@ -25,6 +25,12 @@
  * flashlight is Apple's. What the controller does is named in the log either way (the answers MobileGestalt
  * and AVFlashlight gave before, the AVFlashlight made or not, the tap), so a run says where it stops.
  *
+ * The tap itself (found in the module's code, FlashlightModule.bundle): CCUIFlashlightModuleViewController
+ * -buttonTapped:forEvent: asks [SBUIFlashlightController isAvailable] first and calls turnFlashlightOnForReason: only
+ * if it is yes; otherwise it calls only turnFlashlightOffForReason:. That is why the tap never reached the "on" hook:
+ * isAvailable is made yes here too, and where it was NO (nothing below can serve it) the tap's level is also written
+ * straight to /dev/hakios-torch.
+ *
  * Where there is no /dev/hakios-torch nothing is changed. A method whose type differs from the one expected is
  * left alone and the log says so.
  */
@@ -36,6 +42,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 extern Boolean MGGetBoolAnswer(CFStringRef key);
@@ -139,7 +146,12 @@ types_are(Method m, const char *expected)
 static BOOL (*original_has)(id, SEL);
 static id (*original_init)(id, SEL);
 static void (*original_turn_on)(id, SEL, id);
-static bool has_done, init_done, turn_done;
+static bool has_done, init_done, turn_done, off_done, avail_done, tap_done;
+static BOOL (*original_avail)(id, SEL);
+static void (*original_turn_off)(id, SEL, id);
+static void (*original_tap)(id, SEL, id, id);
+static int avail_was = -1;              /* what SBUIFlashlightController's own isAvailable said last (1 yes, 0 no) */
+static int torch_fd = -2;               /* /dev/hakios-torch, opened at the first direct write */
 
 /* +[AVFlashlight hasFlashlight] */
 static BOOL
@@ -161,6 +173,55 @@ flash_init(id self, SEL _cmd)
 	return made;
 }
 
+/* One level (0 to 1000) straight to the kernel's flashlight: where the controller's chain (AVFlashlight, then the
+ * flashlight server in cameracaptured) says it is unavailable, the tap would reach nothing. */
+static void
+torch_direct(uint32_t level)
+{
+	ssize_t n;
+
+	if (torch_fd == -2) {
+		torch_fd = open("/dev/hakios-torch", O_WRONLY);
+	}
+	n = torch_fd >= 0 ? write(torch_fd, &level, sizeof(level)) : -1;
+	say("hakios: flash: written straight to /dev/hakios-torch: level %u%s\n", level,
+	    n == (ssize_t)sizeof(level) ? "" : " (NOT TAKEN)");
+}
+
+/* -[SBUIFlashlightController isAvailable]: what CCUIFlashlightModuleViewController -buttonTapped:forEvent: asks first
+ * (it turns the flashlight on only if this is yes; otherwise the tap only calls turnFlashlightOffForReason:). */
+static BOOL
+flash_avail(id self, SEL _cmd)
+{
+	BOOL was = original_avail(self, _cmd);
+
+	if ((int)was != avail_was) {
+		avail_was = was;
+		say("hakios: flash: -[SBUIFlashlightController isAvailable] was %s, it is yes\n", was ? "yes" : "NO");
+	}
+	return YES;
+}
+
+/* -[CCUIFlashlightModuleViewController buttonTapped:forEvent:]: the tap on Control Center's flashlight toggle */
+static void
+flash_tap(id self, SEL _cmd, id button, id event)
+{
+	say("hakios: flash: TAP on the Control Center flashlight toggle (controller said available: %s)\n",
+	    avail_was < 0 ? "not asked yet" : (avail_was ? "yes" : "NO"));
+	original_tap(self, _cmd, button, event);
+}
+
+/* -[SBUIFlashlightController turnFlashlightOffForReason:] */
+static void
+flash_turn_off(id self, SEL _cmd, id reason)
+{
+	say("hakios: flash: the flashlight is asked for off\n");
+	original_turn_off(self, _cmd, reason);
+	if (avail_was == 0) {
+		torch_direct(0);
+	}
+}
+
 /* -[SBUIFlashlightController turnFlashlightOnForReason:] */
 static void
 flash_turn_on(id self, SEL _cmd, id reason)
@@ -174,6 +235,9 @@ flash_turn_on(id self, SEL _cmd, id reason)
 	say("hakios: flash: the flashlight is asked for on (%s), the controller says it is %savailable\n", text,
 	    class_respondsToSelector(object_getClass(self), available) && ((BOOL (*)(id, SEL))objc_msgSend)(self, available) ? "" : "NOT ");
 	original_turn_on(self, _cmd, reason);
+	if (avail_was == 0) {
+		torch_direct(1000);     /* (the chain below was not available before: the kernel's light is lit from here) */
+	}
 }
 
 static void
@@ -202,12 +266,23 @@ try_hooks(void)
 {
 	Class av = objc_getClass("AVFlashlight");
 	Class controller = objc_getClass("SBUIFlashlightController");
+	Class module = objc_getClass("CCUIFlashlightModuleViewController");
 
 	if (av != Nil && !has_done) {
 		swizzle(av, true, "hasFlashlight", "B@:", (IMP)flash_has, (IMP *)&original_has, &has_done);
 	}
 	if (av != Nil && !init_done) {
 		swizzle(av, false, "init", "@@:", (IMP)flash_init, (IMP *)&original_init, &init_done);
+	}
+	if (controller != Nil && !avail_done) {
+		swizzle(controller, false, "isAvailable", "B@:", (IMP)flash_avail, (IMP *)&original_avail, &avail_done);
+	}
+	if (controller != Nil && !off_done) {
+		swizzle(controller, false, "turnFlashlightOffForReason:", "v@:@", (IMP)flash_turn_off, (IMP *)&original_turn_off,
+		    &off_done);
+	}
+	if (module != Nil && !tap_done) {
+		swizzle(module, false, "buttonTapped:forEvent:", "v@:@@", (IMP)flash_tap, (IMP *)&original_tap, &tap_done);
 	}
 	if (controller != Nil && !turn_done) {
 		swizzle(controller, false, "turnFlashlightOnForReason:", "v@:@", (IMP)flash_turn_on, (IMP *)&original_turn_on,
@@ -220,7 +295,7 @@ image_added(const struct mach_header *header, intptr_t slide)
 {
 	(void)header;
 	(void)slide;
-	if (kernel_torch && !(has_done && init_done && turn_done)) {
+	if (kernel_torch && !(has_done && init_done && turn_done && off_done && avail_done && tap_done)) {
 		try_hooks();
 	}
 }
