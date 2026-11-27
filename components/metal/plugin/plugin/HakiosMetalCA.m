@@ -4286,7 +4286,7 @@ hm_rt8_mode(void)
 {
 	static int mode = -1;
 
-	if (mode < 0) mode = hm_boot_arg_set("metal_rt8=0") ? 0 : hm_boot_arg_set("metal_rt8=1") ? 1 : hm_boot_arg_set("metal_rt8=3") ? 3 : 2;   /* default 2 (2026-11-27 ui_bench: best of the variants) */
+	if (mode < 0) mode = hm_boot_arg_set("metal_rt8=1") ? 1 : hm_boot_arg_set("metal_rt8=2") ? 2 : hm_boot_arg_set("metal_rt8=3") ? 3 : 0;   /* off by default: with metal_rt8=2 + metal_glass_lod=4 (2026-11-27) Liquid Glass showed a black backdrop */
 	return mode;
 }
 static BOOL
@@ -6258,7 +6258,7 @@ HM_REFUSES_OUT_LOUD
 				char args[1024] = {0};
 				size_t size = sizeof(args) - 1;
 				const char *at;
-				int lod = 4;    /* default 4 (one more downsample level; 2026-11-27 ui_bench), metal_glass_lod=0 for the old blur */
+				int lod = 0;    /* off by default: see hm_rt8_mode (black glass backdrop with metal_glass_lod=4 + metal_rt8=2) */
 
 				glassTold = 1;
 				if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_glass_lod=")) != NULL) lod = atoi(at + strlen("metal_glass_lod="));
