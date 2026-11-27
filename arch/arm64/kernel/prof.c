@@ -331,6 +331,7 @@ struct wp_wait {                /* what a thread waits on */
 	int32_t dst_pid;        /* ... and the pid of the process that receives on it (-1: none known) */
 	char dst_how;           /* s: in a space, t: in transit (in a message not yet received), k: the kernel's, r: reply space, ?: */
 	uint8_t dst_throttled;  /* a service port launchd throttles */
+	uint8_t dst_hops;       /* in transit: how many ports along to the one named (its owner, its service) */
 	char dst_svc[40];       /* a service port's launchd name */
 	uint8_t nubt;
 	uint64_t ufp, ubt[4];   /* the user frame pointer, and the return addresses of 4 user frames above mach_msg */
@@ -448,6 +449,7 @@ wp_fill_user(thread_t t, struct wp_wait *w, uint64_t *x0, uint64_t *x4)
 	w->dst_pid = -1;
 	w->dst_how = 0;
 	w->dst_throttled = 0;
+	w->dst_hops = 0;
 	w->dst_svc[0] = 0;
 	w->ufp = get_saved_state_fp(us) & 0x0000ffffffffffffull;
 }
@@ -501,12 +503,31 @@ wp_read_msg(struct wp_target *tg, struct wp_pending *pe)
 		w.dst_how = '?';
 		w.dst_svc[0] = 0;
 		if (ipc_port_translate_send(tg->task->itk_space, w.dst, &port) == KERN_SUCCESS && port != IP_NULL) {
+			/*
+			 * A port in transit is in a message on another port's queue (ip_destination): e.g. a new XPC
+			 * connection's port in the request on a service's port, which launchd holds until the service
+			 * has started. Followed as ipc_port_destination_chain_lock() does, each lock held, up to 3 hops.
+			 */
+			ipc_port_t chain[4], last;
 			ipc_object_label_t label;
+			unsigned n = 1;
 
-			w.dst_pid = ipc_port_get_receiver_task_locked(port, NULL);
+			chain[0] = port;
+			while (n < 4 && ip_active(chain[n - 1]) && ip_in_transit(chain[n - 1])) {
+				ipc_port_t next = ip_get_destination(chain[n - 1]);
+
+				if (next == IP_NULL) {
+					break;
+				}
+				ip_mq_lock(next);
+				chain[n++] = next;
+			}
+			last = chain[n - 1];
+			w.dst_hops = (uint8_t)(n - 1);
+			w.dst_pid = ipc_port_get_receiver_task_locked(last, NULL);
 			w.dst_how = ip_in_transit(port) ? 't' : ip_in_space(port, ipc_space_kernel) ? 'k' :
 			    ip_in_space(port, ipc_space_reply) ? 'r' : ip_in_a_space(port) ? 's' : '?';
-			label = ip_label_get(port);
+			label = ip_label_get(last);
 			if (ip_is_any_service_port_type(label.io_type) && label.iol_service != NULL) {
 				w.dst_throttled = label.iol_service->ispl_throttled;
 #if CONFIG_SERVICE_PORT_INFO
@@ -515,13 +536,17 @@ wp_read_msg(struct wp_target *tg, struct wp_pending *pe)
 				}
 #endif
 			}
-			ip_mq_unlock_label_put(port, &label);
+			ip_mq_unlock_label_put(last, &label);
+			while (n > 1) {
+				ip_mq_unlock(chain[--n - 1]);
+			}
 		}
 	}
 	if (th->kind == 1 && th->cs == pe->cs) {        /* (still that wait) */
 		th->w.dst_pid = w.dst_pid;
 		th->w.dst_how = w.dst_how;
 		th->w.dst_throttled = w.dst_throttled;
+		th->w.dst_hops = w.dst_hops;
 		memcpy(th->w.dst_svc, w.dst_svc, sizeof(w.dst_svc));
 		th->w.nubt = w.nubt;
 		memcpy(th->w.ubt, w.ubt, sizeof(w.ubt));
@@ -647,10 +672,10 @@ wp_end_episode(struct wp_target *tg, struct wp_thr *th)
 			if (th->w.dst_pid > 0) {
 				proc_name(th->w.dst_pid, peer, sizeof(peer));
 			}
-			WPSAY("wpm %llu.%03llu %llu '%.20s' %llums r%#x t%u m%u %llx %llx %llx %llx to %d %s %c%s svc %s", th->last / NSEC_PER_SEC,
+			WPSAY("wpm %llu.%03llu %llu '%.20s' %llums r%#x t%u m%u %llx %llx %llx %llx to %d %s %c%u%s svc %s", th->last / NSEC_PER_SEC,
 			    th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, th->w.rcv, th->w.utmo, th->w.msgid,
 			    th->w.ubt[0], th->w.ubt[1], th->w.ubt[2], th->w.ubt[3], th->w.dst_pid, peer,
-			    th->w.dst_how ? th->w.dst_how : '-', th->w.dst_throttled ? " THROTTLED" : "", th->w.dst_svc[0] ? th->w.dst_svc : "-");
+			    th->w.dst_how ? th->w.dst_how : '-', th->w.dst_hops, th->w.dst_throttled ? " THROTTLED" : "", th->w.dst_svc[0] ? th->w.dst_svc : "-");
 		}
 	}
 	th->kind = 0;
