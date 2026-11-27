@@ -14,10 +14,18 @@ namespace hakios::metal {
 
 namespace {
 
+io_connect_t gLogConnection = 0;  // the newest open connection: where hakios_metal_kernel_log sends a line
+
 class KernelGpu : public Transport {
 public:
-    explicit KernelGpu(io_connect_t c) : c_(c) { mach_timebase_info(&timebase_); }
-    ~KernelGpu() override { IOServiceClose(c_); }
+    explicit KernelGpu(io_connect_t c) : c_(c) {
+        mach_timebase_info(&timebase_);
+        gLogConnection = c;
+    }
+    ~KernelGpu() override {
+        if (gLogConnection == c_) gLogConnection = 0;
+        IOServiceClose(c_);
+    }
 
     int call(uint32_t request, void* data, size_t size) override {
         size_t returned = size;
@@ -81,3 +89,12 @@ std::unique_ptr<Transport> openKernelGpu(std::string* why) {
 }
 
 }  // namespace hakios::metal
+
+// A line for the kernel log through the GPU connection (kHakiosLog, 0x80): for a sandboxed process, whose stderr is
+// /dev/null and which cannot open /dev/console. 0 if sent; -1 if there is no connection yet or the kernel refused.
+extern "C" int hakios_metal_kernel_log(const char* line, size_t length) {
+    io_connect_t c = hakios::metal::gLogConnection;
+    if (c == 0 || line == nullptr || length == 0) return -1;
+    if (length > 1000) length = 1000;
+    return IOConnectCallStructMethod(c, 0x80, line, length, nullptr, nullptr) == KERN_SUCCESS ? 0 : -1;
+}

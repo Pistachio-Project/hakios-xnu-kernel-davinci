@@ -107,6 +107,9 @@ int hakios_metal_library_type(hakios_metal_library *library, unsigned i);   /* e
 hakios_metal_kernel *hakios_metal_kernel_compile(hakios_metal_library *library, const char *function);
 /* the same from a module's bitcode (a .bc, or a function's AIR as Metal hands it out: -[_MTLFunction bitcodeData]) */
 hakios_metal_kernel *hakios_metal_kernel_compile_bitcode(const void *bitcode, size_t size);
+
+/* One line of text into the kernel log through the open GPU connection (iokit_transport.cpp); 0 if sent, -1 if not. */
+int hakios_metal_kernel_log(const char *line, size_t length);
 /* A function constant the pipeline supplies (MTLFunctionConstantValues): INDEX the [[function_constant(n)]], BITS the
  * value as the bits of its type -- a bool 0 or 1, an integer or float its own bits in the low end, a vector's
  * component i at bit i * its width. A constant the module declares and the array does not name is not defined to it

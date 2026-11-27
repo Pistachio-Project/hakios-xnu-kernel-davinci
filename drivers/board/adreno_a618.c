@@ -3538,6 +3538,11 @@ gpu_clock_thread(__unused void *arg, __unused wait_result_t result)
 			last_irqs = gpu_irqs;
 			gpu_noticed_stat.max_ns = 0;
 		}
+		{
+			extern const char *hakios_gpu_clients(void);
+
+			hakios_say("gpu clients (each process that opened the GPU): %s\n", hakios_gpu_clients());
+		}
 	}
 }
 

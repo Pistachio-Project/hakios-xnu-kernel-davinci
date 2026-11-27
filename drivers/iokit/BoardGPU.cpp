@@ -251,7 +251,10 @@ enum {
 	kHakiosGPUWorked       = 0x7d,         /* ours: how long the 3D core itself has worked, and on how many */
 	kHakiosSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
 	kHakiosShow            = 0x7f,         /* ours: pixels of the caller's onto the panel, to see a test's result */
+	kHakiosLog             = 0x80,         /* ours: a line of text of the caller's for the kernel log (a sandboxed process has no console) */
 };
+#define HAKIOS_LOG_MAX          1000u           /* kHakiosLog: longest line taken */
+#define HAKIOS_LOG_LINES        200u            /* ... and how many lines one client may send */
 
 struct msm_timespec {
 	int64_t seconds, nanoseconds;           /* of the clock that goes on while the machine sleeps */
@@ -937,6 +940,7 @@ class HakiosGPUUserClient : public IOUserClient
 	uint32_t                fLastFence;             /* this client's last submission */
 	char                    fProcName[17];
 	uint32_t                fPid;
+	uint32_t                fLogLines;              /* kHakiosLog lines taken from this client (at most HAKIOS_LOG_LINES) */
 	bool                    fYields;                /* ... which the next waits for (gpu_fair_ms): not the window server */
 	struct gpu_left         fLeft[GPU_LEFT];
 	uint32_t                fLeftCount;
@@ -970,6 +974,31 @@ public:
 	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
 };
 
+/* The names of the processes that have opened the GPU, each once, for the 5 s line (adreno_a618.c): the boot's first
+ * minutes are gone from the log that comes back, and a process's first connection with them. */
+static char gGpuClients[384];
+
+static void
+gpu_client_named(const char * name)
+{
+	char key[40];
+
+	snprintf(key, sizeof(key), ",%s,", name);
+	if (strnstr(gGpuClients, key, sizeof(gGpuClients)) == NULL && strlen(gGpuClients) + strlen(key) < sizeof(gGpuClients)) {
+		if (gGpuClients[0] == 0) {
+			strlcpy(gGpuClients, key, sizeof(gGpuClients));
+		} else {
+			strlcat(gGpuClients, key + 1, sizeof(gGpuClients));
+		}
+	}
+}
+
+extern "C" const char *
+hakios_gpu_clients(void)
+{
+	return gGpuClients;
+}
+
 OSDefineMetaClassAndStructors(HakiosGPUUserClient, IOUserClient);
 
 bool
@@ -998,6 +1027,10 @@ HakiosGPUUserClient::start(IOService * provider)
 		fYields = strcmp(name, "backboardd") != 0;
 		strlcpy(fProcName, name, sizeof(fProcName));
 		fPid = (uint32_t) proc_selfpid();
+		/* (which processes open the GPU: an application's own lines may reach no log -- its sandbox -- and this says
+		 * whether it got as far as a Metal device at all) */
+		IOLog("gpu: a connection for %s[%u]\n", fProcName, fPid);
+		gpu_client_named(fProcName);
 	}
 	return fBuffers != NULL;
 }
@@ -2325,6 +2358,36 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
 	IOReturn ret = kIOReturnSuccess;
 	uint64_t zero = 0, patience, waitBegan;
 	HKAllocScope scope("GPU", selector);
+
+	if (selector == kHakiosLog) {
+		/* a line of text, longer than any request below and wanted even before the GPU is ready: handled first */
+		char line[HAKIOS_LOG_MAX + 2];
+		uint32_t n;
+
+		if (args->structureInput == NULL || size == 0 || size > HAKIOS_LOG_MAX) {
+			return kIOReturnBadArgument;
+		}
+		n = OSIncrementAtomic((volatile SInt32 *)&fLogLines);
+		if (n > HAKIOS_LOG_LINES) {
+			return kIOReturnNoResources;
+		}
+		memcpy(line, args->structureInput, size);
+		line[size] = '\0';
+		for (char * q = line; *q; q++) {
+			if (*q == '\0' || ((unsigned char)*q < 0x20 && *q != '\n' && *q != '\t') || (unsigned char)*q >= 0x7f) {
+				*q = '?';
+			}
+		}
+		while (size > 0 && line[size - 1] == '\n') {
+			line[--size] = '\0';
+		}
+		if (n == HAKIOS_LOG_LINES) {
+			IOLog("%s[%u]: further lines dropped (%u taken)\n", fProcName, fPid, HAKIOS_LOG_LINES);
+		} else {
+			IOLog("%s\n", line);
+		}
+		return kIOReturnSuccess;
+	}
 
 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
 		return kIOReturnBadArgument;

@@ -115,6 +115,7 @@
 /* --- printing ----------------------------------------------------------------------------------------------- */
 
 static void hm_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static int hm_print_null;       /* stderr is /dev/null and the console would not open: lines go to the kernel instead */
 static int hm_print_fd = -1;    /* where hm_print writes: stderr, the console, or (metal_m2v=1) a copy of stderr kept aside */
 
 /* To stderr, as one write: a launchd job's stderr is the console (userland/userland/mkjobs.py sets StandardErrorPath) and its
@@ -150,11 +151,16 @@ hm_print(const char *fmt, ...)
 			if (fstat(2, &err) == 0 && stat("/dev/null", &null) == 0 && S_ISCHR(err.st_mode) && err.st_rdev == null.st_rdev) {
 				int console = open("/dev/console", O_WRONLY | O_NOCTTY);
 
-				if (console >= 0) fd = console;
+				if (console >= 0) fd = console; else hm_print_null = 1;
 			}
 		}
 		hm_print_fd = fd;
-		(void)!write(fd, line, strlen(line));
+		/* no console either (a sandboxed process): the kernel log, through the GPU connection once it is open */
+		if (fd == 2 && hm_print_null) {
+			(void)hakios_metal_kernel_log(line, strlen(line));
+		} else {
+			(void)!write(fd, line, strlen(line));
+		}
 	}
 }
 
