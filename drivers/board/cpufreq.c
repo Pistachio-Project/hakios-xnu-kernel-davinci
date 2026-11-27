@@ -200,7 +200,12 @@ l3_raise(void)
 	char line[600];
 	int used = 0;
 
-	PE_parse_boot_argn("l3", &enabled, sizeof(enabled));
+	/* SM7150 (davinci): raised by default (l3=0 leaves it): the boot loader leaves row 7, 1190 MHz; at 1459 a load
+	 * through 2 MB took 89.8 ns against 97.1 (logs/135511-run.log) */
+	if (!PE_parse_boot_argn("l3", &enabled, sizeof(enabled)) && hakios_board()->cpufreq.block == HAKIOS_CPUFREQ_OSM &&
+	    hakios_board()->cpufreq.epss == L3_OSM_SM7150 + 0x2000) {
+		enabled = 1;
+	}
 	PE_parse_boot_argn("l3_probe", &probe, sizeof(probe));
 	if (enabled == 0 && probe == 0) {
 		return;
