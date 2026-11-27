@@ -2843,9 +2843,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				hakios_display_scanout_stats(st);
 				IOLog("MiniIOMobileFramebuffer: fb_scanout flips: %llu flips, taken over seen by the refresh interrupt %llu, by poll %llu; "
 				    "flip to taken over %llu us on average (%llu at most); %llu waits on the interrupt, %llu of them timed out (20 ms); "
-				    "ring=%u: surface let go %llu us after its successor's flip on average (%llu at most) over %llu; %llu swaps deferred, %llu completed by the 34 ms limit without a seen latch, %llu frames dropped (the flip before not taken over yet); flush %llu written clear of the refresh, %llu written again after 38 ms, %llu start kicks after 50 ms, %llu misses (60 ms)\n", st[0], st[1], st[2],
+				    "ring=%u: surface let go %llu us after its successor's flip on average (%llu at most) over %llu; %llu swaps deferred, %llu completed by the 34 ms limit without a seen latch, %llu frames dropped (the flip before not taken over yet); kick (fb_kick): %llu drains of autorefresh before a flush, %llu us on average (%llu at most), %llu flushes not taken in 60 ms\n", st[0], st[1], st[2],
 				    st[5] ? st[3] / st[5] / 1000 : 0, st[4] / 1000, st[6], st[7], gScanoutRing,
-				    gScanoutReleaseN ? gScanoutReleaseSum / gScanoutReleaseN / 1000 : 0, gScanoutReleaseMax / 1000, gScanoutReleaseN, gScanoutDeferredCount, gScanoutTimedOut, gScanoutDropped, st[8], st[9], st[10], st[11]);
+				    gScanoutReleaseN ? gScanoutReleaseSum / gScanoutReleaseN / 1000 : 0, gScanoutReleaseMax / 1000, gScanoutReleaseN, gScanoutDeferredCount, gScanoutTimedOut, gScanoutDropped, st[8], st[8] ? st[9] / st[8] / 1000 : 0, st[10] / 1000, st[11]);
 				gScanoutDeferredCount = gScanoutTimedOut = gScanoutDropped = 0;
 				gScanoutReleaseSum = gScanoutReleaseMax = gScanoutReleaseN = 0;
 			}
