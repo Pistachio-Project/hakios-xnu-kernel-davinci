@@ -371,7 +371,11 @@ private:
     // GPU before a draw samples the texture after they changed (CommandBuffer::draw, freshen)
     std::shared_ptr<Texture> staging_;
     mutable std::atomic<bool> stale_{false};
+    // set by CommandBuffer::generateMipmaps: levels past 0 hold a filtered chain (metal_glass_lod raises a sampler's minimum LOD only over such)
+    mutable std::atomic<bool> mipsGenerated_{false};
 public:
+    bool mipsGenerated() const { return mipsGenerated_.load(std::memory_order_relaxed); }
+    void markMipsGenerated() const { mipsGenerated_.store(true, std::memory_order_relaxed); }
     const Texture* staging() const { return staging_.get(); }
     bool takeStale() const { return stale_.exchange(false); }   // true once a draw is to copy the rows in
     void markStale() const { stale_ = true; }

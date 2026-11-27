@@ -6606,3 +6606,49 @@ TEST(a_command_buffer_given_in_slices_draws_what_it_does_whole) {
     CHECK(r.fake->stats().submits >= 3u);   // (one a slice: three passes of one draw each)
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
+
+// metal_glass_lod raises a glass program's sampler minimum LOD only over mip levels the sampled texture has AND something filled
+// (an unfilled level reads zeros: a black backdrop); a texture of one level, or of a chain nothing generated, keeps the sampler's own LOD
+TEST(glass_lod_never_reads_mips_that_do_not_exist_or_were_never_filled) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r);
+    SamplerDesc sd;
+    sd.mipFilter = 2;
+    Sampler smp;
+    std::string why;
+    CHECK(makeSampler(sd, &smp, &why));
+    Program p{kernels::tri_color_vs_air, kernels::tri_tex_fs_air, Linkage{}, "glass_blur_test"};
+    p.fs.k.name = "glass_blur_test_fs";   // (glassProgram goes by the fragment kernel's own name)
+    auto minLodOf = [&](const Texture& tex) {
+        RenderPass pass;
+        pass.color0 = t.get();
+        Bindings fsb;
+        fsb.textures = {&tex};
+        fsb.samplers = {&smp};
+        Encoded e(r, p, pass, wholeDraw(6), render::Options{}, Bindings{}, fsb);
+        CHECK(e.ok);
+        return (e.tableWords()[(render::kTableFsAt + 16 * 64) / 4 + 1] & A6XX_TEX_SAMP_1_MIN_LOD__MASK) >> A6XX_TEX_SAMP_1_MIN_LOD__SHIFT;
+    };
+    TextureDesc d;
+    d.format = PixelFormat::kRGBA8Unorm;
+    d.width = d.height = 64;
+    d.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    auto one = Texture::make(*r.gpu, d, &why);
+    d.mipLevels = 4;
+    auto chain = Texture::make(*r.gpu, d, &why);
+    CHECK(one != nullptr && chain != nullptr);
+    if (one == nullptr || chain == nullptr) return;
+    render::setGlass(8, false);   // two levels
+    const uint32_t base = minLodOf(*chain);
+    CHECK_EQ(minLodOf(*one), base);     // one level: not raised
+    CHECK_EQ(minLodOf(*chain), base);   // four levels, none generated: not raised
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->generateMipmaps(*chain));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK_EQ(minLodOf(*chain), base + 2 * 256);   // generated: raised by two levels
+    render::setGlass(20, false);   // five levels: held to the three that exist
+    CHECK_EQ(minLodOf(*chain), base + 3 * 256);
+    render::setGlass(0, false);
+}

@@ -40,9 +40,11 @@ bool glassProgram(const char* name) {
 }
 
 // the sampler words of a glass program's draw: a mipmapped sampler's minimum LOD raised and/or its mip filter made nearest
-void glassSampler(uint32_t w[4]) {
+void glassSampler(uint32_t w[4], uint32_t cap88) {
     if (w[1] & A6XX_TEX_SAMP_1_MIPFILTER_LINEAR_FAR) return;   // (not a mipmapped sampler)
-    const uint32_t lod = gGlassLod88.load(std::memory_order_relaxed);
+    // (never past the last level of a texture the draw samples, nor into levels nothing filled: those read zeros, a black backdrop;
+    // cap88 is the least of them over the draw's sampled textures, 4.8 fixed point)
+    const uint32_t lod = std::min(gGlassLod88.load(std::memory_order_relaxed), cap88);
     if (lod != 0) {
         const uint32_t minLod = ((w[1] & A6XX_TEX_SAMP_1_MIN_LOD__MASK) >> A6XX_TEX_SAMP_1_MIN_LOD__SHIFT) + lod;
         const uint32_t maxLod = (w[1] & A6XX_TEX_SAMP_1_MAX_LOD__MASK) >> A6XX_TEX_SAMP_1_MAX_LOD__SHIFT;
@@ -754,6 +756,13 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
         if ((k.samplerMask >> m) & 1) out->numSamp = m + 1;
     }
     memset(out->sampWords, 0, size_t(out->numSamp) * sizeof out->sampWords[0]);
+    uint32_t glassCap88 = 0xffffffffu;
+    for (uint32_t t = 0; t < out->numTex; t++) {
+        const KernelTexture& kt = k.textures[t];
+        if (kt.kind != kTexSampled || kt.isNull || t >= b.textures.size() || b.textures[t] == nullptr || ((b.nullMask >> t) & 1) != 0) continue;
+        const Texture* tx = b.textures[t];
+        glassCap88 = std::min(glassCap88, tx->levels() > 1 && tx->mipsGenerated() ? (tx->levels() - 1) * 256u : 0u);
+    }
     const bool glassOn = (gGlassLod88.load(std::memory_order_relaxed) != 0 || gGlassNearMip.load(std::memory_order_relaxed)) && glassProgram(k.name);
     for (uint32_t m = 0; m < out->numSamp; m++) {
         if (((k.samplerMask >> m) & 1) == 0) continue;
@@ -764,7 +773,7 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
             continue;
         }
         memcpy(out->sampWords[m], b.samplers[m]->words, 16);
-        if (glassOn && b.samplers[m]->words[0] != 0) glassSampler(out->sampWords[m]);
+        if (glassOn && b.samplers[m]->words[0] != 0) glassSampler(out->sampWords[m], glassCap88);
     }
     if (fs.numSamplerPrefetch > kMaxSamplerPrefetch) {
         return refuse(why, name + " has " + n(fs.numSamplerPrefetch) + " texture prefetches: ir3 makes at most " + n(kMaxSamplerPrefetch));
@@ -3774,6 +3783,7 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
 }
 
 bool CommandBuffer::generateMipmaps(const Texture& t, const render::Options& options) {
+    if (t.levels() > 1) t.markMipsGenerated();
     // an array's or a cube's levels are every layer's: level by level, slice by slice, each (level, slice) the one-level
     // 2D view of it -- the blit addresses a level of slice 0 only
     const bool layered = t.type() == TextureType::k2DArray || t.type() == TextureType::kCube || t.type() == TextureType::kCubeArray;
