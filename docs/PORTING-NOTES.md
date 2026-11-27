@@ -63,8 +63,32 @@ Look the equivalents up for your SoC; don't copy them.
 - **Before `set_tear_on`.** The tear-check line counter reads 0 until the panel has been sent `set_tear_on`
   (DCS 0x35), so don't judge TE before that.
 - **TE pin.** It needs the `mdp_vsync` pin function. On davinci that is gpio10, function 1.
-- **Status on davinci.** TE pulses still never arrive: the PP0 line counter stays at 0 after `set_tear_on`
-  and the INTR_EN bit is set. Still open; the vsync runs from a 60 Hz timer.
+- **Where the tear check lives (SDE 5.x).** On SDE 5.x (davinci hw rev 0x50020000) the tear check is in the
+  **INTF** block, not the ping-pong block. Programming PP0's tear check was why TE "never arrived".
+  - On davinci: INTF1 at 0xae6b800, tear check at +0x280 (VSYNC_SEL 0x280, CHECK_EN 0x284,
+    SYNC_CONFIG_VSYNC 0x288 with the TE-connect bit 20, HEIGHT 0x28C, LINE_COUNT 0x2B0,
+    AUTOREFRESH_CONFIG 0x2B4).
+  - The RD_PTR interrupt is in the MDP interrupt block at mdp+0x6e800, bit 2 (SPI 83).
+  - Result: 301 interrupts in 5 s, period 16.65 ms.
+- **Zero-copy scanout** (the panel fetches the window server's surface directly). Copy Qualcomm's per-frame
+  kickoff exactly (sde_encoder_phys_cmd); guessing it gave missed flips and a glitchy screen. The sequence:
+  1. Disconnect TE (clear bit 20 of SYNC_CONFIG_VSYNC).
+  2. Turn autorefresh off.
+  3. Poll LINE_COUNT until it is outside (0, vdisplay).
+  4. Reconnect TE and write CTL_FLUSH.
+  5. Turn autorefresh back on. No CTL_START.
+
+  Result: 0 missed flips, 2.6 ms from flip to the panel taking it.
+  - Release the old surface only once the flush is taken.
+  - Drop a frame if the previous flip hasn't settled.
+  - Fall back to the copy ring after repeated misses.
+- **Display fetch QoS.** The bootloader leaves the splash pipe's QoS settings, sized for an unscaled splash.
+  Program them yourself, as `sde_plane.c` does, from the SoC's `-sde.dtsi`:
+  - creq LUT, danger/safe LUTs, QOS_CTRL and CDP for the scanout SSPP;
+  - the VBIF RT remap levels.
+
+  davinci uses VIG0 at mdp+0x5000 and VBIF at mdp+0xb0000 (adreno.c `scanout_qos_program`, `fb_qos=0`
+  turns it off). Untested on the phone at the time of writing.
 - **iOS 27 backboardd and vsync.** It does not ask IOMobileFramebuffer for vsync (type 5). CoreAnimation
   runs its own display timer. backboardd registers notification ports for:
   - type 7: `IOMobileFramebufferRelbufInfo`, a display id and two mach timestamps, consumed by a
@@ -81,6 +105,26 @@ Look the equivalents up for your SoC; don't copy them.
   Without it, the remote filesystem panics.
 - **VHT80 rates.** Set up VHT80 and the rates properly. A wrong setup gave about 50 Mbit/s instead of the
   expected ~140+.
+
+### CPU, caches (SM7150 / OSM SoCs)
+
+- **Check the cache code runs on your SoC.** Our L3 and LLCC code was written for SC7280 (EPSS) and silently
+  did nothing on SM7150 (OSM). If a feature is gated on the SoC, log a line when it is skipped.
+- **The L3 clock on OSM SoCs.** It has its own OSM block 0x2000 before the cores' (davinci 0x18321000;
+  `osm_l3_base` in `<soc>.dtsi`), with the same layout as the core groups: table at 0x110, 32 bytes a row,
+  the wanted row at 0x920. `l3=1 l3_probe=1` raises it and measures a 2 MB pointer chase before and after.
+- **LLCC slice IDs per SoC.** Take them from `llcc-<soc>.c`. sdmmagpie: cpuss 1 (512 KB), gpuhtw 11, gpu 12.
+  - On the GPU side, A618 takes kgsl's CX_MISC path: SYSTEM_CACHE_CNTL_1 gets five 5-bit GPU SCIDs, with the
+    HTW SCID at bit 25, and SYSTEM_CACHE_CNTL_0 = 3.
+  - Off by default (`llcc=2` turns it on). On SM7325 the CPU slice made the pointer chase faster with no
+    UI change; not yet measured on davinci.
+- **Governor (davinci).** `pm_gov` is on by default:
+  - a 250 ms top-speed boost on touch;
+  - otherwise 1.5x headroom over load, fast up and slow down;
+  - a soft thermal cap from 60 C down to 75% of top (big cores) at the 70 C trip, combined with
+    thermal.c's limiter by MIN.
+
+  `pm_gov=0` turns it off.
 
 ## iOS userland on foreign hardware
 
@@ -121,9 +165,27 @@ Look the equivalents up for your SoC; don't copy them.
   - No such wait exists in our kernel or Metal plug-in. The GPU fence waits are 2 ms or 200 µs; the swap
     queue wait is 700 ms.
   - First suspect: the type-7 RelbufInfo condition-variable waiter in QuartzCore.
+- **Read the pauses, not just the fps.** The ui_bench fps figure leaves out every gap of 250 ms or more.
+  Two variants that looked best (8-bit render targets, GPU 610 MHz) had 11-13 s freezes hidden from the
+  average. Always report the "gaps of 250 ms or more" total and the longest gap next to the fps.
+- **Visual checks for "free" GPU savings.** 8-bit stand-ins for 16-bit float render targets (`metal_rt8=2`)
+  and a coarser glass blur level (`metal_glass_lod=4`) together gave Liquid Glass a black backdrop. The
+  benchmark can't see that: have a person look before you make any rendering change the default.
+- **HITCH verdicts.** The Metal plug-in's "HITCH breakdown" lines label each long frame. Most of davinci's are
+  BLOCKED: in a 200 ms frame backboardd used about 10 ms of CPU, so it is waiting, not working.
+- **Off-CPU profiling with symbols.** Run `waitprof=<process>` and `keep_words=wpm`. Each long mach_msg wait
+  in the ui_bench window gets a short `wpm` line with the receive port, the timeout and 4 user return
+  addresses; a `wpm cache` line gives the shared cache slide.
+  - Subtract the slide and find the image from the cache header's image list (offset 0x1c0).
+  - Local names are `<redacted>` in the main cache. Read them from `dyld_shared_cache_<arch>.symbols`: the
+    local symbols info at header 0x48, its entries keyed by the image's offset from 0x180000000.
+  - davinci finding: CA's render server (`CA::Render::Server::server_thread`) waits long only right after
+    unlock. During the benchmark's pauses it is idle, waiting for app commits, so look at the clients.
 - **Wrong earlier hypotheses, so you don't retry them:**
   - memory exhaustion;
   - the 56k uber shader;
   - synchronous swap;
   - "0 half registers" for fp16 (a stats artifact);
-  - a memory cap (it regressed fps from 31 to 26).
+  - a memory cap (it regressed fps from 31 to 26);
+  - dropped writes to the GPU's ring write pointer (the watchdog that repairs them counted 0 in three runs);
+  - a CPU governor holding the big cores low (both groups were at their top rows; check the cpufreq lines).
