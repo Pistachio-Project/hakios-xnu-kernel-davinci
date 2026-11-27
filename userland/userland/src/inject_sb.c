@@ -24,6 +24,8 @@
  *     SpringBoard was busy waking the display: see lock_long_press().
  *   - A long press on the lock screen's wallpaper does not open the poster switcher, which the
  *     window server here shows as a black screen (16.5; iOS 27 opens it): see poster_switcher_allowed().
+ *   - A notification authorization request ("Wallet would like to send you notifications") is answered
+ *     "Allow" without the alert (iOS 27; boot-arg notif_ask=1 shows it again): see request_authorization().
  *   - Darwin notifications as a remote control, for scripts (rwtouch notify NAME):
  *       com.hakios.unlock      what the lock screen does after "swipe up to open"
  *       com.hakios.layers      write down the layers SpringBoard has on the screen: see layers()
@@ -721,6 +723,60 @@ prewarm_orb_view_shaders(id self, SEL selector)
 }
 
 /*
+ * The "Wallet Would Like to Send You Notifications" alert, which every boot shows over the home screen
+ * (/private/var holds the answer, but the alert came back after "Don't Allow" all the same), is
+ * SpringBoard's own: SpringBoard.framework links UserNotificationsServer, where the alert controllers
+ * are (usernotificationsd links only UserNotificationsServices, so it is not the daemon's).
+ * Every request goes through -[UNSAuthorizationAlertController
+ * requestAuthorizationForBundleIdentifier:displayName:usageDescription:withResult:], which
+ * the notification, critical-alert and delivery controllers inherit; it shows the alert (a
+ * CFUserNotification) and answers `withResult`, a void (^)(NSInteger), when a button is pressed:
+ * __UNSAuthorizationAlertResponseHandler maps CFUserNotification's response 1 ("Don't Allow") to 0,
+ * 2 ("Allow") to 1 and anything else (dismissed) to -1, and -_queue_sendResponse:forBundleIdentifier:
+ * hands that on to the blocks. So the replacement answers 1 at once, without an alert, as a tap on
+ * "Allow" would, and the service records "authorized". One line per request: "notif: BUNDLE allowed".
+ * Boot-arg notif_ask=1 puts the alert back. (27.2, 24B119; the address is from the cache's local symbols.)
+ */
+#if defined(HAKIOS_IOS27)
+static void (*original_request_authorization)(id self, SEL selector, id bundle_id, id name, id usage, id result);
+
+static void
+request_authorization(id self, SEL selector, id bundle_id, id name, id usage, id result)
+{
+	static int ask = -1;
+
+	if (ask < 0) {
+		ask = boot_arg_is_set("notif_ask=1");
+	}
+	if (ask || result == NULL) {
+		original_request_authorization(self, selector, bundle_id, name, usage, result);
+		return;
+	}
+	say("hakios: notif: %s allowed\n", text_of(bundle_id));
+	((void (^)(long))result)(1);
+}
+
+static void
+install_notification_auto_allow(void)
+{
+	static bool tried;
+
+	if (tried || objc_getClass("UNSAuthorizationAlertController") == NULL) {
+		return;
+	}
+	tried = true;
+	replace_method("UNSAuthorizationAlertController",
+	    "requestAuthorizationForBundleIdentifier:displayName:usageDescription:withResult:", 0x228533f0cUL,
+	    (IMP)request_authorization, (IMP *)&original_request_authorization);
+}
+#else
+static void
+install_notification_auto_allow(void)
+{
+}
+#endif
+
+/*
  * SiriUIActivation arrives only when SpringBoard first wants Siri, which is after everything else
  * this library replaces at startup. So this waits for the class rather than for a named image: the
  * notifier runs once per image already loaded and once per image afterwards, and the first time the
@@ -730,6 +786,8 @@ static void
 image_added(__unused const struct mach_header *header, __unused intptr_t image_slide)
 {
 	static bool tried;      /* (once: an address that did not match the first time will not match on a later image) */
+
+	install_notification_auto_allow();
 
 	if (tried || objc_getClass("SiriPresentationViewController") == NULL) {
 		return;
@@ -1507,6 +1565,7 @@ hakios_springboard_init(void)
 	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state,
 	    NULL);
 	_dyld_register_func_for_add_image(image_added);         /* Siri's orb, whose framework comes late */
+	install_notification_auto_allow();
 	replace_method("SBSetupManager", "_setSetupRequiredReason:", 0x1c4cdd3a4UL, (IMP)set_setup_required_reason,
 	    (IMP *)&original_set_setup_required_reason);
 	snapshot_format = replace_method_of_kind('+', "XBApplicationSnapshotManifestImpl", "_outputFormatForSnapshot:",
