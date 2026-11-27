@@ -5113,7 +5113,7 @@ hakios_display_scanout_reaches(uint64_t phys, uint64_t length)
 #define QOS_VIG0_XIN            0u              /* qcom,sde-sspp-xin-id[0] */
 static const uint8_t qos_rt_remap[8] = { 3, 3, 4, 4, 5, 5, 6, 6 };     /* qcom,sde-vbif-qos-rt-remap */
 static struct block scanout_vbif;
-static uint32_t scanout_qos_mode = 1, scanout_qos_size, scanout_qos_format;     /* boot-arg fb_qos; what it was programmed for */
+static uint32_t scanout_qos_mode = 0,  /* off by default: with sdmmagpie-sde.dtsi values the user saw garbage on screen (2026-11-27); fb_qos=1 */ scanout_qos_size, scanout_qos_format;     /* boot-arg fb_qos; what it was programmed for */
 static bool scanout_qos_read, scanout_qos_done;
 
 static uint32_t
