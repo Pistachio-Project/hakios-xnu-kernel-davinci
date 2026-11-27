@@ -507,6 +507,7 @@ static struct gov_group {
 	/* pm_gov=1 (below): */
 	uint32_t cap;                   /* the thermal limiter's row, the most that may be asked (thermal=2) */
 	uint32_t want;                  /* what the load asks for, before the caps */
+	bool was_boosted;               /* the last look was inside a boost */
 	bool foreign;                   /* a core of the group is the boot loader's: the load of it is not seen */
 	uint64_t boosts, looks_pm;
 } gov[CPUFREQ_GROUPS];
@@ -542,15 +543,26 @@ gov_set(struct gov_group *g, uint32_t row)
  * Without a current sensor in the kernel the mean frequency and the share of the time at the low rows are the numbers to compare
  * runs by, with the temperature lines of thermal.c ("tl: h").
  */
-#define PM_DOWN_LOOKS           6
-#define PM_JUMP_BUSY            85
+#define PM_DOWN_LOOKS           12              /* (x PARK_MS: ~100 ms of calm before a step down: slow down) */
+#define PM_JUMP_BUSY            75
+#define PM_HEADROOM_PCT         150             /* the speed asked for is 1.5 x what the busiest core used: it runs at ~65% at most */
 #define PM_SCREEN_OFF_MS        25
 extern bool hakios_ddr_pm_on(void);
 extern void hakios_ddr_pm_look(uint32_t mean, uint32_t big, bool touch, bool gpu);
 extern uint32_t hakios_adreno_idle_ms(void);
 static bool pm_ddr_on;                  /* pm_ddr=1 and the vote was made (ddr.c) */
 static bool pm_gov;
-static uint32_t pm_boost_pct = 60, pm_boost_ms = 120, pm_foreign_pct = 45;
+/*
+ * Defaults (the phone's UI first): a touch holds both groups at the top row (100%) for 250 ms after the last sample; no group below
+ * pm_floor_pct of its top outside the dark screen; and the soft thermal cap (see pm_soft_pct()).
+ */
+static uint32_t pm_boost_pct = 100, pm_boost_ms = 250, pm_foreign_pct = 45, pm_floor_pct = 30;
+static uint32_t pm_soft_start = 600;    /* tenths of a degree: the soft cap begins (boot-arg pm_soft_start; 0: no soft cap) */
+static uint32_t pm_soft_big_pct = 75, pm_soft_small_pct = 90;   /* the share of the top frequency left at the trip (pm_soft_big, pm_soft_small) */
+static uint64_t pm_boost_edges;         /* the touches that started a boost (the 5 s line) */
+static uint32_t pm_soft_last[CPUFREQ_GROUPS];   /* the soft cap's percent of the last look, for the line */
+extern int32_t hakios_thermal_group_hottest(uint32_t d);        /* thermal.c */
+extern int32_t hakios_thermal_trip(void);
 extern uint64_t hakios_touch_last;      /* input.c */
 static volatile bool pm_screen_off;     /* pm_screen=1 and the display is dark (hakios_cpufreq_screen()) */
 static uint64_t pm_boost_until;         /* (absolute time) a boost asked for by hakios_cpufreq_screen(), on the screen's coming on */
@@ -568,12 +580,42 @@ pm_row_at_pct(const struct gov_group *g, uint32_t pct)
 	return row;
 }
 
+/*
+ * The soft thermal cap, in percent of the group's top frequency: 100 up to pm_soft_start (default 60.0 C), then falling in a straight
+ * line to pm_soft_big_pct (75 for the big group; the small group's, 90) at thermal.c's trip (70.0 C). The limiter (thermal=2) goes on
+ * from there as before: row by row a second, each group by its own sensors, and its row reaches us as g->cap (hakios_cpufreq_pm_cap):
+ * the two caps are combined with MIN(), so neither undoes the other, and the limiter's steps start from a cooler, already-trimmed
+ * clock rather than from the top. The touch boost is held to this cap too.
+ */
+static uint32_t
+pm_soft_pct(uint32_t d)
+{
+	int32_t hot, trip = hakios_thermal_trip(), start = (int32_t)pm_soft_start;
+	uint32_t least = d == 0 ? pm_soft_small_pct : pm_soft_big_pct;
+
+	if (pm_soft_start == 0 || least >= 100) {
+		return 100;
+	}
+	hot = hakios_thermal_group_hottest(d);
+	if (hot <= -2000 || hot <= start || trip <= start) {     /* (TH_NONE: not read yet) */
+		return 100;
+	}
+	if (hot >= trip) {
+		return least;
+	}
+	return 100 - (100 - least) * (uint32_t)(hot - start) / (uint32_t)(trip - start);
+}
+
 /* what is applied: the want, held to the caps (the thermal limiter's, the screen's) and lifted to the floors (touch, foreign core) */
 static void
 pm_apply(struct gov_group *g, bool boosted)
 {
 	uint32_t d = (uint32_t)(g - gov), row = g->want, cap = MIN(g->cap, g->top);
 
+	uint32_t soft = pm_soft_pct(d);
+
+	pm_soft_last[d] = soft;
+	row = MAX(row, pm_row_at_pct(g, pm_floor_pct));
 	if (boosted) {
 		row = MAX(row, pm_row_at_pct(g, pm_boost_pct));
 	}
@@ -584,6 +626,9 @@ pm_apply(struct gov_group *g, bool boosted)
 		/* the dark display: the big cores' group at its lowest row, the small cores' at half of its top at most */
 		cap = MIN(cap, d == 0 ? pm_row_at_pct(g, 50) : 0);
 		row = MIN(row, cap);
+	}
+	if (soft < 100) {
+		cap = MIN(cap, pm_row_at_pct(g, soft));
 	}
 	row = MIN(row, cap);
 	gov_set(g, row);
@@ -601,7 +646,7 @@ hakios_cpufreq_pm_cap(uint32_t domain, uint32_t row)
 	g = &gov[domain];
 	lck_mtx_lock(&gov_lock);
 	g->cap = row;
-	pm_apply(g, false);
+	pm_apply(g, g->was_boosted);
 	lck_mtx_unlock(&gov_lock);
 	return true;
 }
@@ -614,9 +659,15 @@ gov_start(void)
 	const struct hakios_board *board = hakios_board();
 	uint32_t on = 1, thermal = 1, had[CPUFREQ_GROUPS] = { 0 };
 
+	/* the Mi 9T (davinci): the power governor is on unless the boot-arg pm_gov=0 says otherwise (the boot-arg line has no room for more) */
+	pm_gov = board != NULL && board->name != NULL && strncmp(board->name, "davinci", 7) == 0;
 	PE_parse_boot_argn("cpu_gov", &on, sizeof(on));
 	PE_parse_boot_argn("thermal", &thermal, sizeof(thermal));
 	PE_parse_boot_argn("pm_gov", &pm_gov, sizeof(pm_gov));
+	PE_parse_boot_argn("pm_floor_pct", &pm_floor_pct, sizeof(pm_floor_pct));
+	PE_parse_boot_argn("pm_soft_start", &pm_soft_start, sizeof(pm_soft_start));
+	PE_parse_boot_argn("pm_soft_big", &pm_soft_big_pct, sizeof(pm_soft_big_pct));
+	PE_parse_boot_argn("pm_soft_small", &pm_soft_small_pct, sizeof(pm_soft_small_pct));
 	PE_parse_boot_argn("pm_boost_pct", &pm_boost_pct, sizeof(pm_boost_pct));
 	PE_parse_boot_argn("pm_boost_ms", &pm_boost_ms, sizeof(pm_boost_ms));
 	PE_parse_boot_argn("pm_foreign_pct", &pm_foreign_pct, sizeof(pm_foreign_pct));
@@ -731,7 +782,7 @@ gov_look_pm(const uint32_t *busy, uint64_t now)
 			}
 		}
 		/* what the busiest core did, at the speed it ran at (the speed asked for: caps may have kept it lower), with room to spare */
-		need = (uint32_t)((uint64_t)g->khz[g->row] * most * GOV_HEADROOM_PCT / 10000);
+		need = (uint32_t)((uint64_t)g->khz[g->row] * most * PM_HEADROOM_PCT / 10000);
 		for (want = 0; want < g->top && g->khz[want] < need; want++) {
 		}
 		if (most >= PM_JUMP_BUSY) {
@@ -753,6 +804,10 @@ gov_look_pm(const uint32_t *busy, uint64_t now)
 		if (boosted && g->row < pm_row_at_pct(g, pm_boost_pct)) {
 			g->boosts++;
 		}
+		if (boosted && !g->was_boosted) {
+			pm_boost_edges++;
+		}
+		g->was_boosted = boosted;
 		pm_apply(g, boosted);
 		g->looks_at[g->row]++;
 		g->looks_pm++;
@@ -764,12 +819,13 @@ gov_look_pm(const uint32_t *busy, uint64_t now)
 static void
 gov_report_pm(void)
 {
-	char line[420];
+	char line[600];
 	size_t at = 0;
 
 	for (uint32_t d = 0; d < CPUFREQ_GROUPS && at < sizeof(line) - 100; d++) {
 		struct gov_group *g = &gov[d];
 		uint64_t sum = 0, khz_sum = 0;
+		int32_t hot_now = hakios_thermal_group_hottest(d);
 
 		if (g->base == 0 || g->looks_pm == 0) {
 			continue;
@@ -784,12 +840,15 @@ gov_report_pm(void)
 				at += (size_t)snprintf(line + at, sizeof(line) - at, " %u=%llu%%", g->khz[r] / 1000, g->looks_at[r] * 100 / sum);
 			}
 		}
-		at += (size_t)snprintf(line + at, sizeof(line) - at, " mean %llu MHz, boosted looks %llu%s;", sum ? khz_sum / sum / 1000 : 0,
-		    g->boosts, g->foreign ? " (floor: loader's core)" : "");
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " mean %llu MHz, row %u/%u, cap row %u soft %u%% hot %d.%d C, boosted looks %llu%s;",
+		    sum ? khz_sum / sum / 1000 : 0, g->row, g->top, MIN(g->cap, g->top), pm_soft_last[d],
+		    hot_now / 10, hot_now < 0 ? -(hot_now % 10) : hot_now % 10, g->boosts,
+		    g->foreign ? " (floor: loader's core)" : "");
 		memset(g->looks_at, 0, sizeof(g->looks_at));
 		g->boosts = g->looks_pm = 0;
 	}
-	tell("pm: gov (MHz=share of looks):%s screen %s\n", line, pm_screen_off ? "OFF" : "on");
+	tell("pm: gov (MHz=share of looks):%s touch boosts %llu, screen %s\n", line, pm_boost_edges, pm_screen_off ? "OFF" : "on");
+	pm_boost_edges = 0;
 }
 
 /*

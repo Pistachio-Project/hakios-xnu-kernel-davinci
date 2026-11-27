@@ -308,6 +308,22 @@ apply(uint32_t s)
 	hakios_backlight_set_cap(th_backlight_cap(s, most, 600));
 }
 
+/*
+ * For the load governor's soft cap (cpufreq.c, pm_gov): the hottest sensor of GROUP D's own (the overall hottest on a board that names
+ * none) and the limiter's trip, both in tenths of a degree. TH_NONE: not read yet. Plain reads of what th_thread() last stored.
+ */
+int32_t
+hakios_thermal_group_hottest(uint32_t d)
+{
+	return (domains && d < TH_DOMAINS && cpu_mask[d] != 0) ? dhot[d] : hottest;
+}
+
+int32_t
+hakios_thermal_trip(void)
+{
+	return in_force.trip;
+}
+
 #define PERIOD_MS       1000
 static uint32_t period_ms = PERIOD_MS;          /* boot-arg th_period_ms (100 to 10000) */
 
