@@ -321,6 +321,9 @@ struct wp_wait {                /* what a thread waits on */
 	uint32_t ec, msgid, word, hint;
 	uint8_t has_msg, nbt;
 	uint64_t bt[WP_BT];
+	uint32_t rcv, utmo;     /* mach_msg2: the receive port's name (x5) and the timeout asked, ms (x7) */
+	uint8_t nubt;
+	uint64_t ufp, ubt[4];   /* the user frame pointer, and the return addresses of 4 user frames above mach_msg */
 };
 
 struct wp_agg {
@@ -357,7 +360,7 @@ extern boolean_t machine_thread_on_core(thread_t thread);
 
 #define WPSAY(...) \
 	do { \
-		char wp_line[480]; \
+		char wp_line[600]; \
 		snprintf(wp_line, sizeof(wp_line), __VA_ARGS__); \
 		loader_log_line(wp_line); \
 	} while (0)
@@ -424,6 +427,11 @@ wp_fill_user(thread_t t, struct wp_wait *w, uint64_t *x0, uint64_t *x4)
 	w->trap = get_saved_state_reg(us, 16);
 	*x0 = get_saved_state_reg(us, 0);
 	*x4 = get_saved_state_reg(us, 4);
+	if (w->trap == (uint64_t)-47) {
+		w->rcv = (uint32_t)get_saved_state_reg(us, 5);
+		w->utmo = (uint32_t)get_saved_state_reg(us, 7);
+	}
+	w->ufp = get_saved_state_fp(us) & 0x0000ffffffffffffull;
 }
 
 /* (no locks held: the task's map is read, which may fault) */
@@ -454,8 +462,23 @@ wp_read_msg(struct wp_target *tg, struct wp_pending *pe)
 			w.has_msg = 2;
 		}
 	}
+	w.nubt = 0;
+	for (uint64_t fp = w.ufp; fp != 0 && (fp & 7) == 0 && w.nubt < 4;) {
+		uint64_t fr[2];
+
+		if (vm_map_read_user(map, fp, fr, sizeof(fr)) != KERN_SUCCESS) {
+			break;
+		}
+		w.ubt[w.nubt++] = fr[1] & 0x0000ffffffffffffull;
+		if (fr[0] <= fp) {
+			break;
+		}
+		fp = fr[0];
+	}
 	vm_map_deallocate(map);
 	if (th->kind == 1 && th->cs == pe->cs) {        /* (still that wait) */
+		th->w.nubt = w.nubt;
+		memcpy(th->w.ubt, w.ubt, sizeof(w.ubt));
 		th->w.msgid = w.msgid;
 		th->w.word = w.word;
 		th->w.has_msg = w.has_msg;
@@ -532,6 +555,15 @@ wp_describe(char *out, size_t n, const struct wp_wait *w)
 		at += (size_t)snprintf(out + at, n - at, " timeout %llums", w->timeout_ms);
 	}
 	at += (size_t)snprintf(out + at, n - at, " upc %#llx ulr %#llx", w->upc, w->ulr);
+	if (w->trap == (uint64_t)-47) {
+		at += (size_t)snprintf(out + at, n - at, " rcv %#x utmo %u", w->rcv, w->utmo);
+	}
+	if (w->nubt != 0) {
+		at += (size_t)snprintf(out + at, n - at, " u:");
+		for (unsigned i = 0; i < w->nubt; i++) {
+			at += (size_t)snprintf(out + at, n - at, " %#llx", w->ubt[i]);
+		}
+	}
 	if (w->cont != 0) {
 		at += (size_t)snprintf(out + at, n - at, " cont %#llx", w->cont);
 	}
@@ -555,7 +587,7 @@ wp_end_episode(struct wp_target *tg, struct wp_thr *th)
 		a->max_ms = MAX(a->max_ms, (uint32_t)ms);
 	}
 	if (th->kind != 0 && ms >= wp_long_ms) {
-		char d[300];
+		char d[420];
 
 		d[0] = 0;
 		if (th->kind == 1) {
@@ -717,9 +749,22 @@ wp_report(struct wp_target *tg)
 	bzero(used, sizeof(used));
 	WPSAY("waitprof: %s: %u samples in %us, kernel slide %#lx, %u waits not kept", tg->name, tg->samples, wp_secs,
 	    (unsigned long)vm_kernel_slide, tg->lost);
+	{       /* the shared cache's slide, to name the user addresses (u:) on the host */
+		struct user64_dyld_all_image_infos infos;
+		vm_map_t map = get_task_map_reference(tg->task);
+
+		if (map != VM_MAP_NULL) {
+			if (tg->task->all_image_info_addr != 0 &&
+			    vm_map_read_user(map, tg->task->all_image_info_addr, &infos, sizeof(infos)) == KERN_SUCCESS) {
+				WPSAY("waitprof: %s: shared cache at %#llx slide %#llx", tg->name, infos.sharedCacheBaseAddress,
+				    infos.sharedCacheSlide);
+			}
+			vm_map_deallocate(map);
+		}
+	}
 	for (unsigned n = 0; n < 8; n++) {
 		int best = -1;
-		char d[300];
+		char d[420];
 
 		for (uint32_t i = 0; i < tg->nagg; i++) {
 			if (!used[i] && tg->agg[i].ms != 0 && (best < 0 || tg->agg[i].ms > tg->agg[best].ms)) {
