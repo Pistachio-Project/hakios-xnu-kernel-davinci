@@ -618,6 +618,44 @@ window_server_keeps_opengl_es(Method method)
 	method_setImplementation(method, (IMP)my_detect_displays);
 }
 
+/*
+ * backboardd refuses the display queries of other processes (CARenderServer's _XGetDisplays answers "not yet",
+ * 0xFB294002) until StartWindowServer's last step, -[CAWindowServer enableOutOfProcessDisplayObservation]. A
+ * process that asks sooner (chronod, started on demand: QuartzCore's query_displays() retries for five seconds,
+ * then abort()s) is kept waiting by libhakios-chronod.dylib on this notification, whose state is 1 from then on.
+ */
+#define DISPLAYS_OPEN_NOTIFICATION "com.hakios.windowserver.displays-open"
+
+static void (*orig_enable_observation)(id, SEL);
+
+static void
+my_enable_observation(id server, SEL selector)
+{
+	int token;
+
+	orig_enable_observation(server, selector);
+	if (notify_register_check(DISPLAYS_OPEN_NOTIFICATION, &token) == NOTIFY_STATUS_OK) {
+		notify_set_state(token, 1);
+	}
+	notify_post(DISPLAYS_OPEN_NOTIFICATION);
+	say("hakios: window server: displays open to other processes at uptime %.1f s\n",
+	    (double)clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1e9);
+}
+
+static void
+window_server_opens_displays(void)
+{
+	Class cls = objc_getClass("CAWindowServer");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("enableOutOfProcessDisplayObservation")) : NULL;
+
+	if (method == NULL) {
+		say("hakios: window server: no -enableOutOfProcessDisplayObservation; other processes are not told when displays open\n");
+		return;
+	}
+	orig_enable_observation = (void (*)(id, SEL))method_getImplementation(method);
+	method_setImplementation(method, (IMP)my_enable_observation);
+}
+
 static void
 window_server_fixes(void)
 {
@@ -2387,6 +2425,7 @@ hakios_init(void)
 			}
 		}
 		opengl_es();
+		window_server_opens_displays();
 		window_server_fixes();
 		/*
 		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch

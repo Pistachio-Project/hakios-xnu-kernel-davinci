@@ -90,6 +90,8 @@ $DYN -dynamiclib -install_name /hakios/lib/liblocationd-silo.dylib -lobjc -o "$O
 $DYN -dynamiclib -install_name /hakios/lib/libhakios-brightness.dylib -framework CoreFoundation -lobjc -o "$O/libhakios-brightness.dylib" "$RN/../components/brightness/inject_brightness.c"
 # UIKit's feedback generators answered on the motor (components/haptic/inject_haptic.c)
 $DYN -dynamiclib -install_name /hakios/lib/libhakios-haptic.dylib -lobjc -o "$O/libhakios-haptic.dylib" "$RN/../components/haptic/inject_haptic.c"
+# chronod held until backboardd's window server answers other processes' display queries (components/display/inject_chronod.c)
+$DYN -dynamiclib -install_name /hakios/lib/libhakios-chronod.dylib -o "$O/libhakios-chronod.dylib" "$RN/../components/display/inject_chronod.c"
 for f in "$O"/*.dylib "$O/HakiosAudio"; do
 	pac_strip "$f"
 	"$LDID" -S "$f"

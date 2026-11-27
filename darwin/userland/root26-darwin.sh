@@ -394,6 +394,9 @@ echo "/hakios/lib/libhakios-camapp.dylib Camera" >> $T/etc/inject.conf
 # locationd: its Mescal signer refused before it asks fairplayd, which never answers here and would hold one of
 # locationd's silos, and every client behind it, for good (src: components/location/inject_locationd.c)
 echo "/hakios/lib/liblocationd-silo.dylib locationd" >> $T/etc/inject.conf
+# chronod: held in its constructor until backboardd says its window server answers other processes' display
+# queries (else QuartzCore's query_displays() gives up after 5 s and abort()s; src: components/display/inject_chronod.c)
+echo "/hakios/lib/libhakios-chronod.dylib chronod" >> $T/etc/inject.conf
 # STOREFRONT=1: the App Store's SAP (Mescal) signature from the host's sapd, and a storefront answered, so the
 # storefront-token request is signed and amp-api returns the catalog (components/apple-id/src/inject_store.c, inject_mescal.m).
 # STORE_FROM_VAR=1 puts the store library in /var instead, with a copy of it in var.skel so it is always
