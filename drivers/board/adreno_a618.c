@@ -2113,14 +2113,14 @@ static const struct {
 	 */
 	{ 0, 0 }, { 180000, 48 }, { 267000, 64 }, { 355000, 128 }, { 430000, 192 }, { 565000, 256 },
 	/*
-	 * Only with boot-arg adreno_speed=6 (the default stays 5): the fastest that speed bin 0x80 (this Mi 9T) reaches, 610 MHz at
+	 * The default (adreno_speed=5 for 565): the fastest that speed bin 0x80 (this Mi 9T) reaches, 610 MHz at
 	 * the rail's TURBO level 320 (RPMh's gfx.lvl, mx.lvl have it: logs/145651-run.log). Untested on the phone; the
 	 * "adreno: gpu clock" line (every 5 s) and step 17's "measured" line say what the core really runs at.
 	 */
 	{ 610000, 320 },
 };
 #define GPU_SPEEDS              ((uint32_t)(sizeof(gpu_speeds) / sizeof(gpu_speeds[0])))
-static uint32_t gpu_votes[GPU_SPEEDS], gpu_speed = 5;        /* 565 MHz: 610 (index 6) only with adreno_speed=6 */
+static uint32_t gpu_votes[GPU_SPEEDS], gpu_speed = 6;        /* 610 MHz, this bin's top (2026-11-27 ui_bench, 64.8 C peak); adreno_speed=5 for 565 */
 /* what the GMU was last asked for (the thermal cap may lower it below gpu_speed, never raise it above); 0: not yet asked */
 static uint32_t gpu_applied;
 /* the thermal limiter's level (0: none yet), the load governor's (pm_gpu=1; 0: not governing) and what wakes it (a618_gpu_submit) */
