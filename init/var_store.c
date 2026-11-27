@@ -846,6 +846,39 @@ is_icon_cache(const char *relative)
 	return 0;
 }
 
+/*
+ * Boot-arg var_store_trace=1: at a save, one line for each LaunchServices store file and each index-like or big file of the
+ * icon caches (size, modification time, inode): the next boot's save shows whether the files the restore gave back were
+ * rewritten (their time moved) or replaced (a new inode and size) -- the two ways an icon cache that is kept is still
+ * rejected (iconservicesagent's validation token is the database's UUID and sequence number).
+ */
+static void
+trace_cache_file(const char *relative, const char *path)
+{
+	static int wanted = -1;
+	struct stat st;
+	const char *name = relative;
+
+	if (wanted < 0) {
+		wanted = boot_arg_is("var_store_trace", "1");
+	}
+	if (!wanted || !(is_launchservices_store(relative) || is_icon_cache(relative)) || lstat(path, &st) != 0 ||
+	    (st.st_mode & S_IFMT) != S_IFREG) {
+		return;
+	}
+	for (const char *at = relative; *at != 0; at++) {
+		if (*at == '/') {
+			name = at + 1;
+		}
+	}
+	/* (the files of the icon caches that are not one icon's data: the index and what says which store it is) */
+	if (is_launchservices_store(relative) || st.st_size >= (1 << 20) || strncmp(name, "store", 5) == 0 ||
+	    strncmp(name, "index", 5) == 0 || strncmp(name, "version", 7) == 0 || strncmp(name, "uuid", 4) == 0) {
+		printf("var_store: trace: %s size %llu mtime %lld.%09ld ino %llu\n", relative, (unsigned long long)st.st_size,
+		    (long long)st.st_mtimespec.tv_sec, (long)st.st_mtimespec.tv_nsec, (unsigned long long)st.st_ino);
+	}
+}
+
 /* The identity of the image this boot runs from, in ID (ID_MAX bytes); 0 when there is none to be had. */
 static int
 image_identity(char *id)
@@ -1567,6 +1600,7 @@ pack_tree(const char *relative)
 				strcpy(child, name);
 			}
 			if (ls_on() || !is_launchservices_store(child)) {
+				trace_cache_file(child, path);
 				ok = pack_tree(child);
 			}
 			path[base] = 0;
