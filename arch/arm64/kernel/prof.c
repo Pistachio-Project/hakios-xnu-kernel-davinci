@@ -25,6 +25,7 @@
 #include <string.h>
 #include <ipc/ipc_port.h>
 #include <ipc/ipc_space.h>
+#include <ipc/ipc_service_port.h>
 
 extern int proc_name(int pid, char *buf, int size);
 
@@ -328,6 +329,9 @@ struct wp_wait {                /* what a thread waits on */
 	uint32_t rcv, utmo;     /* mach_msg2: the receive port's name (x5) and the timeout asked, ms (x7) */
 	uint32_t dst;           /* mach_msg2 with a send: the destination's name (x3 low half) */
 	int32_t dst_pid;        /* ... and the pid of the process that receives on it (-1: none known) */
+	char dst_how;           /* s: in a space, t: in transit (in a message not yet received), k: the kernel's, r: reply space, ?: */
+	uint8_t dst_throttled;  /* a service port launchd throttles */
+	char dst_svc[40];       /* a service port's launchd name */
 	uint8_t nubt;
 	uint64_t ufp, ubt[4];   /* the user frame pointer, and the return addresses of 4 user frames above mach_msg */
 };
@@ -442,6 +446,9 @@ wp_fill_user(thread_t t, struct wp_wait *w, uint64_t *x0, uint64_t *x4)
 		w->dst = (uint32_t)get_saved_state_reg(us, 3);
 	}
 	w->dst_pid = -1;
+	w->dst_how = 0;
+	w->dst_throttled = 0;
+	w->dst_svc[0] = 0;
 	w->ufp = get_saved_state_fp(us) & 0x0000ffffffffffffull;
 }
 
@@ -491,13 +498,31 @@ wp_read_msg(struct wp_target *tg, struct wp_pending *pe)
 	if (w.trap == (uint64_t)-47 && MACH_PORT_VALID(w.dst) && tg->task->itk_space != IS_NULL) {
 		ipc_port_t port = IP_NULL;
 
+		w.dst_how = '?';
+		w.dst_svc[0] = 0;
 		if (ipc_port_translate_send(tg->task->itk_space, w.dst, &port) == KERN_SUCCESS && port != IP_NULL) {
+			ipc_object_label_t label;
+
 			w.dst_pid = ipc_port_get_receiver_task_locked(port, NULL);
-			ip_mq_unlock(port);
+			w.dst_how = ip_in_transit(port) ? 't' : ip_in_space(port, ipc_space_kernel) ? 'k' :
+			    ip_in_space(port, ipc_space_reply) ? 'r' : ip_in_a_space(port) ? 's' : '?';
+			label = ip_label_get(port);
+			if (ip_is_any_service_port_type(label.io_type) && label.iol_service != NULL) {
+				w.dst_throttled = label.iol_service->ispl_throttled;
+#if CONFIG_SERVICE_PORT_INFO
+				if (label.iol_service->ispl_service_name != NULL) {
+					strlcpy(w.dst_svc, label.iol_service->ispl_service_name, sizeof(w.dst_svc));
+				}
+#endif
+			}
+			ip_mq_unlock_label_put(port, &label);
 		}
 	}
 	if (th->kind == 1 && th->cs == pe->cs) {        /* (still that wait) */
 		th->w.dst_pid = w.dst_pid;
+		th->w.dst_how = w.dst_how;
+		th->w.dst_throttled = w.dst_throttled;
+		memcpy(th->w.dst_svc, w.dst_svc, sizeof(w.dst_svc));
 		th->w.nubt = w.nubt;
 		memcpy(th->w.ubt, w.ubt, sizeof(w.ubt));
 		th->w.msgid = w.msgid;
@@ -622,9 +647,10 @@ wp_end_episode(struct wp_target *tg, struct wp_thr *th)
 			if (th->w.dst_pid > 0) {
 				proc_name(th->w.dst_pid, peer, sizeof(peer));
 			}
-			WPSAY("wpm %llu.%03llu %llu '%.20s' %llums r%#x t%u m%u %llx %llx %llx %llx to %d %s", th->last / NSEC_PER_SEC,
+			WPSAY("wpm %llu.%03llu %llu '%.20s' %llums r%#x t%u m%u %llx %llx %llx %llx to %d %s %c%s svc %s", th->last / NSEC_PER_SEC,
 			    th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, th->w.rcv, th->w.utmo, th->w.msgid,
-			    th->w.ubt[0], th->w.ubt[1], th->w.ubt[2], th->w.ubt[3], th->w.dst_pid, peer);
+			    th->w.ubt[0], th->w.ubt[1], th->w.ubt[2], th->w.ubt[3], th->w.dst_pid, peer,
+			    th->w.dst_how ? th->w.dst_how : '-', th->w.dst_throttled ? " THROTTLED" : "", th->w.dst_svc[0] ? th->w.dst_svc : "-");
 		}
 	}
 	th->kind = 0;
