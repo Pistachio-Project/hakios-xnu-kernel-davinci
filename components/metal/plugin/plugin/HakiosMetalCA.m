@@ -3172,9 +3172,19 @@ hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned
 
 - (id)hakiosPipelineForFunction:(id)function descriptor:(id)descriptor error:(NSError **)error
 {
+	const double began = hm_now();
+	id made = [self hakiosPipelineForFunctionTimed:function descriptor:descriptor error:error];
+
+	hm_pipe_account((hm_now() - began) * 1e3, YES);
+	return made;
+}
+
+- (id)hakiosPipelineForFunctionTimed:(id)function descriptor:(id)descriptor error:(NSError **)error
+{
 	SEL bitcode = sel_getUid("bitcodeData");
 	NSData *air;
 	hakios_metal_kernel *kernel;
+	BOOL fromCache = NO;
 
 	if (function == nil) {
 		return [self hakiosRefuse:error what:"a compute pipeline" why:@"the descriptor names no compute function"];
@@ -3195,7 +3205,12 @@ hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned
 		hakios_metal_constant constants[64];
 		unsigned count = hm_function_constants(function, constants, 64);
 
+		unsigned long long h0, s0, m0, c0, l0, n0, f0, p0, h1, s1, m1, c1, l1, n1, f1, p1;
+
+		hakios_metal_compile_stats(&h0, &s0, &m0, &c0, &l0, &n0, &f0, &p0);
 		kernel = hakios_metal_kernel_compile_bitcode_constants([air bytes], [air length], constants, count);
+		hakios_metal_compile_stats(&h1, &s1, &m1, &c1, &l1, &n1, &f1, &p1);
+		fromCache = (m1 == m0);
 		if (kernel != NULL) {
 			hm_dump_function("cs", function, "metal_dump=fn", constants, count);
 		}
@@ -3206,8 +3221,8 @@ hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned
 		return [self hakiosRefuse:error what:"a compute pipeline"
 				      why:[NSString stringWithFormat:@"%@: %s", [function name], hakios_metal_error()]];
 	}
-	hm_print("compiled %s: %u resources, %u threads a threadgroup at most, execution width %u, %u bytes of threadgroup memory\n",
-		 hakios_metal_kernel_name(kernel), hakios_metal_kernel_resource_count(kernel), hakios_metal_kernel_max_threads(kernel),
+	hm_print("%s %s: %u resources, %u threads a threadgroup at most, execution width %u, %u bytes of threadgroup memory\n",
+		 fromCache ? "from the cache" : "compiled", hakios_metal_kernel_name(kernel), hakios_metal_kernel_resource_count(kernel), hakios_metal_kernel_max_threads(kernel),
 		 hakios_metal_kernel_execution_width(kernel), hakios_metal_kernel_threadgroup_memory(kernel));
 	return [[HakiosMetalComputePipelineState alloc] initWithHakiosDevice:self kernel:kernel descriptor:descriptor];
 }
@@ -3649,6 +3664,15 @@ hm_bench_register(void)
 }
 
 static unsigned hm_pipelines_total;   /* pipelines built in this process (the hitch lines) */
+static unsigned long long hm_pipe_ns;   /* time in render and compute pipeline builds, the hitch breakdown's "compile" */
+static unsigned hm_compute_pipes;
+
+static void
+hm_pipe_account(double ms, BOOL compute)
+{
+	__atomic_fetch_add(&hm_pipe_ns, (unsigned long long)(ms * 1e6), __ATOMIC_RELAXED);
+	if (compute) __atomic_fetch_add(&hm_compute_pipes, 1, __ATOMIC_RELAXED);
+}
 static unsigned hm_spec_used, hm_spec_fallback;   /* draws of uber pipelines with a specialised program / on the uber shader itself (the fps report) */
 
 /* the stage cache's misses, one line each as compiled (compiler.cpp: cacheNote): the stage's name, the first 12 hex digits of
@@ -3676,6 +3700,7 @@ hm_pipeline_note(double ms)
 	double at;
 
 	hm_cache_notes();
+	hm_pipe_account(ms, NO);
 	pipelines++;
 	__atomic_fetch_add(&hm_pipelines_total, 1, __ATOMIC_RELAXED);
 	totalMs += ms;
@@ -6764,6 +6789,9 @@ static struct {
 	BOOL binningOff;                /* the queue's binning was turned off by an overrun of a visibility stream */
 	unsigned long long gmemLoad, gmemStore, splitStore;   /* bytes the GMEM passes loaded and stored, and what the split ones stored */
 	unsigned splitPasses;
+	double snapEncode, snapWaited, snapProcCpu, snapThreadCpu, snapLoadMs, snapCompileMs;   /* the breakdown's baselines at the last frame's start */
+	unsigned long long snapPipeNs;
+	unsigned snapComputePipes;
 } hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}} };
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
@@ -7843,6 +7871,34 @@ hm_fps_commit(double seconds)
 				pthread_mutex_unlock(&hm_fps.lock);
 				hm_print("%s\n", line);
 				pthread_mutex_lock(&hm_fps.lock);
+				{
+					/* where the gap went: pipeline builds (compile + cache loads), the buffers' making-to-commit time (the client's encoding,
+					 * ours included), waits in -waitUntilCompleted, the process's CPU against the wall time (CPU well under the gap: the
+					 * process was blocked -- on a lock, a XPC reply, a drawable -- not working), this thread's own CPU, GPU */
+					char line2[600];
+					struct timespec pc, tc;
+					const double procCpu = (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &pc), (double)pc.tv_sec + (double)pc.tv_nsec / 1e9);
+					const double thrCpu = (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tc), (double)tc.tv_sec + (double)tc.tv_nsec / 1e9);
+					const unsigned long long pipeNs = __atomic_load_n(&hm_pipe_ns, __ATOMIC_RELAXED);
+					const unsigned cpipes = __atomic_load_n(&hm_compute_pipes, __ATOMIC_RELAXED);
+					const double pipeMs = (double)(pipeNs - hm_fps.snapPipeNs) / 1e6;
+					const double encMs = hm_fps.encode >= hm_fps.snapEncode ? (hm_fps.encode - hm_fps.snapEncode) * 1e3 : hm_fps.encode * 1e3,
+						     waitMs = hm_fps.waited >= hm_fps.snapWaited ? (hm_fps.waited - hm_fps.snapWaited) * 1e3 : hm_fps.waited * 1e3;
+					const double procMs = (procCpu - hm_fps.snapProcCpu) * 1e3, thrMs = (thrCpu - hm_fps.snapThreadCpu) * 1e3;
+					const double loadMs = (double)lms - hm_fps.snapLoadMs, compMs = (double)cms - hm_fps.snapCompileMs;
+					const double other = frame * 1e3 - pipeMs - waitMs;
+					const char *verdict = pipeMs > 0.5 * frame * 1e3 ? "COMPILE" : waitMs > 0.5 * frame * 1e3 ? "WAIT" :
+							      procMs < 0.4 * frame * 1e3 ? "BLOCKED" : "CPU";
+
+					snprintf(line2, sizeof(line2),
+						 "fps: ... HITCH breakdown: %s: frame %.0f ms = pipelines %.1f (%u render, %u compute; compile %.1f, cache loads %.1f), "
+						 "waitUntilCompleted %.1f, other %.1f; buffers made-to-commit %.1f; cpu: process %.1f, committing thread %.1f; longest commit-to-completion %.1f",
+						 verdict, frame * 1e3, pipeMs, (unsigned)(pipelines - (unsigned)hm_fps.snapPipelines), cpipes - hm_fps.snapComputePipes,
+						 compMs, loadMs, waitMs, other, encMs, procMs, thrMs, hm_fps.sinceFrameLatencyMax * 1e3);
+					pthread_mutex_unlock(&hm_fps.lock);
+					hm_print("%s\n", line2);
+					pthread_mutex_lock(&hm_fps.lock);
+				}
 			}
 			{
 				unsigned long long buffers, kb, texMiss, stageMiss;
@@ -7850,6 +7906,22 @@ hm_fps_commit(double seconds)
 				hakios_metal_activity(&buffers, &kb, &texMiss, &stageMiss);
 				hm_fps.snapBuffers = buffers, hm_fps.snapKb = kb, hm_fps.snapTexMiss = texMiss, hm_fps.snapStageMiss = stageMiss;
 				hm_fps.snapPipelines = __atomic_load_n(&hm_pipelines_total, __ATOMIC_RELAXED);
+				{
+					struct timespec pc, tc;
+					unsigned long long h_, s_, m_, c_, l_, n_, f_, p_;
+
+					clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &pc);
+					clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tc);
+					hakios_metal_compile_stats(&h_, &s_, &m_, &c_, &l_, &n_, &f_, &p_);
+					hm_fps.snapProcCpu = (double)pc.tv_sec + (double)pc.tv_nsec / 1e9;
+					hm_fps.snapThreadCpu = (double)tc.tv_sec + (double)tc.tv_nsec / 1e9;
+					hm_fps.snapEncode = hm_fps.encode;
+					hm_fps.snapWaited = hm_fps.waited;
+					hm_fps.snapLoadMs = (double)l_;
+					hm_fps.snapCompileMs = (double)c_;
+					hm_fps.snapPipeNs = __atomic_load_n(&hm_pipe_ns, __ATOMIC_RELAXED);
+					hm_fps.snapComputePipes = __atomic_load_n(&hm_compute_pipes, __ATOMIC_RELAXED);
+				}
 				hm_fps.cbsSince = 0;
 				hm_fps.sinceFrameLatencyMax = 0;
 				hm_fps.hitchSlowUs = 0;
