@@ -23,6 +23,10 @@
 #include <vm/vm_map_xnu.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
+#include <ipc/ipc_port.h>
+#include <ipc/ipc_space.h>
+
+extern int proc_name(int pid, char *buf, int size);
 
 extern char *proc_name_address(void *p);
 extern lck_mtx_t tasks_threads_lock;
@@ -322,6 +326,8 @@ struct wp_wait {                /* what a thread waits on */
 	uint8_t has_msg, nbt;
 	uint64_t bt[WP_BT];
 	uint32_t rcv, utmo;     /* mach_msg2: the receive port's name (x5) and the timeout asked, ms (x7) */
+	uint32_t dst;           /* mach_msg2 with a send: the destination's name (x3 low half) */
+	int32_t dst_pid;        /* ... and the pid of the process that receives on it (-1: none known) */
 	uint8_t nubt;
 	uint64_t ufp, ubt[4];   /* the user frame pointer, and the return addresses of 4 user frames above mach_msg */
 };
@@ -433,7 +439,9 @@ wp_fill_user(thread_t t, struct wp_wait *w, uint64_t *x0, uint64_t *x4)
 	if (w->trap == (uint64_t)-47) {
 		w->rcv = (uint32_t)get_saved_state_reg(us, 5);
 		w->utmo = (uint32_t)get_saved_state_reg(us, 7);
+		w->dst = (uint32_t)get_saved_state_reg(us, 3);
 	}
+	w->dst_pid = -1;
 	w->ufp = get_saved_state_fp(us) & 0x0000ffffffffffffull;
 }
 
@@ -479,7 +487,17 @@ wp_read_msg(struct wp_target *tg, struct wp_pending *pe)
 		fp = fr[0];
 	}
 	vm_map_deallocate(map);
+	/* who is to answer: the process receiving on the port the message went to (a synchronous call's server) */
+	if (w.trap == (uint64_t)-47 && MACH_PORT_VALID(w.dst) && tg->task->itk_space != IS_NULL) {
+		ipc_port_t port = IP_NULL;
+
+		if (ipc_port_translate_send(tg->task->itk_space, w.dst, &port) == KERN_SUCCESS && port != IP_NULL) {
+			w.dst_pid = ipc_port_get_receiver_task_locked(port, NULL);
+			ip_mq_unlock(port);
+		}
+	}
 	if (th->kind == 1 && th->cs == pe->cs) {        /* (still that wait) */
+		th->w.dst_pid = w.dst_pid;
 		th->w.nubt = w.nubt;
 		memcpy(th->w.ubt, w.ubt, sizeof(w.ubt));
 		th->w.msgid = w.msgid;
@@ -599,9 +617,14 @@ wp_end_episode(struct wp_target *tg, struct wp_thr *th)
 		WPSAY("waitprof: %s %s at %llu.%03llu s: tid %llu '%s' %llu ms %s", tg->name, th->kind == 1 ? "LONG" : "RUNNABLE",
 		    th->last / NSEC_PER_SEC, th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, d);
 		if (th->kind == 1 && th->w.trap == (uint64_t)-47 && th->last / NSEC_PER_SEC >= wp_after_s) {
-			WPSAY("wpm %llu.%03llu %llu '%.20s' %llums r%#x t%u m%u %llx %llx %llx %llx", th->last / NSEC_PER_SEC,
+			char peer[20] = "-";
+
+			if (th->w.dst_pid > 0) {
+				proc_name(th->w.dst_pid, peer, sizeof(peer));
+			}
+			WPSAY("wpm %llu.%03llu %llu '%.20s' %llums r%#x t%u m%u %llx %llx %llx %llx to %d %s", th->last / NSEC_PER_SEC,
 			    th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, th->w.rcv, th->w.utmo, th->w.msgid,
-			    th->w.ubt[0], th->w.ubt[1], th->w.ubt[2], th->w.ubt[3]);
+			    th->w.ubt[0], th->w.ubt[1], th->w.ubt[2], th->w.ubt[3], th->w.dst_pid, peer);
 		}
 	}
 	th->kind = 0;
