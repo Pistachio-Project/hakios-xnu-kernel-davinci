@@ -120,13 +120,17 @@ Look the equivalents up for your SoC; don't copy them.
     HTW SCID at bit 25, and SYSTEM_CACHE_CNTL_0 = 3.
   - Off by default (`llcc=2` turns it on). On SM7325 the CPU slice made the pointer chase faster with no UI change.
     davinci (LLCC v1.1.2, 2 banks): 2 MB chase 93.5 -> 82.2 ns, nothing measurable from 3 MB up. Left off.
-- **Governor (davinci).** `pm_gov` is on by default:
+- **Governor (davinci).** `pm_gov=1` turns it on; it is OFF by default:
   - a 250 ms top-speed boost on touch;
   - otherwise 1.5x headroom over load, fast up and slow down;
   - a soft thermal cap from 60 C down to 75% of top (big cores) at the 70 C trip, combined with
     thermal.c's limiter by MIN.
 
-  `pm_gov=0` turns it off.
+  Measured with ui_bench, two pairs in both orders: on 36.7 / 38.7 fps with 101 / 79 frames over 100 ms;
+  off 41.1 / 42.6 fps with 71 / 63; peak 66-69 C either way. It drops the small cores when the load falls,
+  and the next animation starts on slow cores, which feels like lag. The heat is held by thermal.c's
+  limiter, not by running slower. A load-only governor needs a frame signal (a boost on the start of
+  an animation or a render-server wake) before it can match a fixed top frequency.
 
 ## iOS userland on foreign hardware
 

@@ -703,8 +703,10 @@ gov_start(void)
 	const struct hakios_board *board = hakios_board();
 	uint32_t on = 1, thermal = 1, had[CPUFREQ_GROUPS] = { 0 };
 
-	/* the Mi 9T (davinci): the power governor is on unless the boot-arg pm_gov=0 says otherwise (the boot-arg line has no room for more) */
-	pm_gov = board != NULL && board->name != NULL && strncmp(board->name, "davinci", 7) == 0;
+	/* off everywhere unless pm_gov=1: on the Mi 9T it cost smoothness at the same heat (ui_bench, two pairs in both orders, 2026-11-27:
+	 * on 36.7/38.7 fps, 101/79 frames over 100 ms; off 41.1/42.6 fps, 71/63; peak 66-69 C either way). It lowers the small cores when
+	 * the load drops, and the next animation starts on slow cores. thermal.c's cap still holds the heat. */
+	pm_gov = false;
 	PE_parse_boot_argn("cpu_gov", &on, sizeof(on));
 	PE_parse_boot_argn("thermal", &thermal, sizeof(thermal));
 	PE_parse_boot_argn("pm_gov", &pm_gov, sizeof(pm_gov));
