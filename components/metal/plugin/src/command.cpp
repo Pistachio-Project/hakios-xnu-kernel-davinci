@@ -602,7 +602,50 @@ void CommandBuffer::waitUntilCompleted() {
     done_.wait(g, [this] { return finished_ || status_ <= kEnqueued; });
 }
 
+void CommandBuffer::setOverlap(unsigned draws) {
+    // (not with slices at commit, which cut by the same passEnds_; not once something was given already and the answer is 0 now)
+    if (draws != 0 && queue_.splitDraws_ != 0) draws = 0;
+    overlapDraws_ = draws;
+    overlapSeq_ = queue_.commitSeq_.load();
+}
+
+void CommandQueue::waitEarly(CommandBuffer& cb) {
+    if (cb.earlySubmitted_ && cb.fence_ != 0) gpu_.wait(id_, cb.fence_, kPatienceNs);
+}
+
+void CommandQueue::submitEarly(CommandBuffer& cb) {
+    if (cb.overlapDraws_ == 0 || !cb.error_.empty() || cb.status_ > CommandBuffer::kEnqueued) return;
+    const std::vector<uint32_t>& w = cb.stream_.words();
+    if (cb.passEnds_.empty() || cb.passEnds_.back().words != w.size() || w.size() <= cb.sentWords_) return;
+    if (cb.passEnds_.back().draws - cb.earlyDraws_ < cb.overlapDraws_) return;
+    if (commitSeq_.load() != cb.overlapSeq_) { cb.overlapDraws_ = 0; return; }   // (another buffer was committed meanwhile: its order is kept)
+    std::vector<uint32_t> sub(w.begin() + cb.sentWords_, w.end());
+    std::vector<std::pair<uint32_t, uint32_t>> runs = pm4::ibRuns(sub);
+    if (runs.empty() || runs.size() > Gpu::kMaxSubmitCmds) { cb.overlapDraws_ = 0; return; }
+    for (auto& r : runs) r.first *= 4;
+    int error = 0;
+    std::unique_ptr<Bo> bo = takeCommandBo(4 * sub.size(), &error);
+    if (bo == nullptr) { cb.overlapDraws_ = 0; return; }
+    memcpy(bo->cpu(), sub.data(), 4 * sub.size());
+    std::lock_guard<std::mutex> g(lock_);
+    uint32_t fence = cb.fence_;
+    // (the buffers it uses so far: the later passes' are given with the later slices)
+    const int e = gpu_.submit(id_, *bo, runs, cb.uses_, &fence);
+    if (e != 0) {   // (nothing of it went in: the words stay for the commit, which gives them all and says what is wrong if it still is)
+        idle_.push_back(std::move(bo));
+        cb.overlapDraws_ = 0;
+        return;
+    }
+    cb.fence_ = fence;
+    cb.earlySubmitted_ = true;
+    cb.sentWords_ = uint32_t(w.size());
+    cb.earlyDraws_ = cb.passEnds_.back().draws;
+    cb.earlyBos_.push_back(std::move(bo));
+}
+
 CommandBuffer::~CommandBuffer() {
+    // (early slices still on the GPU of a buffer dropped before its commit or after an error: waited for before its memory goes)
+    if (earlySubmitted_ && !finished_ && status_ <= kEnqueued) queue_.waitEarly(*this);
     // (a buffer never completed may be destroyed with the GPU still on it -- an error -- and its stamps are then not
     // given back; one that completed has had its readers. Nor are a quarantined one's, which has let go of its queue:
     // the GPU may still write them, and the queue may be gone)
@@ -891,15 +934,23 @@ std::unique_ptr<Bo> CommandQueue::takeCommandBo(size_t bytes, int* error) {
 
 void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     cb->committedAt_ = gpu_.transport().nowNs();
+    cb->overlapDraws_ = 0;   // (the last pass is not given early: it goes with the commit)
     if (!cb->error_.empty()) {
-        cb->finish(CommandBuffer::kError);   // a blit that was refused: nothing of it reaches the GPU
+        waitEarly(*cb);
+        cb->finish(CommandBuffer::kError);   // a blit that was refused: nothing of it reaches the GPU (but early slices, waited for above)
         return;
     }
     cb->closePass();   // the last pass's tail
     // every command buffer ends with the GPU idle: what Metal's completion promises, that the work is done
     cb->stream_.waitMemWrites();
     cb->stream_.waitForIdle();
+    if (!cb->error_.empty()) {   // (the last pass's tail failed)
+        waitEarly(*cb);
+        cb->finish(CommandBuffer::kError);
+        return;
+    }
     const std::vector<uint32_t>& w = cb->stream_.words();
+    const uint32_t from = cb->sentWords_;   // (metal_overlap: the words before were given by early slices)
     // the stream as runs the GPU's IB_SIZE can count, cut between packets: one IB1 a run, run in order (a stream of
     // more than 2^20 words -- some thousands of draws in one command buffer -- was handed over as one, and the command
     // processor ran its size modulo 2^20)
@@ -918,7 +969,14 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
         }
         if (!cuts.empty()) cuts.emplace_back(from, uint32_t(w.size()));
     }
-    std::vector<std::pair<uint32_t, uint32_t>> runs = cuts.empty() ? pm4::ibRuns(w) : std::vector<std::pair<uint32_t, uint32_t>>{};
+    std::vector<std::pair<uint32_t, uint32_t>> runs;
+    if (cuts.empty()) {
+        if (from == 0) {
+            runs = pm4::ibRuns(w);
+        } else {
+            runs = pm4::ibRuns(std::vector<uint32_t>(w.begin() + from, w.end()));
+        }
+    }
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> sliceRuns;
     for (const auto& c : cuts) {
         std::vector<uint32_t> sub(w.begin() + c.first, w.begin() + c.second);
@@ -930,22 +988,24 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     if (runs.size() > Gpu::kMaxSubmitCmds) {
         cb->error_ = "a command stream of " + std::to_string(w.size()) + " words: more than the " + std::to_string(Gpu::kMaxSubmitCmds) +
                      " indirect buffers of " + std::to_string(pm4::kMaxIbWords) + " words one submission takes";
+        waitEarly(*cb);
         cb->finish(CommandBuffer::kError);
         return;
     }
     for (auto& r : runs) r.first *= 4;   // (in bytes into the command buffer's memory)
     for (const auto& sr : sliceRuns) {
-        if (sr.size() > Gpu::kMaxSubmitCmds) { sliceRuns.clear(); runs = pm4::ibRuns(w); for (auto& r : runs) r.first *= 4; break; }   // (too many in a slice: one submission as before)
+        if (sr.size() > Gpu::kMaxSubmitCmds) { sliceRuns.clear(); runs = pm4::ibRuns(from == 0 ? w : std::vector<uint32_t>(w.begin() + from, w.end())); for (auto& r : runs) r.first *= 4; break; }   // (too many in a slice: one submission as before)
     }
     int error = 0;
-    cb->commands_ = takeCommandBo(4 * w.size(), &error);
+    cb->commands_ = takeCommandBo(4 * (w.size() - from), &error);
     if (cb->commands_ == nullptr) {
         cb->error_ = std::string("no memory for the command stream: ") + strerror(error);
+        waitEarly(*cb);
         cb->finish(CommandBuffer::kError);
         return;
     }
     // the stream is written in order, as write-combined memory wants it, and read back by nobody
-    memcpy(cb->commands_->cpu(), w.data(), 4 * w.size());
+    memcpy(cb->commands_->cpu(), w.data() + from, 4 * (w.size() - from));
     std::unique_lock<std::mutex> g(lock_);  // the fences of one queue are handed out in commit order
     if (inflightLimit_ != 0 && thread_.get_id() != std::this_thread::get_id()) {   // (not on the waiter's own thread: a handler's commit)
         // (back-pressure: the waiter notifies as each buffer completes. A buffer waited for 2 s is given anyway.)
@@ -953,6 +1013,7 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
     }
     // (its words are in the GPU's buffer now: the memory goes to the next command buffer, a few kept at most)
     if (spareStreams_.size() < kSpareStreams) spareStreams_.push_back(cb->stream_.release());
+    commitSeq_++;
     cb->status_ = CommandBuffer::kCommitted;
     cb->faultsAtCommit_ = gpu_.faults();
     cb->submitCallAt_ = gpu_.transport().nowNs();
@@ -972,6 +1033,7 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
         cb->error_ = std::string("the driver refused the submission: ") + strerror(e);
         idle_.push_back(std::move(cb->commands_));
         g.unlock();                         // (the handlers may commit more: not under the queue's lock)
+        waitEarly(*cb);
         cb->finish(CommandBuffer::kError);
         return;
     }
@@ -1045,6 +1107,10 @@ void CommandQueue::waiter(const std::shared_ptr<bool>& orphaned) {
             cb->owner_.reset();           // (self holds the queue to the end of this turn)
         } else if (cb->commands_ != nullptr) {
             idle_.push_back(std::move(cb->commands_));
+        }
+        if (!poisoned) {
+            for (auto& bo : cb->earlyBos_) idle_.push_back(std::move(bo));   // (metal_overlap's slices: the GPU is done with them)
+            cb->earlyBos_.clear();
         }
         g.unlock();
         // The buffer let go of first (its stamps go back to the queue's pool, which SELF keeps), then the queue: SELF

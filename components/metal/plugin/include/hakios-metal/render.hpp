@@ -770,5 +770,7 @@ void encodeBytes(pm4::Stream& stream, uint64_t from, uint64_t to, uint64_t lengt
 
 namespace hakios::metal::render {
 // what the tails encoded since the last call (all recordings, a pass recorded both ways twice): waits for idle, flush events, waits for a word
+// metal_glass_lod (quarters of a mip level added to the minimum LOD of the blur and glass programs' samplers) and metal_glass_nearmip
+void setGlass(unsigned lodQuarters, bool nearMip);
 void tailCounts(unsigned* idles, unsigned* flushes, unsigned* waits);
 }  // namespace hakios::metal::render

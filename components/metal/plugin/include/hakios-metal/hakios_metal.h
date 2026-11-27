@@ -543,6 +543,10 @@ void hakios_metal_cb_set_gmem_binning(hakios_metal_cb *cb, int on);
 /* the tail of each pass: 0 the full flush and wait for idle (default), 1 the cache flush only for stages that store to buffers,
  * 2 also no wait for idle ahead of the flush events (boot-arg metal_pass_sync) */
 void hakios_metal_cb_set_pass_sync(hakios_metal_cb *cb, int level);
+/* metal_overlap=N: closed passes given to the GPU as the buffer is encoded, N draws a slice (0: all at commit) */
+/* metal_glass_lod / metal_glass_nearmip: the blur and glass programs' samplers read LOD_QUARTERS/4 mip levels coarser, with a nearest mip filter */
+void hakios_metal_set_glass(int lod_quarters, int near_mip);
+void hakios_metal_cb_set_overlap(hakios_metal_cb *cb, int draws);
 /* attachments a GMEM pass only clears are left out of the tiles and cleared by the 2D engine (boot-arg metal_gmem_clear2d=1) */
 void hakios_metal_cb_set_gmem_clear2d(hakios_metal_cb *cb, int on);
 /* what the pass tails encoded since the last call: waits for idle, flush events, waits for a flush's word */

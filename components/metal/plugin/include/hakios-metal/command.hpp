@@ -237,6 +237,10 @@ public:
     void setGmemClear2d(bool on) { gmemClear2d_ = on; }
     // metal_pass_sync (render::Options::tailSync): 0 the full flush and wait for idle after each pass, 1 and 2 less
     void setPassSync(uint8_t level) { passSync_ = level; }
+    // metal_overlap=N: a closed pass is given to the GPU as the buffer is still being encoded, once N draws have closed since the last
+    // slice, so the core runs this frame's early passes while the CPU encodes its later ones (0: all at commit, as before). Off for a
+    // buffer another buffer of the queue was committed in front of while this one was encoded, or one that waits for an event.
+    void setOverlap(unsigned draws);
     // every fragment texture the null texture (1x1, always in the texture cache): wrong pictures, but a draw's time then
     // says what its shader costs without its texture reads -- a measurement switch, as setGmemOff is a bisect's
     void setNullFsTextures(bool on) { nullFsTextures_ = on; }
@@ -493,6 +497,11 @@ private:
     HakiosFenceTimes kernelTimes_{};
     int64_t prevFinishFrom_ = 0, prevFinishTo_ = 0;   // when the waiter was busy finishing the buffer before this one (handlers, slabs)
     struct PassEnd { uint32_t words, draws; };
+    unsigned overlapDraws_ = 0, earlyDraws_ = 0;     // metal_overlap: draws per early slice, and the draws up to the last one cut
+    uint32_t sentWords_ = 0;                         // the words of stream_ already given to the GPU by early slices
+    uint64_t overlapSeq_ = 0;                        // the queue's commit count when this buffer began (a commit since = no early slices)
+    bool earlySubmitted_ = false;
+    std::vector<std::unique_ptr<Bo>> earlyBos_;      // the early slices' memory, until the buffer completes
     std::vector<PassEnd> passEnds_;                  // where each closed pass ends in stream_, and the draws up to there (submit's slices)
     bool haveKernelTimes_ = false;
 public:
@@ -589,6 +598,7 @@ private:
     void warmer();
     void wantSlabs(unsigned n);
     void submit(std::shared_ptr<CommandBuffer> cb);
+    void waitEarly(CommandBuffer& cb);   // a buffer that fails after early slices: the GPU is done with them before anything is freed
     void waiter(const std::shared_ptr<bool>& orphaned);
     std::unique_ptr<Bo> takeCommandBo(size_t bytes, int* error);
 
@@ -607,6 +617,8 @@ private:
     std::unordered_map<uint64_t, std::vector<std::shared_ptr<Buffer>>> freeBuffers_;   // by size: giveSlabs', giveBuffer's
     uint64_t freeBytes_ = 0;
     unsigned inflightLimit_ = 0;
+    std::atomic<uint64_t> commitSeq_{0};       // commits so far (under lock_ when raised): early slices keep the queue's commit order
+    void submitEarly(CommandBuffer& cb);       // a closed pass's words given to the GPU before the commit (metal_overlap)
     unsigned splitDraws_ = 0;                  // HAKIOS_METAL_SPLIT_DRAWS: a buffer's passes given to the GPU in slices of about this many draws
     int64_t finishFrom_ = 0, finishTo_ = 0;    // the waiter's last finish() (the next buffer's notice waits behind it)
     struct Resident { std::vector<uint32_t> words; std::shared_ptr<Buffer> buffer; };

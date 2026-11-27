@@ -29,6 +29,29 @@ namespace {
 
 using namespace a6xx;
 
+// metal_glass_lod / metal_glass_nearmip (the plug-in's boot-args): the samplers of the blur and glass fragment programs read a coarser mip
+std::atomic<uint32_t> gGlassLod88{0};      // levels added to the sampler's minimum LOD, 4.8 fixed point (0: off)
+std::atomic<bool> gGlassNearMip{false};    // the sampler's mip filter linear -> nearest: one mip's bilinear taps, not two's
+
+// a fragment program of Liquid Glass's blur chain, by its name: the blurs, the glass background, the Vfx downsample (_Isrc) and upsample (_Isup)
+bool glassProgram(const char* name) {
+    return name != nullptr && (strstr(name, "blur") != nullptr || strstr(name, "glass") != nullptr || strstr(name, "_Isrc") != nullptr ||
+                               strstr(name, "_Isup") != nullptr);
+}
+
+// the sampler words of a glass program's draw: a mipmapped sampler's minimum LOD raised and/or its mip filter made nearest
+void glassSampler(uint32_t w[4]) {
+    if (w[1] & A6XX_TEX_SAMP_1_MIPFILTER_LINEAR_FAR) return;   // (not a mipmapped sampler)
+    const uint32_t lod = gGlassLod88.load(std::memory_order_relaxed);
+    if (lod != 0) {
+        const uint32_t minLod = ((w[1] & A6XX_TEX_SAMP_1_MIN_LOD__MASK) >> A6XX_TEX_SAMP_1_MIN_LOD__SHIFT) + lod;
+        const uint32_t maxLod = (w[1] & A6XX_TEX_SAMP_1_MAX_LOD__MASK) >> A6XX_TEX_SAMP_1_MAX_LOD__SHIFT;
+        const uint32_t lo = std::min<uint32_t>(minLod, 4095), hi = std::max(maxLod, lo);
+        w[1] = (w[1] & ~(A6XX_TEX_SAMP_1_MIN_LOD__MASK | A6XX_TEX_SAMP_1_MAX_LOD__MASK)) | A6XX_TEX_SAMP_1_MIN_LOD(lo) | A6XX_TEX_SAMP_1_MAX_LOD(hi);
+    }
+    if (gGlassNearMip.load(std::memory_order_relaxed)) w[0] &= ~A6XX_TEX_SAMP_0_MIPFILTER_LINEAR_NEAR;
+}
+
 std::string n(uint64_t v) { return std::to_string(v); }
 
 // what the RB, SP_FS_MRT and the 2D engine's destination are given: the colour column of fd6_format_table.c, which
@@ -731,6 +754,7 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
         if ((k.samplerMask >> m) & 1) out->numSamp = m + 1;
     }
     memset(out->sampWords, 0, size_t(out->numSamp) * sizeof out->sampWords[0]);
+    const bool glassOn = (gGlassLod88.load(std::memory_order_relaxed) != 0 || gGlassNearMip.load(std::memory_order_relaxed)) && glassProgram(k.name);
     for (uint32_t m = 0; m < out->numSamp; m++) {
         if (((k.samplerMask >> m) & 1) == 0) continue;
         if (m >= b.samplers.size() || b.samplers[m] == nullptr) {
@@ -740,6 +764,7 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
             continue;
         }
         memcpy(out->sampWords[m], b.samplers[m]->words, 16);
+        if (glassOn && b.samplers[m]->words[0] != 0) glassSampler(out->sampWords[m]);
     }
     if (fs.numSamplerPrefetch > kMaxSamplerPrefetch) {
         return refuse(why, name + " has " + n(fs.numSamplerPrefetch) + " texture prefetches: ir3 makes at most " + n(kMaxSamplerPrefetch));
@@ -1283,6 +1308,11 @@ void passTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth 
 }
 
 }  // namespace
+
+void setGlass(unsigned lodQuarters, bool nearMip) {
+    gGlassLod88 = lodQuarters * 64;   // (quarters of a level: 256 is one)
+    gGlassNearMip = nearMip;
+}
 
 void tailCounts(unsigned* idles, unsigned* flushes, unsigned* waits) {
     *idles = gTailIdles.exchange(0);
@@ -3969,6 +3999,7 @@ void CommandBuffer::closePass() {
     stampEnd();
     passEnds_.push_back(PassEnd{uint32_t(stream_.words().size()), counts_.draws});
     retirePass();
+    if (overlapDraws_ != 0) queue_.submitEarly(*this);   // (metal_overlap)
 }
 
 std::unique_ptr<CommandBuffer::OpenPass> CommandBuffer::takePass() {
