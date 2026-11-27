@@ -1032,6 +1032,16 @@ void hakios_metal_cb_set_pass_sync(hakios_metal_cb* cb, int level) {
     cb->cb->setPassSync(l);
 }
 
+void hakios_metal_cb_set_overlap(hakios_metal_cb* cb, int draws) {
+    const unsigned n = draws < 0 ? 0 : unsigned(draws);
+    if (deferring(cb)) return cb->deferrer->post(cb->pending, [cb, n] { cb->cb->setOverlap(n); });
+    cb->cb->setOverlap(n);
+}
+
+void hakios_metal_set_glass(int lod_quarters, int near_mip) {
+    render::setGlass(lod_quarters < 0 ? 0 : unsigned(lod_quarters), near_mip != 0);
+}
+
 void hakios_metal_tail_counts(unsigned* idles, unsigned* flushes, unsigned* waits) { render::tailCounts(idles, flushes, waits); }
 
 void hakios_metal_cb_set_full_state(hakios_metal_cb* cb, int on) {

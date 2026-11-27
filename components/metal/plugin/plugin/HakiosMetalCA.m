@@ -619,6 +619,7 @@ static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled ren
 static unsigned hm_dirty_groups(void);                /* metal_dirty_groups=MASK: the tracked register groups, a bit each */
 static BOOL hm_full_state(void);                      /* metal_full_state=1: every draw encodes all its register state (no dirty tracking) */
 static BOOL hm_binning_on(void);
+static unsigned hm_overlap(void);                        /* metal_overlap=N: passes given to the GPU while the buffer is still encoded */
 static unsigned hm_pass_sync(void);                      /* metal_gmem_binning=1: the hardware's binning in GMEM passes */
 static unsigned hm_gmem_off(void);                    /* metal_gmem_off=N: GMEM's refinements off, by bit */
 - (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;
@@ -4273,13 +4274,25 @@ hm_compress_rt_ok(void)
  */
 static unsigned hm_rt8_stored[2], hm_rt8_excluded[5];
 static const char *const hm_rt8_why[5] = { "shared/managed storage", "PixelFormatView usage", "ShaderWrite usage", "not one 2D single-sample level", "core refused" };
+/* metal_rt8=1 as above. Two narrower variants, from the finding that 8-bit alone showed no gain (every target of 16 bits went, the
+ * full-screen ones whose bandwidth was not the cost, and the bands showed): metal_rt8=2 only the MEMORYLESS RGBA16Float attachments
+ * (never stored, so no banding is left in any texture; their cost is GMEM: 8 bytes a pixel of the tile instead of 4, i.e. twice the
+ * bins -- 56 tiles in the main pass -- and the blur's blends read and write them), and metal_rt8=3 that and the private RGBA16Float
+ * targets of at most HM_RT8_SMALL_PX pixels, the downsampled blur levels, whose 8 bits are re-blurred next and so band least.
+ * Full-size private targets and RG16Float stay as they are in both. */
+#define HM_RT8_SMALL_PX 700000u
+static int
+hm_rt8_mode(void)
+{
+	static int mode = -1;
+
+	if (mode < 0) mode = hm_boot_arg_set("metal_rt8=1") ? 1 : hm_boot_arg_set("metal_rt8=2") ? 2 : hm_boot_arg_set("metal_rt8=3") ? 3 : 0;
+	return mode;
+}
 static BOOL
 hm_rt8_on(void)
 {
-	static int on = -1;
-
-	if (on < 0) on = hm_boot_arg_set("metal_rt8=1");
-	return on;
+	return hm_rt8_mode() != 0;
 }
 static unsigned
 hm_rt8_format(MTLTextureDescriptor *d, int *why)
@@ -4289,6 +4302,12 @@ hm_rt8_format(MTLTextureDescriptor *d, int *why)
 
 	*why = -1;
 	if (!hm_rt8_on() || (pf != MTLPixelFormatRGBA16Float && pf != MTLPixelFormatRG16Float) || (u & MTLTextureUsageRenderTarget) == 0) return 0;
+	if (hm_rt8_mode() >= 2) {
+		const BOOL memoryless = [d storageMode] == MTLStorageModeMemoryless;
+		const BOOL small = hm_rt8_mode() == 3 && (NSUInteger)[d width] * [d height] <= HM_RT8_SMALL_PX;
+
+		if (pf != MTLPixelFormatRGBA16Float || !(memoryless || small)) return 0;
+	}
 	if ([d storageMode] != MTLStorageModePrivate && [d storageMode] != MTLStorageModeMemoryless) *why = 0;
 	else if (u & MTLTextureUsagePixelFormatView) *why = 1;
 	else if (u & MTLTextureUsageShaderWrite) *why = 2;
@@ -6233,6 +6252,22 @@ HM_REFUSES_OUT_LOUD
 		hakios_metal_cb_set_gmem_binning(_cb, hm_binning_on());
 		hakios_metal_cb_set_pass_sync(_cb, hm_pass_sync());
 		{
+			static int glassTold;   /* boot-args metal_glass_lod=Q (quarters of a mip level coarser; 4 = one more downsample level) and metal_glass_nearmip=1 */
+
+			if (!glassTold) {
+				char args[1024] = {0};
+				size_t size = sizeof(args) - 1;
+				const char *at;
+				int lod = 0;
+
+				glassTold = 1;
+				if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_glass_lod=")) != NULL) lod = atoi(at + strlen("metal_glass_lod="));
+				hakios_metal_set_glass(lod < 0 ? 0 : lod > 12 ? 12 : lod, hm_boot_arg_set("metal_glass_nearmip=1"));
+				hm_print("glass: metal_glass_lod=%d quarter levels, metal_glass_nearmip=%d\n", lod, hm_boot_arg_set("metal_glass_nearmip=1") ? 1 : 0);
+			}
+		}
+		if (hm_overlap() != 0 && ![queue hakiosDeferring]) hakios_metal_cb_set_overlap(_cb, (int)hm_overlap());
+		{
 			static int clear2d = -1;   /* boot-arg metal_gmem_clear2d=1 (default off) */
 
 			if (clear2d < 0) {
@@ -6842,6 +6877,32 @@ hm_pass_sync(void)
 		hm_print("pass tails: metal_pass_sync=%d\n", level);
 	}
 	return (unsigned)level;
+}
+
+/* boot-arg metal_overlap=N (default 0 = off): CPU/GPU overlap. A command buffer's words went to the GPU only at -commit, so for
+ * the 5 to 30 ms a frame took to encode (167 draws, 29 us each, then "a buffer made to committed 12 ms on average") the core had
+ * nothing of that frame, and was 50% busy while frames ran late (logs 112144, 111529). With N the plug-in gives each closed pass to
+ * the GPU as soon as at least N draws have closed since the last slice, the rest at the commit; the fences complete in order, the
+ * last is the buffer's. Not with metal_defer, not for a buffer that waits for an event, and a buffer that another was committed
+ * in front of is given whole. N=1 slices after every pass. */
+static unsigned
+hm_overlap(void)
+{
+	static int n = -1;
+
+	if (n < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+		const char *at;
+
+		n = 0;
+		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_overlap=")) != NULL) {
+			n = atoi(at + strlen("metal_overlap="));
+			if (n < 0) n = 0;
+		}
+		hm_print("overlap: metal_overlap=%d\n", n);
+	}
+	return (unsigned)n;
 }
 
 static BOOL
@@ -8303,6 +8364,7 @@ hm_note_handler(const char *kind, id handler)
 	}
 	if (_waits == nil) _waits = [[NSMutableArray alloc] init];
 	[_waits addObject:@[ event, @(value) ]];
+	if (_cb != NULL) hakios_metal_cb_set_overlap(_cb, 0);   /* (metal_overlap: what waits for an event goes whole, at the commit) */
 }
 
 /* Sent by the window server to every command buffer it makes (78 unrecognized-selector aborts in one boot): declared on
