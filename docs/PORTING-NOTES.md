@@ -113,11 +113,13 @@ Look the equivalents up for your SoC; don't copy them.
 - **The L3 clock on OSM SoCs.** It has its own OSM block 0x2000 before the cores' (davinci 0x18321000;
   `osm_l3_base` in `<soc>.dtsi`), with the same layout as the core groups: table at 0x110, 32 bytes a row,
   the wanted row at 0x920. `l3=1 l3_probe=1` raises it and measures a 2 MB pointer chase before and after.
+  davinci: the bootloader leaves row 7 (1190 MHz). The top row (1459 MHz) cut the chase from 97.1 to 89.8 ns,
+  so davinci raises it by default (`l3=0` leaves it alone).
 - **LLCC slice IDs per SoC.** Take them from `llcc-<soc>.c`. sdmmagpie: cpuss 1 (512 KB), gpuhtw 11, gpu 12.
   - On the GPU side, A618 takes kgsl's CX_MISC path: SYSTEM_CACHE_CNTL_1 gets five 5-bit GPU SCIDs, with the
     HTW SCID at bit 25, and SYSTEM_CACHE_CNTL_0 = 3.
-  - Off by default (`llcc=2` turns it on). On SM7325 the CPU slice made the pointer chase faster with no
-    UI change; not yet measured on davinci.
+  - Off by default (`llcc=2` turns it on). On SM7325 the CPU slice made the pointer chase faster with no UI change.
+    davinci (LLCC v1.1.2, 2 banks): 2 MB chase 93.5 -> 82.2 ns, nothing measurable from 3 MB up. Left off.
 - **Governor (davinci).** `pm_gov` is on by default:
   - a 250 ms top-speed boost on touch;
   - otherwise 1.5x headroom over load, fast up and slow down;
@@ -181,6 +183,16 @@ Look the equivalents up for your SoC; don't copy them.
     local symbols info at header 0x48, its entries keyed by the image's offset from 0x180000000.
   - davinci finding: CA's render server (`CA::Render::Server::server_thread`) waits long only right after
     unlock. During the benchmark's pauses it is idle, waiting for app commits, so look at the clients.
+- **Unlock right after boot.** SpringBoard's threads wait in synchronous XPC calls
+  (`_dispatch_mach_send_and_wait_for_reply`) for up to 47 s. The callees are runningboardd, backboardd, biomed,
+  iconservicesagent, MTLCompilerService and misd, plus one port no process owned at that moment (probably a service
+  still being started on demand). That is the 10-20 s freeze at the start of the benchmark: every service starting
+  cold at once. `wpm` lines name the receiving process (`to PID NAME`).
+- **Old frames flashing in zero-copy mode.** When a frame can't be shown zero-copy, the panel must not go back to the
+  copy framebuffer before the new frame has been copied into it. That buffer still holds whatever was copied
+  before zero-copy began. Fixed by deferring the switch (`fb_restore_late`).
+- **Every-boot permission alerts block scripted runs.** Example: Wallet's "allow notifications" alert. Answer it
+  once with `/var` saved (`var_store=1`) so it isn't asked again.
 - **Wrong earlier hypotheses, so you don't retry them:**
   - memory exhaustion;
   - the 56k uber shader;
