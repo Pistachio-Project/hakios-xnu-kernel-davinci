@@ -322,6 +322,7 @@ static uint64_t gScanoutReleaseSum, gScanoutReleaseMax, gScanoutReleaseN;
 static unsigned gScanoutDeferred;               /* (fb_scanout_ring=2) swaps whose flip is on its way and which are not completed yet */
 static class IOMobileFramebuffer * gScanoutDeferredFb;
 extern "C" void hakios_display_scanout_on_latch(void (*hook)(void));
+extern "C" void hakios_display_scanout_irq_wait(bool on);
 extern "C" void hakios_display_scanout_stats(uint64_t out[8]);
 extern "C" uint64_t hakios_display_te_irqs(void);
 static uint64_t gScanoutLatchSeenAt, gScanoutLatchTe;   /* (ring=2) when a flip's taking over was first seen here, and the refresh interrupts counted then */
@@ -1102,7 +1103,11 @@ IOMobileFramebuffer::start(IOService * provider)
 		if (gScanoutReady) {
 			gScanoutLock = IOLockAlloc();
 			gScanoutCall = thread_call_allocate(scanoutTimer, NULL);
-			hakios_display_scanout_on_latch(scanoutOnLatch);
+			if (gScanoutRing == 2) {
+				/* (only ring 2: ring 0 and 1 wait and poll as they always did) */
+				hakios_display_scanout_on_latch(scanoutOnLatch);
+				hakios_display_scanout_irq_wait(true);
+			}
 			if (gScanoutLock == NULL || gScanoutCall == NULL) {
 				gScanoutReady = false;
 			}
@@ -2378,6 +2383,7 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 			gScanoutFails = 0;
 			if (gScanoutRing == 2) {
 				gScanoutRing = 1;               /* (the ring copy, as the default does) */
+				hakios_display_scanout_irq_wait(false);
 				IOLog("MiniIOMobileFramebuffer: fb_scanout: ring 2 gives up: the ring copy (ring 1) from now on\n");
 			} else {
 				gScanoutGaveUp = true;

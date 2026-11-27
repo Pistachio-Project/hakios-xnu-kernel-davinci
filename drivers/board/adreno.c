@@ -4669,6 +4669,7 @@ static bool te_on, te_given_up;
 static uint64_t te_count;
 static uint32_t te_wake_event;
 static void (*scanout_latch_hook)(void);
+static bool scanout_irq_wait;           /* the flip waits sleep on the refresh interrupt (fb_scanout_ring=2 only; else the 200 us poll as ever) */
 
 static struct {
 	bool open, on, broken;
@@ -4794,7 +4795,7 @@ scanout_wait(bool may_sleep)
 	nanoseconds_to_absolutetime(60 * NSEC_PER_MSEC, &limit);
 	until += limit;
 	while ((now = mach_absolute_time()) < until) {
-		if (te_on && !te_given_up) {
+		if (te_on && !te_given_up && scanout_irq_wait) {
 			uint64_t before = __atomic_load_n(&te_count, __ATOMIC_SEQ_CST);
 
 			scanout_stats.irq_waits++;
@@ -4879,6 +4880,13 @@ void
 hakios_display_scanout_rearm(void)
 {
 	scanout.broken = false;
+}
+
+void hakios_display_scanout_irq_wait(bool on);
+void
+hakios_display_scanout_irq_wait(bool on)
+{
+	scanout_irq_wait = on;
 }
 
 /* The display driver's call when the refresh interrupt has seen the last flip taken over (interrupt context: wake a thread, nothing more). */
