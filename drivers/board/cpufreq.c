@@ -168,6 +168,7 @@ raise_domain(uint32_t domain, uint32_t cores)
  * a first look, 8.11 against 6.83, did not come again). So it is left where the boot loader put it.
  */
 #define L3_EPSS                 0x18590000
+#define L3_OSM_SM7150           0x18321000
 #define L3_CHASE_BYTES          (2u << 20)
 #define L3_CHASE_STEPS          (1u << 20)
 
@@ -192,7 +193,8 @@ l3_chase_ns(vm_offset_t buffer)
 static void
 l3_raise(void)
 {
-	const struct cpufreq_hw_layout *l3 = &cpufreq_hw_layouts[HAKIOS_CPUFREQ_EPSS];  /* (EPSS's, on either kind of chip) */
+	const struct cpufreq_hw_layout *l3 = &cpufreq_hw_layouts[HAKIOS_CPUFREQ_EPSS];  /* (EPSS's; an OSM chip's below) */
+	vm_offset_t l3_pa = L3_EPSS;
 	uint32_t enabled = 0, probe = 0, top = 0, top_khz = 0, was, lines = L3_CHASE_BYTES / 64, seed = 12345;
 	vm_offset_t base, buffer = 0;
 	char line[600];
@@ -203,11 +205,15 @@ l3_raise(void)
 	if (enabled == 0 && probe == 0) {
 		return;
 	}
-	if (hakios_board()->cpufreq.epss != L3_EPSS + 0x1000) {
+	if (hakios_board()->cpufreq.block == HAKIOS_CPUFREQ_OSM && hakios_board()->cpufreq.epss == L3_OSM_SM7150 + 0x2000) {
+		/* SM7150 (davinci): the L3's own OSM block 0x2000 before the cores' (Linux osm-l3.c: the table at 0x110, 32 a row, the row wanted at 0x920) */
+		l3 = &cpufreq_hw_layouts[HAKIOS_CPUFREQ_OSM];
+		l3_pa = L3_OSM_SM7150;
+	} else if (hakios_board()->cpufreq.epss != L3_EPSS + 0x1000) {
 		tell("l3: not this SoC's layout (the cores' EPSS at %#x): left alone\n", hakios_board()->cpufreq.epss);
 		return;
 	}
-	base = ml_io_map(L3_EPSS, 0x1000);
+	base = ml_io_map(l3_pa, 0x1000);
 	for (uint32_t row = 0; row < CPUFREQ_HW_ROWS; row++) {
 		uint32_t khz = cpufreq_hw_khz(*(volatile uint32_t *)(base + cpufreq_hw_row(l3, row)));
 
