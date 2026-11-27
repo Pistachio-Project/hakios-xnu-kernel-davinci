@@ -4634,6 +4634,7 @@ dpu_pipeline(void)
 #define DPU_CTL0                0x2000u
 #define DPU_CTL_FLUSH           0x018u
 #define DPU_FLUSH_VIG0          (1u << 0)
+#define DPU_CTL_START           0x01cu          /* Linux's CTL_START: sends a frame; written only to shake a flush that was not taken */
 #define DPU_VIG0                0x5000u
 #define SSPP_SRC_SIZE           0x000u
 #define SSPP_SRC_IMG_SIZE       0x004u
@@ -4684,8 +4685,9 @@ static struct {
 
 /* stats of the flips, per 5 s line of the display driver (hakios_display_scanout_stats) */
 static struct {
-	uint64_t flips, by_irq, by_poll, lat_sum, lat_max, lat_n, irq_waits, irq_timeouts;
+	uint64_t flips, by_irq, by_poll, lat_sum, lat_max, lat_n, irq_waits, irq_timeouts, aligned, reflush, startkick, misses;
 } scanout_stats;
+static uint64_t te_last, te_period;      /* the latest refresh interrupt and the distance between them (below: te_handler) */
 
 /* What the eye sees: when each flip was taken over by the panel (the refresh interrupt's time), and the distance between them. */
 #define PACE_BUCKETS 64                         /* 1 ms each, the last takes all above */
@@ -4704,6 +4706,38 @@ static uint32_t
 scanout_get(uint32_t offset)
 {
 	return rd(scanout.mdp.base + DPU_VIG0 + offset);
+}
+
+/*
+ * (ring 2) A flush written in the hair's breadth around a refresh's start (the tear-effect pulse, the RD_PTR interrupt a line after it) can be
+ * overlooked by the display: Linux's command-mode kickoff takes care to write between the refreshes. So a flush about to be written within 0.8 ms
+ * before, or 0.2 ms after, the predicted pulse waits until 0.2 ms after it. Cheap: spin of 1 ms at most, and only ring 2 (scanout_irq_wait).
+ */
+static void
+scanout_align(void)
+{
+	uint64_t now, last = __atomic_load_n(&te_last, __ATOMIC_SEQ_CST), p, phase, wait_ns = 0, ns_now, ns_last;
+
+	if (!scanout_irq_wait || !te_on || te_given_up || te_period == 0 || last == 0) {
+		return;
+	}
+	now = mach_absolute_time();
+	absolutetime_to_nanoseconds(now, &ns_now);
+	absolutetime_to_nanoseconds(last, &ns_last);
+	absolutetime_to_nanoseconds(te_period, &p);
+	if (p < 10000000 || p > 25000000 || ns_now < ns_last) {
+		return;
+	}
+	phase = (ns_now - ns_last) % p;
+	if (phase <= 200000) {
+		wait_ns = 200000 - phase;
+	} else if (p - phase <= 800000) {
+		wait_ns = p - phase + 200000;
+	}
+	if (wait_ns != 0) {
+		scanout_stats.aligned++;
+		spin_us((uint32_t)(wait_ns / 1000) + 1);
+	}
 }
 
 /* ctl0's flush of vig0; the display takes it over at the next frame start and then clears the bit (scanout.pend: not seen yet) */
@@ -4791,10 +4825,26 @@ scanout_wait(bool may_sleep)
 	}
 	uint64_t until = mach_absolute_time() + 0, now;
 	uint64_t limit;
+	bool reflushed = false, started = false;
 
 	nanoseconds_to_absolutetime(60 * NSEC_PER_MSEC, &limit);
 	until += limit;
 	while ((now = mach_absolute_time()) < until) {
+		if (scanout_irq_wait && !started) {
+			/* (ring 2) a flush not taken over in 2.3 refreshes is written again; in 3, a start is sent: the display is not idle-waiting for it */
+			uint64_t waited;
+
+			absolutetime_to_nanoseconds(now - scanout.kick_at, &waited);
+			if (waited >= 38000000 && !reflushed && __atomic_load_n(&scanout.pend, __ATOMIC_SEQ_CST) != 0) {
+				reflushed = true;
+				scanout_stats.reflush++;
+				wr(scanout.mdp.base + DPU_CTL0 + DPU_CTL_FLUSH, DPU_FLUSH_VIG0);
+			} else if (waited >= 50000000 && __atomic_load_n(&scanout.pend, __ATOMIC_SEQ_CST) != 0) {
+				started = true;
+				scanout_stats.startkick++;
+				wr(scanout.mdp.base + DPU_CTL0 + DPU_CTL_START, 1);
+			}
+		}
 		if (te_on && !te_given_up && scanout_irq_wait) {
 			uint64_t before = __atomic_load_n(&te_count, __ATOMIC_SEQ_CST);
 
@@ -4822,7 +4872,11 @@ scanout_wait(bool may_sleep)
 		}
 		sleep_us(200);
 	}
-	return scanout_latched();
+	if (scanout_latched()) {
+		return true;
+	}
+	scanout_stats.misses++;
+	return false;
 }
 
 static bool
@@ -4898,9 +4952,9 @@ hakios_display_scanout_on_latch(void (*hook)(void))
 }
 
 /* Read and reset: flips, taken over seen by the interrupt / by a poll, the latch's latency (kick to seen, ns) sum, max and count, waits on the interrupt, ones that timed out. */
-void hakios_display_scanout_stats(uint64_t out[8]);
+void hakios_display_scanout_stats(uint64_t out[12]);
 void
-hakios_display_scanout_stats(uint64_t out[8])
+hakios_display_scanout_stats(uint64_t out[12])
 {
 	out[0] = scanout_stats.flips;
 	out[1] = scanout_stats.by_irq;
@@ -4910,6 +4964,10 @@ hakios_display_scanout_stats(uint64_t out[8])
 	out[5] = scanout_stats.lat_n;
 	out[6] = scanout_stats.irq_waits;
 	out[7] = scanout_stats.irq_timeouts;
+	out[8] = scanout_stats.aligned;
+	out[9] = scanout_stats.reflush;
+	out[10] = scanout_stats.startkick;
+	out[11] = scanout_stats.misses;
 	memset(&scanout_stats, 0, sizeof(scanout_stats));
 }
 
@@ -5081,6 +5139,7 @@ hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint
 	}
 	bool taken = true;
 
+	scanout_align();
 	if (wait) {
 		taken = scanout_flush(true);
 	} else {
@@ -5355,7 +5414,7 @@ bool hakios_display_te_alive(void);
 static vm_offset_t te_top, te_pp, te_itear, te_intf;
 static void (*te_callback)(uint64_t at);
 static bool te_attached;
-static uint64_t te_spurious, te_last, te_intf_count;
+static uint64_t te_spurious, te_intf_count;
 
 static void
 te_handler(__unused void *context, __unused uint32_t intid)
@@ -5374,6 +5433,15 @@ te_handler(__unused void *context, __unused uint32_t intid)
 		}
 		if (istatus & TE_ITEAR_RD_PTR) {
 			__atomic_fetch_add(&te_intf_count, 1, __ATOMIC_SEQ_CST);
+		}
+		{
+			uint64_t prev = te_last, dt = at - prev, lo, hi;
+
+			nanoseconds_to_absolutetime(10000000, &lo);
+			nanoseconds_to_absolutetime(25000000, &hi);
+			if (prev != 0 && dt > lo && dt < hi) {
+				te_period = te_period != 0 ? te_period - te_period / 16 + dt / 16 : dt;
+			}
 		}
 		__atomic_store_n(&te_last, at, __ATOMIC_SEQ_CST);
 		__atomic_fetch_add(&te_count, 1, __ATOMIC_SEQ_CST);
