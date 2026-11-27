@@ -354,6 +354,14 @@ static uint32_t gScanoutRingAddress[SCANOUT_RING], gScanoutRingBytes, gScanoutRi
 static bool gScanoutRingOn, gScanoutRingFailed;
 static uint64_t gScanoutCopyTime, gScanoutCopyMax;      /* stats (absolute time) */
 static MiniIOSurface * gScanoutHeld;            /* the surface the pipe fetches now (or the latest flip, not latched yet) */
+/*
+ * Back to copying, deferred: the pipe stays on the surface it fetches until this frame has been copied into the panel's
+ * memory, and only then goes back to it (fb_restore_late=0: at once, as before). At once, the panel showed what that
+ * memory last held -- a frame from before zero copy began -- for a refresh or more: the "old frames" seen flashing.
+ */
+static TUNABLE(uint32_t, gScanoutRestoreLate, "fb_restore_late", 1);
+static bool gScanoutRestorePending;
+static const char * gScanoutRestoreWhy;
 static MiniIOSurface * gScanoutPrev;            /* the surface before it, while the display may still be fetching it */
 static IOLock * gScanoutLock;                   /* around the two and the pipe's registers */
 static thread_call_t gScanoutCall;
@@ -2277,7 +2285,10 @@ IOMobileFramebuffer::scanoutFrame(const uint8_t * swap, MiniIOSurface ** surface
 	}
 	IOLockLock(gScanoutLock);
 	if (why != NULL) {
-		if (gScanoutHeld != NULL || gScanoutRingOn) {
+		if (gScanoutRestoreLate != 0 && gScanoutHeld != NULL && !gScanoutRingOn) {
+			gScanoutRestorePending = true;          /* (done in show() once this frame is copied: scanoutRestoreLate) */
+			gScanoutRestoreWhy = why;
+		} else if (gScanoutHeld != NULL || gScanoutRingOn) {
 			hakios_display_scanout_restore();
 			gScanoutRingOn = false;
 			scanoutRelease();
@@ -2719,6 +2730,24 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	composed = mach_absolute_time();
 	if (!direct) {
 		copyBackBuffer();
+	}
+	if (gScanoutRestorePending) {
+		/* this frame is in the panel's memory now: the pipe may go back to it (see gScanoutRestoreLate) */
+		static uint32_t told;
+
+		IOLockLock(gScanoutLock);
+		if (gScanoutRestorePending) {
+			gScanoutRestorePending = false;
+			if (!direct && gScanoutHeld != NULL) {
+				hakios_display_scanout_restore();
+				gScanoutRingOn = false;
+				scanoutRelease();
+				if (told++ < 20) {
+					IOLog("MiniIOMobileFramebuffer: fb_scanout: back to copying (%s), after the frame was copied\n", gScanoutRestoreWhy);
+				}
+			}
+		}
+		IOLockUnlock(gScanoutLock);
 	}
 	if (fScanTarget != 0) {
 		uint64_t up = usToAbs(500), down = usToAbs(100), floor = usToAbs(1000), ceiling = usToAbs(8000);
