@@ -351,9 +351,12 @@ static struct wp_target {
 	struct wp_thr *thr;
 	struct wp_agg *agg;
 	uint32_t nagg, samples, lost;
+	uint8_t slide_told;
 } wp_t[WP_MAXT];
 static unsigned wp_n;
 static uint32_t wp_long_ms = 30, wp_secs = 5;
+/* the short "wpm" line of a long mach_msg2 wait (keep_words=wpm keeps them): from uptime waitprof_after s (with ui_bench: 85, its window) */
+static uint32_t wp_after_s;
 
 extern void loader_log_line(const char *line);
 extern boolean_t machine_thread_on_core(thread_t thread);
@@ -595,6 +598,11 @@ wp_end_episode(struct wp_target *tg, struct wp_thr *th)
 		}
 		WPSAY("waitprof: %s %s at %llu.%03llu s: tid %llu '%s' %llu ms %s", tg->name, th->kind == 1 ? "LONG" : "RUNNABLE",
 		    th->last / NSEC_PER_SEC, th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, d);
+		if (th->kind == 1 && th->w.trap == (uint64_t)-47 && th->last / NSEC_PER_SEC >= wp_after_s) {
+			WPSAY("wpm %llu.%03llu %llu '%.20s' %llums r%#x t%u m%u %llx %llx %llx %llx", th->last / NSEC_PER_SEC,
+			    th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, th->w.rcv, th->w.utmo, th->w.msgid,
+			    th->w.ubt[0], th->w.ubt[1], th->w.ubt[2], th->w.ubt[3]);
+		}
 	}
 	th->kind = 0;
 }
@@ -753,12 +761,18 @@ wp_report(struct wp_target *tg)
 		struct user64_dyld_all_image_infos infos;
 		vm_map_t map = get_task_map_reference(tg->task);
 
-		if (map != VM_MAP_NULL) {
+		uint64_t up_ns;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &up_ns);
+		if (map != VM_MAP_NULL && !tg->slide_told && up_ns / NSEC_PER_SEC >= wp_after_s) {     /* (once, in the window: kept with wpm) */
+			tg->slide_told = 1;
 			if (tg->task->all_image_info_addr != 0 &&
 			    vm_map_read_user(map, tg->task->all_image_info_addr, &infos, sizeof(infos)) == KERN_SUCCESS) {
-				WPSAY("waitprof: %s: shared cache at %#llx slide %#llx", tg->name, infos.sharedCacheBaseAddress,
+				WPSAY("wpm cache %s: shared cache at %#llx slide %#llx", tg->name, infos.sharedCacheBaseAddress,
 				    infos.sharedCacheSlide);
 			}
+		}
+		if (map != VM_MAP_NULL) {
 			vm_map_deallocate(map);
 		}
 	}
@@ -864,6 +878,14 @@ waitprof_start(void)
 		return;
 	}
 	PE_parse_boot_argn("waitprof_ms", &wp_long_ms, sizeof(wp_long_ms));
+	{
+		uint32_t b;
+
+		if (PE_parse_boot_argn("ui_bench", &b, sizeof(b))) {
+			wp_after_s = 85;
+		}
+	}
+	PE_parse_boot_argn("waitprof_after", &wp_after_s, sizeof(wp_after_s));
 	PE_parse_boot_argn("waitprof_secs", &wp_secs, sizeof(wp_secs));
 	wp_secs = MAX(wp_secs, 1);
 	for (p = arg; *p != 0 && wp_n < WP_MAXT; p = q) {
