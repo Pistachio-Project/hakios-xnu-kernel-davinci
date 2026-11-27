@@ -5082,6 +5082,112 @@ hakios_display_scanout_reaches(uint64_t phys, uint64_t length)
 }
 
 /*
+ * Display fetch QoS (boot-arg fb_qos=0 turns it off): what Qualcomm programs for a linear real-time plane, which this driver never did --
+ * the pipe kept the splash's creq/danger/safe values while it now fetches another (scaled, zero-copy) surface. The values are
+ * sdmmagpie's (sdmmagpie-sde.dtsi: qos-lut-linear <0 0x00112222 0x22223357>, danger-lut[linear] 0xf, safe-lut-linear <0 0xfff8>,
+ * cdp-setting <1 1> (RT read enable), vbif-qos-rt-remap <3 3 4 4 5 5 6 6>); the registers are sde_hw_sspp.c's (SSPP_DANGER_LUT 0x60,
+ * SAFE_LUT 0x64, QOS_CTRL 0x6c, CREQ_LUT_0/1 0x74/0x78 (QOS_8LVL: vbif_qos_nlvl 8 for 5.2.0), CDP_CNTL 0x134) and sde_hw_vbif.c's
+ * (set_qos_remap: RP_REMAP 0x550 and LVL_REMAP 0x590, + 8 * level, + 4 for xin >= 8, nibble xin & 7; vig0's xin is 0). As sde_plane.c
+ * (_sde_plane_set_qos_lut, _set_danger_lut, _set_qos_ctrl(true, PANIC_CTRL), _set_qos_remap) and sde_vbif_set_qos_remap, which forces
+ * the pipe's clock on (top 0x2ac bit 0: qcom,sde-sspp-clk-ctrl for vig0) around the VBIF writes. Vblank qos is left off (as
+ * sde_plane.c's amortize path does). Again when the source's size or format changes.
+ */
+#define SSPP_DANGER_LUT         0x060u
+#define SSPP_SAFE_LUT           0x064u
+#define SSPP_QOS_CTRL           0x06cu
+#define SSPP_CREQ_LUT_0         0x074u
+#define SSPP_CREQ_LUT_1         0x078u
+#define SSPP_CDP_CNTL           0x134u
+#define QOS_CREQ_LINEAR_LO      0x22223357u
+#define QOS_CREQ_LINEAR_HI      0x00112222u
+#define QOS_DANGER_LINEAR       0x0000000fu
+#define QOS_SAFE_LINEAR         0x0000fff8u
+#define QOS_CTRL_DANGER_SAFE_EN 1u
+#define QOS_CDP_ENABLE          (1u << 0)
+#define QOS_CDP_PRELOAD_64      (1u << 3)       /* sde_plane.c passes SDE_WB_CDP_PRELOAD_AHEAD_64; sde_hw_sspp.c's setup_cdp sets bit 3 for it */
+#define DPU_VBIF                0xb0000u        /* vbif_phys 0x0aeb0000 minus mdp_phys 0x0ae00000 */
+#define DPU_VBIF_LEN            0x2008u
+#define VBIF_RP_REMAP_000       0x550u
+#define VBIF_LVL_REMAP_000      0x590u
+#define TOP_CLK_FORCE_VIG0      0x2acu          /* qcom,sde-sspp-clk-ctrl <0x2ac 0>: relative to the top block (DPU_TOP) */
+#define QOS_VIG0_XIN            0u              /* qcom,sde-sspp-xin-id[0] */
+static const uint8_t qos_rt_remap[8] = { 3, 3, 4, 4, 5, 5, 6, 6 };     /* qcom,sde-vbif-qos-rt-remap */
+static struct block scanout_vbif;
+static uint32_t scanout_qos_mode = 1, scanout_qos_size, scanout_qos_format;     /* boot-arg fb_qos; what it was programmed for */
+static bool scanout_qos_read, scanout_qos_done;
+
+static uint32_t
+scanout_vbif_remap(uint32_t reg_base)      /* vig0's nibble at each of the 8 levels, packed one nibble a level */
+{
+	uint32_t packed = 0;
+
+	for (uint32_t level = 0; level < 8; level++) {
+		uint32_t at = reg_base + level * 8 + ((QOS_VIG0_XIN & 8) >> 3) * 4;
+
+		packed |= ((rd(scanout_vbif.base + at) >> ((QOS_VIG0_XIN & 7) * 4)) & 0x7u) << (level * 4);
+	}
+	return packed;
+}
+
+static void
+scanout_qos_program(uint32_t size, uint32_t format)
+{
+	uint32_t before[6], after[6], rp_before, rp_after, force, shift = (QOS_VIG0_XIN & 7) * 4;
+	static const uint32_t regs[6] = { SSPP_CREQ_LUT_0, SSPP_CREQ_LUT_1, SSPP_DANGER_LUT, SSPP_SAFE_LUT, SSPP_QOS_CTRL, SSPP_CDP_CNTL };
+
+	if (!scanout_qos_read) {
+		scanout_qos_read = true;
+		PE_parse_boot_argn("fb_qos", &scanout_qos_mode, sizeof(scanout_qos_mode));
+	}
+	if (scanout_qos_mode == 0 || (scanout_qos_done && size == scanout_qos_size && format == scanout_qos_format)) {
+		return;
+	}
+	scanout_qos_size = size;
+	scanout_qos_format = format;
+	scanout_qos_done = true;
+	scanout_vbif.name = "vbif";
+	scanout_vbif.phys = scanout.mdp.phys + DPU_VBIF;
+	scanout_vbif.size = DPU_VBIF_LEN;
+	need(&scanout_vbif);
+	if (scanout_vbif.base == 0) {
+		return;
+	}
+	for (unsigned i = 0; i < 6; i++) {
+		before[i] = scanout_get(regs[i]);
+	}
+	rp_before = scanout_vbif_remap(VBIF_RP_REMAP_000);
+	scanout_put(SSPP_CREQ_LUT_0, QOS_CREQ_LINEAR_LO);
+	scanout_put(SSPP_CREQ_LUT_1, QOS_CREQ_LINEAR_HI);
+	scanout_put(SSPP_DANGER_LUT, QOS_DANGER_LINEAR);
+	scanout_put(SSPP_SAFE_LUT, QOS_SAFE_LINEAR);
+	scanout_put(SSPP_QOS_CTRL, QOS_CTRL_DANGER_SAFE_EN);
+	scanout_put(SSPP_CDP_CNTL, QOS_CDP_ENABLE | QOS_CDP_PRELOAD_64);
+	/* (sde_vbif_set_qos_remap: the pipe's clock forced on while the VBIF is written, and as it was after) */
+	force = rd(scanout.mdp.base + DPU_TOP + TOP_CLK_FORCE_VIG0);
+	wr(scanout.mdp.base + DPU_TOP + TOP_CLK_FORCE_VIG0, force | 1u);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (uint32_t level = 0; level < 8; level++) {
+		uint32_t at = level * 8 + ((QOS_VIG0_XIN & 8) >> 3) * 4, mask = 0x7u << shift, value;
+
+		value = (rd(scanout_vbif.base + VBIF_RP_REMAP_000 + at) & ~mask) | ((uint32_t)qos_rt_remap[level] << shift);
+		wr(scanout_vbif.base + VBIF_RP_REMAP_000 + at, value);
+		value = (rd(scanout_vbif.base + VBIF_LVL_REMAP_000 + at) & ~mask) | ((uint32_t)qos_rt_remap[level] << shift);
+		wr(scanout_vbif.base + VBIF_LVL_REMAP_000 + at, value);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!(force & 1u)) {
+		wr(scanout.mdp.base + DPU_TOP + TOP_CLK_FORCE_VIG0, force);
+	}
+	for (unsigned i = 0; i < 6; i++) {
+		after[i] = scanout_get(regs[i]);
+	}
+	rp_after = scanout_vbif_remap(VBIF_RP_REMAP_000);
+	printf("adreno: scanout: qos for %ux%u format %#x: creq %08x%08x -> %08x%08x danger %#x -> %#x safe %#x -> %#x ctrl %#x -> %#x cdp %#x -> %#x "
+	    "vbif remap (a nibble a level) %08x -> %08x\n", size & 0xffff, size >> 16, format, before[1], before[0], after[1], after[0],
+	    before[2], after[2], before[3], after[3], before[4], after[4], before[5], after[5], rp_before, rp_after);
+}
+
+/*
  * The surface at `phys` (width x height, `stride` bytes a row, 4 bytes a pixel) becomes vig0's picture, to be on the panel at the
  * next frame; waits for that. False: the display did not take it (the firmware's picture is put back, and nothing more is shown
  * this way).
@@ -5143,6 +5249,7 @@ hakios_display_scanout_show(uint32_t phys, uint32_t stride, uint32_t width, uint
 	} else {
 		scanout_put(DPU_QSEED + QSEED_OP_MODE, scanout.saved[11] & ~1u);
 	}
+	scanout_qos_program(size, scanout.saved[7] & ~SRC_FORMAT_ALPHA);
 	bool taken = true;
 
 	if (wait) {
