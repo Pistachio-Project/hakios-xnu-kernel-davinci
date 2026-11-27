@@ -316,7 +316,7 @@ static TUNABLE(uint32_t, gScanoutAsync, "fb_scanout_async", 1);
  * then never draws into a surface the display still fetches, and the presenter copies nothing (no 6 MB memcpy a frame). The flips wait for the
  * latch on that interrupt (adreno.c), and poll after 20 ms without one.
  */
-static TUNABLE(uint32_t, gScanoutRing, "fb_scanout_ring", 1);
+static TUNABLE(uint32_t, gScanoutRing, "fb_scanout_ring", 2);   /* 2 (zero copy, released on the TE interrupt) by default; 1: the ring copy */
 static uint64_t gScanoutKickAt;                 /* when the latest flip was kicked (for how long a surface is held after) */
 static uint64_t gScanoutReleaseSum, gScanoutReleaseMax, gScanoutReleaseN;
 static unsigned gScanoutDeferred;               /* (fb_scanout_ring=2) swaps whose flip is on its way and which are not completed yet */

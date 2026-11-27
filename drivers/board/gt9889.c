@@ -757,7 +757,7 @@ irq_dump(const char *when)
 	    f >> 2 & 1, f >> 3 & 1, f >> 4 & 3, r, irq_count);
 }
 
-static uint32_t irq_want;               /* boot-arg touch_irq */
+static uint32_t irq_want = 1;           /* boot-arg touch_irq (default 1: the interrupt, latch polled as fallback; 0: polled only) */
 static bool irq_attached, irq_mode;     /* the interrupt is ours / it is what the thread waits for */
 
 static void
