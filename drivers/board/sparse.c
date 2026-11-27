@@ -167,6 +167,9 @@ sparse_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag,
 	case DKIOCSETBLOCKSIZE:
 		/* spec_open() sets 512 and back, and takes a refusal for a broken device */
 		return (*(uint32_t *)data == SPARSE_SECTOR) ? 0 : EINVAL;
+	case DKIOCISSOLIDSTATE:
+		*(uint32_t *)data = 1;  /* flash or memory: see ufs.c */
+		return 0;
 	case DKIOCGETBLOCKCOUNT:
 		*(uint64_t *)data = sparse_block_count *
 		    (sparse_block_size / SPARSE_SECTOR);

@@ -913,6 +913,15 @@ ufs_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc
 	case DKIOCISWRITABLE:
 		*(uint32_t *)data = 0;  /* the block device, which is what a filesystem would ask */
 		return 0;
+	case DKIOCISSOLIDSTATE:
+		/*
+		 * Flash: without this answer spec_vnops.c takes the device for a spinning disk and throttles
+		 * low-priority I/O with its windows (up to 500 ms a page-in): geod, a LowPriorityIO job, took 40 s
+		 * of 600 ms page faults to start at boot, and audiomxd and SpringBoard waited on it (the freeze
+		 * after unlock).
+		 */
+		*(uint32_t *)data = 1;
+		return 0;
 	case DKIOCGETMAXBLOCKCOUNTREAD:
 		*(uint64_t *)data = ufs_buffer_size / ufs_bsize[part];
 		return 0;

@@ -346,6 +346,9 @@ blk_dev_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag,
 			return EINVAL;
 		}
 		return 0;
+	case DKIOCISSOLIDSTATE:
+		*(uint32_t *)data = 1;  /* flash or memory: see ufs.c */
+		return 0;
 	case DKIOCGETBLOCKCOUNT:
 		*(uint64_t *)data = d->capacity;
 		return 0;
