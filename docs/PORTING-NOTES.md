@@ -183,6 +183,16 @@ Look the equivalents up for your SoC; don't copy them.
     local symbols info at header 0x48, its entries keyed by the image's offset from 0x180000000.
   - davinci finding: CA's render server (`CA::Render::Server::server_thread`) waits long only right after
     unlock. During the benchmark's pauses it is idle, waiting for app commits, so look at the clients.
+- **Report flash as flash (`DKIOCISSOLIDSTATE`).** This was the post-unlock freeze, and it was ours. A block
+  driver that doesn't answer this ioctl makes spec_vnops.c treat the device as a spinning disk, so low-priority I/O
+  is throttled with the slow-disk periods (40-200 ms, windows up to 500 ms) instead of the flash ones (5-25 ms).
+  At boot the disk is always busy: geod (a `LowPriorityIO` job) spent about 40 s in 600 ms page faults inside
+  `throttle_lowpri_io`. audiomxd waited on geod before checking in its media services, and SpringBoard waited
+  20+ s on audiomxd. With the ioctl answered, the longest pause in the benchmark went from 9-13 s to 1.3-1.6 s,
+  and fps from 37-40 to 37.6/43.9. **Answer it in every block driver of a new port.**
+- **Finding a chain like that:** `waitprof=<process>` on the stuck client, then on each service it names. `t1`
+  in a `wpm` line means the destination port is in transit, queued on launchd's port for a service that hasn't
+  checked in; `svc` names it. The kernel stack frames (`k:`) symbolize against the unstripped kernel (slide 0).
 - **Unlock right after boot.** SpringBoard's threads wait in synchronous XPC calls
   (`_dispatch_mach_send_and_wait_for_reply`) for up to 47 s. The callees are runningboardd, backboardd, biomed,
   iconservicesagent, MTLCompilerService and misd, plus one port no process owned at that moment (probably a service
