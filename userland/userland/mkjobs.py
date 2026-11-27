@@ -358,6 +358,24 @@ def quiet_fairplayd(label, job):
         job['ThrottleInterval'] = FAIRPLAYD_THROTTLE
 
 
+# bluetoothd and spaceattributiond (logs/183854-run.log and the five runs before it: 9 and 8 spawns in the last 90 s,
+# one every ten seconds, alternating) exit at once and are started again on the next request. bluetoothd says
+#   "bluetoothd: No bluetooth on this device."   (after "marconi-bt: Unable to match bluetooth service in device tree.")
+# and leaves; it cannot be denied (audiomxd then looks up com.apple.bluetooth.xpc 16000 times a second, see
+# root26-darwin.sh), so it stays with every Mach service and only its restarts are spaced out, as for fairplayd:
+# the names stay registered in launchd, so audiomxd's lookups succeed and its messages wait instead of failing.
+# spaceattributiond (Settings > General > iPhone Storage) prints only the objc duplicate-class warning for
+# SASupport and exits, no signal, no crash report. Same treatment, shorter, since a Storage page may be waiting on it.
+THROTTLED = {'com.apple.bluetoothd': 600, 'com.apple.spaceattributiond': 300}
+
+
+def quiet_respawners(label, job):
+    """Jobs that exit at once and are asked for again (above) restarted at most every few minutes; any other as it is."""
+    if label in THROTTLED:
+        job['KeepAlive'] = False
+        job['ThrottleInterval'] = THROTTLED[label]
+
+
 angels = f'{src_root}/System/Library/LaunchAngels'
 os.makedirs(dest, exist_ok=True)
 for label in labels:
@@ -397,6 +415,7 @@ for label in labels:
     if 'all' in oslog or label in oslog:
         job.setdefault('EnvironmentVariables', {}).update(STDERR_LOG)
     quiet_fairplayd(label, job)
+    quiet_respawners(label, job)
     quiet_background(label, job)
     with open(f'{dest}/{label}.plist', 'wb') as f:
         plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
@@ -437,6 +456,7 @@ if rest:
         if label in oslog:
             job.setdefault('EnvironmentVariables', {}).update(STDERR_LOG)
         quiet_fairplayd(label, job)
+        quiet_respawners(label, job)
         quiet_background(label, job)
         with open(f'{dest}/{name}', 'wb') as f:
             plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
