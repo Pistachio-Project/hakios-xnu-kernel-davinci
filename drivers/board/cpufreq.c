@@ -299,15 +299,33 @@ l3_raise(void)
 #define LLCC_WRSC_CACHEABLE_EN  0x21f2c
 #define LLCC_CHASE_MAX          (6u << 20)
 
-static const struct llcc_slice {
+struct llcc_slice {
 	uint8_t id, priority, fixed, retain, activate;
 	uint16_t kb;
-} llcc_slices[] = {
+};
+static const struct llcc_slice llcc_slices_sc7280[] = {
 	{ 1, 1, 0, 1, 1, 768 },         /* CPUSS: the processors */
 	{ 11, 1, 1, 1, 0, 256 },        /* GPUHTW: the GPU's SMMU table walks */
 	{ 12, 1, 0, 1, 0, 512 },        /* GPU */
 	{ 13, 1, 1, 0, 1, 256 },        /* MMUHWT: the system SMMU's table walks */
 };
+/*
+ * SM7150 (davinci): msm-4.14's drivers/soc/qcom/llcc-sdmmagpie.c sdmmagpie_data[] (SCT_ENTRY: usecase = slice id,
+ * max_cap KB, priority, fixed_size, bonus 0xF, res 0, cache_mode 0, probe target 0, dis_cap_alloc 0, retain_on_pc 1,
+ * activate_on_init). Only the slices of a user here: cpuss 1 (512 KB, activate_on_init), gpuhtw 11 (256 KB, fixed),
+ * gpu 12 (256 KB, fixed); modem 8 and npu 23 are not touched. The GPU's two are activated here with the cpuss one
+ * (the vendor's kgsl activates "gpu" when the 3D core starts and "gpuhtw" with its SMMU; the registers the GPU
+ * needs to use them are written by adreno_a618.c, which asks hakios_llcc_gpu_scids()).
+ */
+static const struct llcc_slice llcc_slices_sm7150[] = {
+	{ 1, 1, 0, 1, 1, 512 },         /* cpuss: the processors */
+	{ 11, 1, 1, 1, 1, 256 },        /* gpuhtw: the GPU's SMMU table walks */
+	{ 12, 1, 1, 1, 1, 256 },        /* gpu */
+};
+static const struct llcc_slice *llcc_slices = llcc_slices_sc7280;
+static unsigned llcc_slice_count = sizeof(llcc_slices_sc7280) / sizeof(llcc_slices_sc7280[0]);
+static bool llcc_sm7150;
+static unsigned llcc_gpu_done;          /* bit 0: slice 11 activated, bit 1: slice 12 (SM7150) */
 static vm_offset_t llcc_bcast;
 static bool llcc_activated;
 
@@ -373,7 +391,13 @@ llcc_setup(void)
 		return;
 	}
 	/* (an SM8250's OSM is where an SM7325's EPSS is, and its slices are not these) */
-	if (hakios_board()->cpufreq.epss != L3_EPSS + 0x1000 || hakios_board()->cpufreq.block != HAKIOS_CPUFREQ_EPSS) {
+	if (hakios_board()->cpufreq.block == HAKIOS_CPUFREQ_OSM && hakios_board()->cpufreq.epss == L3_OSM_SM7150 + 0x2000) {
+		/* SM7150: the same addresses as the SC7280's (sdmmagpie.dtsi qcom,llcc@9200000: reg 0x9200000 0x450000,
+		 * banks-off 0x0 0x80000, broadcast-off 0x400000 = 0x9600000), its own slices */
+		llcc_slices = llcc_slices_sm7150;
+		llcc_slice_count = sizeof(llcc_slices_sm7150) / sizeof(llcc_slices_sm7150[0]);
+		llcc_sm7150 = true;
+	} else if (hakios_board()->cpufreq.epss != L3_EPSS + 0x1000 || hakios_board()->cpufreq.block != HAKIOS_CPUFREQ_EPSS) {
 		tell("llcc: not this SoC (the cores' %s at %#x): left alone\n", layout->name, hakios_board()->cpufreq.epss);
 		return;
 	}
@@ -411,7 +435,7 @@ llcc_setup(void)
 	if (buffer != 0) {
 		llcc_chase_all(buffer, perm, "before");
 	}
-	for (unsigned i = 0; i < sizeof(llcc_slices) / sizeof(llcc_slices[0]); i++) {
+	for (unsigned i = 0; i < llcc_slice_count; i++) {
 		const struct llcc_slice *s = &llcc_slices[i];
 		uint32_t lines = s->kb * 1024u / banks / 64, bit = 1u << s->id;
 
@@ -430,6 +454,9 @@ llcc_setup(void)
 			bool done = llcc_act(s->id, true);
 
 			llcc_activated = llcc_activated || done;
+			if (llcc_sm7150 && done && (s->id == 11 || s->id == 12)) {
+				llcc_gpu_done |= s->id == 11 ? 1u : 2u;
+			}
 			tell("llcc: slice %u (%u KB) activated: %s, state %#x\n", s->id, s->kb, done ? "yes" : "NO",
 			    *(volatile uint32_t *)(llcc_bcast + LLCC_ACT_STATUS(s->id)));
 		}
@@ -441,6 +468,18 @@ llcc_setup(void)
 	}
 }
 
+/* For adreno_a618.c (the cpufreq steps run first): the GPU's two slices are on (llcc=2 on SM7150), and what they are. */
+bool
+hakios_llcc_gpu_scids(uint32_t *gpu, uint32_t *gpuhtw)
+{
+	if (llcc_gpu_done != 3) {
+		return false;
+	}
+	*gpu = 12;
+	*gpuhtw = 11;
+	return true;
+}
+
 /* On the way back to the loader (interrupts off): the slices activated above, deactivated. */
 static void
 llcc_quiesce(void)
@@ -449,7 +488,7 @@ llcc_quiesce(void)
 		return;
 	}
 	llcc_activated = false;
-	for (unsigned i = 0; i < sizeof(llcc_slices) / sizeof(llcc_slices[0]); i++) {
+	for (unsigned i = 0; i < llcc_slice_count; i++) {
 		if (llcc_slices[i].activate) {
 			(void)llcc_act(llcc_slices[i].id, false);
 		}

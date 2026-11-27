@@ -108,6 +108,7 @@ int hakios_rpmh_ddr_vote(uint32_t vote, bool send);
 #include "log.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern bool hakios_llcc_gpu_scids(uint32_t *gpu, uint32_t *gpuhtw);       /* cpufreq.c: llcc=2 on SM7150 */
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 /* Mach MIG declaration is not included by BSD's exported thread.h. */
@@ -2661,6 +2662,33 @@ zap_load(void)
 	return true;
 }
 
+/*
+ * The system cache (LLCC) for the GPU, when cpufreq.c has activated its two slices (boot-arg llcc=2). kgsl
+ * a6xx_start() calls the gpudev's llc_configure_gpu_scid, llc_configure_gpuhtw_scid and llc_enable_overrides
+ * (adreno_a6xx.c a6xx_llc_*). A618 is not in their A640/A612/A610/A680 list, which program the GBIF
+ * (SCACHE_CNTL1) instead and leave the rest to the boot loader, so it takes the CX_MISC path: SYSTEM_CACHE_CNTL_1
+ * [24:0] five 5-bit SCIDs, all the "gpu" slice's (12; msm-4.14 llcc-sdmmagpie.c), [29:25] the GPUHTW's (11);
+ * SYSTEM_CACHE_CNTL_0 = 3 (read-allocate, no write-allocate override). Constants: a6xx_reg.h
+ * A6XX_LLC_NUM_GPU_SCIDS 5, A6XX_GPU_LLC_SCID_NUM_BITS 5, A6XX_GPUHTW_LLC_SCID_SHIFT 25.
+ */
+static void
+llc_scids(void)
+{
+	uint32_t gpu_scid, htw_scid, all = 0, cntl1;
+
+	if (!hakios_llcc_gpu_scids(&gpu_scid, &htw_scid)) {
+		return;
+	}
+	for (unsigned i = 0; i < 5; i++) {
+		all = all << 5 | gpu_scid;
+	}
+	cntl1 = (get(&cx_misc, "system_cache_cntl_1", CX_MISC_SYSTEM_CACHE_CNTL_1) & ~((1u << 30) - 1)) | all | htw_scid << 25;
+	put(&cx_misc, "system_cache_cntl_1: the GPU's and GPUHTW's SCIDs", CX_MISC_SYSTEM_CACHE_CNTL_1, cntl1);
+	put(&cx_misc, "system_cache_cntl_0: overrides", CX_MISC_SYSTEM_CACHE_CNTL_0, 0x3);
+	get(&cx_misc, "system_cache_cntl_1", CX_MISC_SYSTEM_CACHE_CNTL_1);
+	get(&cx_misc, "system_cache_cntl_0", CX_MISC_SYSTEM_CACHE_CNTL_0);
+}
+
 /* ---- step 20: the 3D core's registers, its command processor started, its first command ------------------- */
 
 /*
@@ -2689,6 +2717,7 @@ step_core_start(void)
 		put(&gpu, "address mode: 64 bits", GPU_WORD(address_modes[i]), 1);
 	}
 	put(&gpu, "rbbm_vbif_client_qos_cntl", RBBM_VBIF_CLIENT_QOS_CNTL, 3);
+	llc_scids();
 	put(&gpu, "rbbm_perfctr_gpu_busy_masked", RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
 	put64(&gpu, "uche_write_range_max", UCHE_WRITE_RANGE_MAX, 0x1fffffffff000ull + 0xfc0);
 	put64(&gpu, "uche_trap_base", UCHE_TRAP_BASE, 0x1fffffffff000ull);
