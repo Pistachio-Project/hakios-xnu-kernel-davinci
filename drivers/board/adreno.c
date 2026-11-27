@@ -4686,6 +4686,13 @@ static struct {
 	uint64_t flips, by_irq, by_poll, lat_sum, lat_max, lat_n, irq_waits, irq_timeouts;
 } scanout_stats;
 
+/* What the eye sees: when each flip was taken over by the panel (the refresh interrupt's time), and the distance between them. */
+#define PACE_BUCKETS 64                         /* 1 ms each, the last takes all above */
+static struct {
+	uint64_t last, since, frames, sum, max, n;
+	uint32_t bucket[PACE_BUCKETS];
+} scanout_pace;
+
 static void
 scanout_put(uint32_t offset, uint32_t value)
 {
@@ -4731,6 +4738,22 @@ scanout_try_latch(bool by_irq)
 			scanout_stats.by_irq++;
 		} else {
 			scanout_stats.by_poll++;
+		}
+		{
+			uint64_t at = mach_absolute_time(), gap;
+
+			if (scanout_pace.since == 0) {
+				scanout_pace.since = at;
+			}
+			if (scanout_pace.last != 0) {
+				absolutetime_to_nanoseconds(at - scanout_pace.last, &gap);
+				scanout_pace.sum += gap;
+				scanout_pace.n++;
+				scanout_pace.max = gap > scanout_pace.max ? gap : scanout_pace.max;
+				scanout_pace.bucket[gap / 1000000 < PACE_BUCKETS ? gap / 1000000 : PACE_BUCKETS - 1]++;
+			}
+			scanout_pace.last = at;
+			scanout_pace.frames++;
 		}
 		scanout_stats.lat_sum += ns;
 		scanout_stats.lat_n++;
@@ -4815,6 +4838,32 @@ uint64_t
 hakios_display_te_irqs(void)
 {
 	return te_on && !te_given_up ? __atomic_load_n(&te_count, __ATOMIC_SEQ_CST) : 0;
+}
+
+/* Read and reset: frames taken over by the panel and the span (ns) they came in, the intervals between them: sum, count, 99th percentile and largest (ns). */
+void hakios_display_panel_pacing(uint64_t out[6]);
+void
+hakios_display_panel_pacing(uint64_t out[6])
+{
+	uint64_t at = mach_absolute_time(), span, seen = 0, p99 = 0;
+
+	absolutetime_to_nanoseconds(scanout_pace.since != 0 ? at - scanout_pace.since : 0, &span);
+	for (unsigned i = 0; i < PACE_BUCKETS; i++) {
+		seen += scanout_pace.bucket[i];
+		if (scanout_pace.n != 0 && seen * 100 >= scanout_pace.n * 99) {
+			p99 = (uint64_t)(i + 1) * 1000000;      /* (the bucket's upper edge) */
+			break;
+		}
+	}
+	out[0] = scanout_pace.frames;
+	out[1] = span;
+	out[2] = scanout_pace.sum;
+	out[3] = scanout_pace.n;
+	out[4] = p99 > scanout_pace.max ? scanout_pace.max : p99;
+	out[5] = scanout_pace.max;
+	memset(&scanout_pace, 0, sizeof(scanout_pace));
+	scanout_pace.last = 0;
+	scanout_pace.since = at;
 }
 
 /* Why the last show failed (a string), and the permission to try again: a miss is not for good unless the display driver says so. */

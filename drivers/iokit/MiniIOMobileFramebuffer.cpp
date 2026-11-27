@@ -327,6 +327,15 @@ extern "C" uint64_t hakios_display_te_irqs(void);
 static uint64_t gScanoutLatchSeenAt, gScanoutLatchTe;   /* (ring=2) when a flip's taking over was first seen here, and the refresh interrupts counted then */
 static uint64_t gScanoutDeferredAt;                     /* ... when the oldest swap not completed was deferred */
 static uint64_t gScanoutTimedOut, gScanoutDeferredCount;
+/*
+ * fb_scanout_release=2 (default 1; ring 2): the surface before a flip is let go one refresh interrupt after the flip's flush was seen taken
+ * over, not at once. 1: at once -- the new surface's fetch starts at that refresh, the old one is read no more.
+ * fb_scanout_complete=1 (default 0; ring 2): the swap completes when its flip is issued (as ring 0 does) and only the surface hold (use count,
+ * which the window server may or may not honour: logs/143902-run.log glitched without anything else) keeps it from the surface on the panel.
+ */
+static TUNABLE(uint32_t, gScanoutRelease, "fb_scanout_release", 1);
+static TUNABLE(uint32_t, gScanoutComplete, "fb_scanout_complete", 0);
+extern "C" void hakios_display_panel_pacing(uint64_t out[6]);
 static uint32_t gScanoutFails;
 static uint64_t gScanoutDropped;                       /* frames not flipped because the flip before had not been taken over */                         /* consecutive flips (zero copy) that were not taken */
 #define SCANOUT_FAILS_MAX 10
@@ -2073,7 +2082,7 @@ scanoutReleasable(void)
 		gScanoutLatchSeenAt = 0;
 		return false;
 	}
-	if (gScanoutRing != 2) {
+	if (gScanoutRing != 2 || gScanoutRelease != 2) {
 		return true;
 	}
 	te = hakios_display_te_irqs();
@@ -2723,7 +2732,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 * Only now is the frame in the panel's memory: the swap after it may be handed over. Given back any
 	 * earlier, the window server would draw a frame more ahead of the panel than fb_queue says.
 	 */
-	bool deferred = direct && gScanoutRing == 2 && gScanoutReady && !gScanoutGaveUp;
+	bool deferred = direct && gScanoutRing == 2 && gScanoutComplete == 0 && gScanoutReady && !gScanoutGaveUp;
 
 	IOLockLock(fSwapLock);
 	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
@@ -2813,6 +2822,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				    "no surface of the window server's is fetched\n", gScanoutFrames ? micros(gScanoutCopyTime / gScanoutFrames) : 0,
 				    micros(gScanoutCopyMax));
 				gScanoutCopyTime = gScanoutCopyMax = 0;
+			}
+			{
+				uint64_t pc[6];
+
+				hakios_display_panel_pacing(pc);
+				IOLog("MiniIOMobileFramebuffer: panel pacing: %llu frames/s, interval avg/p99/max %llu/%llu/%llu us (ring %u, release %u, complete %u)\n",
+				    pc[1] ? pc[0] * NSEC_PER_SEC / pc[1] : 0, pc[3] ? pc[2] / pc[3] / 1000 : 0, pc[4] / 1000, pc[5] / 1000, gScanoutRing,
+				    gScanoutRelease, gScanoutComplete);
 			}
 			{
 				uint64_t st[8];
