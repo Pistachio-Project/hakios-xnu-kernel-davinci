@@ -452,20 +452,21 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
  	uint32_t preferred_pset_load = shared_rsrc_thread ? (uint32_t)sched_edge_pset_cluster_shared_rsrc_load(preferred_pset, shared_rsrc_type) : sched_edge_pset_load_metric(preferred_pset, thread->th_sched_bucket);
  	if (preferred_pset_load == 0) {
  		goto migrate_candidate_available_check;
-@@ -6353,6 +6398,25 @@ sched_edge_cpu_init_completed(void)
+@@ -6353,6 +6398,26 @@ sched_edge_cpu_init_completed(void)
  	sched_clutch_edge free_spill = (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 1, .sce_steal_allowed = 1};
  	sched_clutch_edge no_spill = (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 0, .sce_steal_allowed = 0};
  	sched_clutch_edge weighted_spill = (sched_clutch_edge){.sce_migration_weight = 64, .sce_migration_allowed = 1, .sce_steal_allowed = 1};
 +	/* hakios, boot-arg amp_spill=N: the P -> E edge's weight in us (the default 64); 0: nothing of the P cluster's overflow goes to E */
 +	uint32_t amp_spill = 64;
 +	/*
-+	 * hakios, boot-arg amp_keep=MASK (a bit per bucket: 1 the fixed priorities, 2 FG; default 3): those buckets'
-+	 * P -> E edge gets a weight nothing reaches, so the window server's render threads and the foreground's main
-+	 * threads stay on the A76 cores while user-initiated, default and lower work spills to the A55 ones. With the
-+	 * same weight for all (the stock table) the frames themselves were drawn on A55 cores: 30.7 fps for 38-40.
++	 * hakios, boot-arg amp_keep=MASK (a bit per bucket: 1 the fixed priorities, 2 FG, 4 IN; default 7): those buckets'
++	 * P -> E edge gets a weight nothing reaches, they are placed on P at wake (sched_edge_migrate_candidate()) and
++	 * an idle E processor does not steal them: the window server's render threads, the foreground's main threads
++	 * and user-initiated work stay on the A76 cores while default and lower work spills to the A55 ones. With the
++	 * stock table (everything spills alike) the frames themselves were made on A55 cores: 31 fps for 37.
 +	 * (A weight, not "no spill": an edge allowed for a bucket has to be allowed for every bucket above it.)
 +	 */
-+	uint32_t amp_keep = 3;
++	uint32_t amp_keep = 7;
 +	PE_parse_boot_argn("amp_keep", &amp_keep, sizeof(amp_keep));
 +	hakios_amp_keep = amp_keep;
 +	if (PE_parse_boot_argn("amp_spill", &amp_spill, sizeof(amp_spill))) {
@@ -478,7 +479,7 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
  	/* P -> P */
  	edge_config_defaults[PSET_AMP_P][PSET_AMP_P] = free_spill;
  	/* E -> E */
-@@ -6444,6 +6508,10 @@ sched_edge_cpu_init_completed(void)
+@@ -6444,6 +6509,10 @@ sched_edge_cpu_init_completed(void)
  				 * values when deciding to enforce performance islands for certain buckets.
  				 */
  #endif /* CONFIG_SCHED_PERF_ISLANDS */
@@ -489,7 +490,7 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
  				sched_edge_config_set(src_pset_id, dst_pset_id, bucket, edge_config);
  				if (edge_config.sce_migration_allowed) {
  					src_pset->max_parallel_cores[bucket] += dst_pset->cpu_set_count;
-@@ -6464,6 +6532,33 @@ sched_edge_cpu_init_completed(void)
+@@ -6464,6 +6533,32 @@ sched_edge_cpu_init_completed(void)
  	splx(s);
  }
  
@@ -501,10 +502,9 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
 + * user-initiated threads 100 ms to seconds on the A76 queue beside idle A55 cores; widget extensions killed by
 + * their watchdog having had no CPU), and amp_spill= was never read. Only the edges: the rest of
 + * sched_cpu_init_completed() expects every processor of the machine online, and the loader keeps one. Once,
-+ * from hakios_amp_start(), with boot-arg amp_edges=1. Not the default yet: on davinci it ended the starving (one
-+ * 107 ms stay on a run queue for 115-207 of them in a ui_bench window, the pauses 8-10 s for 9-16 s, fewer widget
-+ * extensions killed) but the benchmark's frame rate fell from 35-38 to 31-32 fps, foreground work running on A55
-+ * cores whatever amp_keep says (three runs, 2026-11-28, with a BackgroundShortcutRunner busy on 1.7 cores).
++ * from hakios_amp_start(); boot-arg amp_edges=0 leaves the edges as they were. On davinci (ui_bench, two runs
++ * each, 2026-11-28): without them 37.5 fps, 2610 frames in the window, 17.3 s of pauses, 30 widget extensions
++ * killed; with them and amp_keep=7 37.6 fps, 2836 frames, 12.6 s, 14; with amp_keep=3 34.5 fps, 2690 frames, 8.8 s, 20.
 + */
 +void hakios_sched_edge_edges_init(void);
 +
@@ -512,7 +512,7 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
 +hakios_sched_edge_edges_init(void)
 +{
 +	static bool done;
-+	uint32_t on = 0;
++	uint32_t on = 1;
 +
 +	PE_parse_boot_argn("amp_edges", &on, sizeof(on));
 +	if (on && !os_atomic_xchg(&done, true, relaxed)) {

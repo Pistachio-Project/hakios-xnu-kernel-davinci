@@ -196,11 +196,17 @@ Look the equivalents up for your SoC; don't copy them.
   never read. waitprof showed it: user-initiated and default threads of SpringBoard and backboardd sat 100 ms to
   seconds on the A76 queue beside idle A55 cores (40-75 s of thread time per ui_bench window), and widget
   extensions were killed by chronod's 10 s watchdog having had no CPU (white widgets: `getTimelines` watchdogged,
-  28-31 kills a boot). `amp_edges=1` sets the edges up (only them: the rest of `sched_cpu_init_completed()` wants
-  every core online). Result on davinci: the long waits gone (1 for 115-207), pauses 8-10 s for 9-16 s, kills
-  14-22, but 31-32 fps for 35-38, because foreground work also runs on A55 cores; an idle E cluster is taken
-  before any edge weight is looked at, and `amp_keep` (placement at wake) did not stop it (steal? not found yet).
-  Off by default until that is tuned.
+  28-31 kills a boot). The edges are now set up at `amp=1` (only them: the rest of `sched_cpu_init_completed()`
+  wants every core online; `amp_edges=0` for the old state). Two more things were needed for the frame rate: an
+  idle E cluster is taken at wake before any edge weight is looked at, and an idle E core steals whenever more
+  than two threads are runnable on P, so the frames were being made on A55 cores (31 fps for 37). `amp_keep`
+  (default 7: fixed priority, FG, IN) places those buckets on P at wake and exempts them from the steal.
+  davinci, ui_bench, two runs each: no edges 37.5 fps / 2610 frames / 17.3 s of pauses / 30 widget kills;
+  edges + keep 7: 37.6 / 2836 / 12.6 s / 14; edges + keep 3: 34.5 / 2690 / 8.8 s / 20.
+- **A one-time job that never gets saved runs on every boot.** After a new system image (new image id) the
+  LaunchServices store is rebuilt and BackgroundShortcutRunner rebuilds the Shortcuts database: 2 min 10 s of
+  CPU on up to two cores. Runs without `ufs_write=1` threw that away each time, and every benchmark of that
+  afternoon was 3-5 fps low. After a new image, do one run with `ufs_write=1` before measuring.
 - **Report flash as flash (`DKIOCISSOLIDSTATE`).** This was the post-unlock freeze, and it was ours. A block
   driver that doesn't answer this ioctl makes spec_vnops.c treat the device as a spinning disk, so low-priority I/O
   is throttled with the slow-disk periods (40-200 ms, windows up to 500 ms) instead of the flash ones (5-25 ms).
