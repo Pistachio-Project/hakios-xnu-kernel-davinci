@@ -31,12 +31,13 @@
 /*
  * The console log handed back to the loader. A long session writes more than fits, and both
  * ends matter: the start of the boot is kept as it is, and of everything after it the most
- * recent part (a ring); room is left for what is appended on the way out (the kernel message
- * buffer, a panic's text). loader_log_linearize() puts the pieces in order before returning.
+ * recent part (a ring: 768 KB, about ten seconds of a session); room is left for what is appended on the way out (the wait profiler's
+ * own lines, the kept lines, the kernel message buffer, a panic's text). loader_log_linearize() puts the pieces in order before returning.
  */
-#define LOADER_LOG_SIZE (1536 * 1024)
+/* (the loader stages 2 MB: its own log, at most 32 KB, and this one) */
+#define LOADER_LOG_SIZE (1920 * 1024)
 #define LOADER_LOG_HEAD (256 * 1024)
-#define LOADER_LOG_RING (1024 * 1024)
+#define LOADER_LOG_RING (768 * 1024)
 
 #if defined(GENERIC_GIC_V3_IRQ)
 extern void gic_v3_irq_quiesce(void);
@@ -220,6 +221,15 @@ loader_keep_wanted(const char *line)
 				}
 			}
 		}
+		/*
+		 * (not runningboardd's own lines: with its debug log on, each "acquireAssertion... SpringBoard" of its
+		 * hundreds matched "ssert" and the kept lines were full a minute into the boot)
+		 */
+		for (const char *l = line; ours && *l != 0; l++) {
+			if (strncmp(l, "runningboardd[", 14) == 0) {
+				ours = false;
+			}
+		}
 		/* ... and what either says when it gives up: an assertion, an exception, an abort */
 		if (ours) {
 			static const char *const words[] = { "ssert", "xception", "erminat", "atal", "bort", "BUG IN", "rash" };
@@ -281,6 +291,31 @@ loader_keep_char(char c)
 		loader_keep[loader_keep_len++] = '\n';
 	}
 	loader_keep_line_len = 0;
+}
+
+/*
+ * The wait profiler's lines (boot-arg waitprof=, arch/arm64/kernel/prof.c): a buffer of their own, appended to the log
+ * on the way out. In the ring they were gone ten seconds later, and the kept lines above are full long before a
+ * ui_bench window ends. One writer (the profiler's thread); read once the others are stopped.
+ */
+#define LOADER_WP_SIZE (640 * 1024)
+static char     loader_wp[LOADER_WP_SIZE];
+static uint32_t loader_wp_len, loader_wp_lost;
+
+void loader_wp_line(const char *line);
+
+void
+loader_wp_line(const char *line)
+{
+	uint32_t n = (uint32_t)strlen(line), at = os_atomic_load(&loader_wp_len, relaxed);
+
+	if (at + n + 1 > LOADER_WP_SIZE) {
+		loader_wp_lost++;
+		return;
+	}
+	__builtin_memcpy(loader_wp + at, line, n);
+	loader_wp[at + n] = '\n';
+	os_atomic_store(&loader_wp_len, at + n + 1, release);
 }
 
 void
@@ -354,7 +389,7 @@ loader_log_put_locked(char c)
 static void
 loader_log_linearize(void)
 {
-	static const char note[] = "\n\n[... the log between the first 256 KB and the last 1 MB was dropped ...]\n\n";
+	static const char note[] = "\n\n[... the log between the first 256 KB and the last 768 KB was dropped ...]\n\n";
 	uint32_t older = LOADER_LOG_RING - loader_log_ring_at, n = LOADER_LOG_HEAD;
 
 	if (loader_log_linear) {
@@ -537,20 +572,38 @@ loader_log_puts(const char *s)
  * buffer (what dmesg shows), whether or not a console displayed it.
  */
 static void
-loader_log_append_msgbuf(void)
+loader_log_append_msgbuf(uint32_t reserve)
 {
 	struct msgbuf *mb = msgbufp;
 
 	if (mb == NULL || mb->msg_bufc == NULL || mb->msg_size <= 0 || mb->msg_bufx < 0 || mb->msg_bufx > mb->msg_size) {
 		return;
 	}
-	loader_log_puts("\n--- kernel message buffer ---\n");
-	/* oldest data first: [bufx, size) is only meaningful once the buffer has wrapped */
-	for (int pass = 0; pass < 2; pass++) {
-		int from = pass == 0 ? mb->msg_bufx : 0;
-		int to = pass == 0 ? mb->msg_size : mb->msg_bufx;
-		for (int i = from; i < to; i++) {
-			if (mb->msg_bufc[i] != 0) {
+	/*
+	 * Of a buffer bigger than the room left (boot-arg msgbuf=1048576) the newest part: written from its start it
+	 * filled the log, and the last minutes -- and a panic's text after them -- were what was cut off.
+	 */
+	{
+		uint32_t room = LOADER_LOG_SIZE - MIN(loader_log_len, LOADER_LOG_SIZE), used = 0, skip;
+
+		room = room > reserve + 64 ? room - reserve - 64 : 0;
+		for (int i = 0; i < mb->msg_size; i++) {
+			used += mb->msg_bufc[i] != 0;
+		}
+		skip = used > room ? used - room : 0;
+		loader_log_puts(skip != 0 ? "\n--- kernel message buffer (its newest part) ---\n" : "\n--- kernel message buffer ---\n");
+		/* oldest data first: [bufx, size) is only meaningful once the buffer has wrapped */
+		for (int pass = 0; pass < 2; pass++) {
+			int from = pass == 0 ? mb->msg_bufx : 0;
+			int to = pass == 0 ? mb->msg_size : mb->msg_bufx;
+			for (int i = from; i < to; i++) {
+				if (mb->msg_bufc[i] == 0) {
+					continue;
+				}
+				if (skip != 0) {
+					skip--;
+					continue;
+				}
 				loader_log_putc(mb->msg_bufc[i]);
 			}
 		}
@@ -614,14 +667,29 @@ loader_return(void)
 	 * never happens. Append the buffer so the loader gets it either way.
 	 */
 	loader_log_linearize();
+	if (!loader_return_entered && loader_wp_len != 0) {
+		char note[96];
+
+		snprintf(note, sizeof(note), "\n--- wait profile (%u bytes, %u lines did not fit) ---\n", loader_wp_len, loader_wp_lost);
+		loader_log_puts(note);
+		for (uint32_t i = 0; i < loader_wp_len; i++) {
+			loader_log_putc(loader_wp[i]);
+		}
+		loader_log_puts("--- end of wait profile ---\n");
+	}
 	if (!loader_return_entered && loader_keep_len != 0) {
 		loader_log_puts("\n--- kept lines (dtouch, hakios26, exec) ---\n");
 		for (uint32_t i = 0; i < loader_keep_len; i++) {
 			loader_log_putc(loader_keep[i]);
 		}
 	}
-	if (!loader_return_entered) {
-		loader_log_append_msgbuf();
+	{
+		bool panic_text = debug_buf_base != NULL && debug_buf_ptr > debug_buf_base &&
+		    (size_t)(debug_buf_ptr - debug_buf_base) < 256 * 1024;
+
+		if (!loader_return_entered) {
+			loader_log_append_msgbuf(panic_text ? (uint32_t)(debug_buf_ptr - debug_buf_base) : 0);
+		}
 	}
 	if (!loader_return_entered && debug_buf_base != NULL && debug_buf_ptr > debug_buf_base &&
 	    (size_t)(debug_buf_ptr - debug_buf_base) < 256 * 1024) {

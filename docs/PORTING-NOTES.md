@@ -179,9 +179,12 @@ Look the equivalents up for your SoC; don't copy them.
   benchmark can't see that: have a person look before you make any rendering change the default.
 - **HITCH verdicts.** The Metal plug-in's "HITCH breakdown" lines label each long frame. Most of davinci's are
   BLOCKED: in a 200 ms frame backboardd used about 10 ms of CPU, so it is waiting, not working.
-- **Off-CPU profiling with symbols.** Run `waitprof=<process>` and `keep_words=wpm`. Each long mach_msg wait
-  in the ui_bench window gets a short `wpm` line with the receive port, the timeout and 4 user return
-  addresses; a `wpm cache` line gives the shared cache slide.
+- **Off-CPU profiling with symbols.** Run `waitprof=<process>[,<process>]`. From the start of the ui_bench
+  window each long wait gets a short `wpw` line in the profiler's own buffer (640 KB, appended to the returned
+  log as "--- wait profile ---"), with the trap, the message id, 4 user return addresses, the kernel frames and
+  the destination process; a `wpc` line gives the slides. `tools/waitprof.py LOG --cache DIR --kernel FILE`
+  groups the waits by thread and place and names the addresses. (Before 2026-11-28 the lines went to the log's
+  ring only and had no line ends: nothing of the benchmark window survived a run.)
   - Subtract the slide and find the image from the cache header's image list (offset 0x1c0).
   - Local names are `<redacted>` in the main cache. Read them from `dyld_shared_cache_<arch>.symbols`: the
     local symbols info at header 0x48, its entries keyed by the image's offset from 0x180000000.
@@ -195,7 +198,7 @@ Look the equivalents up for your SoC; don't copy them.
   20+ s on audiomxd. With the ioctl answered, the longest pause in the benchmark went from 9-13 s to 1.3-1.6 s,
   and fps from 37-40 to 37.6/43.9. **Answer it in every block driver of a new port.**
 - **Finding a chain like that:** `waitprof=<process>` on the stuck client, then on each service it names. `t1`
-  in a `wpm` line means the destination port is in transit, queued on launchd's port for a service that hasn't
+  in a `wpw` line's destination (`d PID NAME t1 SVC`) means the port is in transit, queued on launchd's port for a service that hasn't
   checked in; `svc` names it. The kernel stack frames (`k:`) symbolize against the unstripped kernel (slide 0).
 - **Unlock right after boot.** SpringBoard's threads wait in synchronous XPC calls
   (`_dispatch_mach_send_and_wait_for_reply`) for up to 47 s. The callees are runningboardd, backboardd, biomed,

@@ -353,6 +353,7 @@ struct wp_thr {
 	uint64_t began, last;   /* (ns) */
 	uint64_t ev;
 	uint32_t ms_run, ms_rdy, ms_blk;
+	int16_t pri;            /* (its scheduled priority when the episode began) */
 	struct wp_wait w;
 };
 
@@ -366,7 +367,7 @@ static struct wp_target {
 } wp_t[WP_MAXT];
 static unsigned wp_n;
 static uint32_t wp_long_ms = 30, wp_secs = 5;
-/* the short "wpm" line of a long mach_msg2 wait (keep_words=wpm keeps them): from uptime waitprof_after s (with ui_bench: 85, its window) */
+/* the short lines of the profiler's own buffer ("wpw", "wps", "wpc"): from uptime waitprof_after s (with ui_bench: 85, its window) */
 static uint32_t wp_after_s;
 
 extern void loader_log_line(const char *line);
@@ -375,8 +376,21 @@ extern boolean_t machine_thread_on_core(thread_t thread);
 #define WPSAY(...) \
 	do { \
 		char wp_line[600]; \
-		snprintf(wp_line, sizeof(wp_line), __VA_ARGS__); \
+		size_t wp_n = (size_t)snprintf(wp_line, sizeof(wp_line) - 1, __VA_ARGS__); \
+		wp_n = MIN(wp_n, sizeof(wp_line) - 2); \
+		wp_line[wp_n] = '\n';      /* (without it the lines ran into each other, and into the next writer's) */ \
+		wp_line[wp_n + 1] = 0; \
 		loader_log_line(wp_line); \
+	} while (0)
+
+/* a line of the profiler's own buffer (loader_return.c: appended to the log on the way out, whatever the ring lost) */
+extern void loader_wp_line(const char *line);
+
+#define WPKEEP(...) \
+	do { \
+		char wp_line[700]; \
+		snprintf(wp_line, sizeof(wp_line), __VA_ARGS__); \
+		loader_wp_line(wp_line); \
 	} while (0)
 
 static const char *
@@ -666,16 +680,49 @@ wp_end_episode(struct wp_target *tg, struct wp_thr *th)
 		}
 		WPSAY("waitprof: %s %s at %llu.%03llu s: tid %llu '%s' %llu ms %s", tg->name, th->kind == 1 ? "LONG" : "RUNNABLE",
 		    th->last / NSEC_PER_SEC, th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, d);
-		if (th->kind == 1 && th->w.trap == (uint64_t)-47 && th->last / NSEC_PER_SEC >= wp_after_s) {
-			char peer[20] = "-";
+		/*
+		 * ... and the short line of the profiler's own buffer, from uptime waitprof_after on: every long wait
+		 * and every long stay on a run queue ("wpw end tid 'name' ms B|R process pPRIORITY ..."), but a parked workqueue thread's
+		 * (workq_kernreturn: it waits for work). All numbers hexadecimal but the times, the pid and the ids.
+		 */
+		if (th->last / NSEC_PER_SEC >= wp_after_s && !(th->kind == 1 && th->w.trap == 368)) {
+			const struct wp_wait *w = &th->w;
+			char l[640], peer[20] = "-";
+			size_t at = 0;
 
-			if (th->w.dst_pid > 0) {
-				proc_name(th->w.dst_pid, peer, sizeof(peer));
+			at += (size_t)snprintf(l + at, sizeof(l) - at, "wpw %llu.%03llu %llu '%.20s' %llu %c %.16s p%d", th->last / NSEC_PER_SEC,
+			    th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, th->kind == 1 ? 'B' : 'R', tg->name, th->pri);
+			if (th->kind == 1) {
+				at += (size_t)snprintf(l + at, sizeof(l) - at, " e%x t%lld", w->ec, (long long)w->trap);
+				if (w->has_msg) {
+					at += (size_t)snprintf(l + at, sizeof(l) - at, " m%u w%x", w->msgid, w->word);
+				}
+				at += (size_t)snprintf(l + at, sizeof(l) - at, " h%u ev%llx", w->hint, w->event);
+				if (w->timeout_ms != ~0ull) {
+					at += (size_t)snprintf(l + at, sizeof(l) - at, " to%llu", w->timeout_ms);
+				}
+				if (w->trap == (uint64_t)-47) {
+					at += (size_t)snprintf(l + at, sizeof(l) - at, " r%x ut%u", w->rcv, w->utmo);
+				}
+				at += (size_t)snprintf(l + at, sizeof(l) - at, " u:%llx,%llx", w->upc, w->ulr);
+				for (unsigned i = 0; i < w->nubt && at < sizeof(l) - 20; i++) {
+					at += (size_t)snprintf(l + at, sizeof(l) - at, ",%llx", w->ubt[i]);
+				}
+				if (w->cont != 0) {
+					at += (size_t)snprintf(l + at, sizeof(l) - at, " c%llx", w->cont);
+				}
+				for (unsigned i = 0; i < w->nbt && at < sizeof(l) - 20; i++) {
+					at += (size_t)snprintf(l + at, sizeof(l) - at, "%s%llx", i == 0 ? " k:" : ",", w->bt[i]);
+				}
+				if (w->dst_how != 0 && at < sizeof(l) - 90) {
+					if (w->dst_pid > 0) {
+						proc_name(w->dst_pid, peer, sizeof(peer));
+					}
+					at += (size_t)snprintf(l + at, sizeof(l) - at, " d%d %s %c%u%s %s", w->dst_pid, peer, w->dst_how,
+					    w->dst_hops, w->dst_throttled ? "T" : "", w->dst_svc[0] ? w->dst_svc : "-");
+				}
 			}
-			WPSAY("wpm %llu.%03llu %llu '%.20s' %llums r%#x t%u m%u %llx %llx %llx %llx to %d %s %c%u%s svc %s", th->last / NSEC_PER_SEC,
-			    th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, th->w.rcv, th->w.utmo, th->w.msgid,
-			    th->w.ubt[0], th->w.ubt[1], th->w.ubt[2], th->w.ubt[3], th->w.dst_pid, peer,
-			    th->w.dst_how ? th->w.dst_how : '-', th->w.dst_hops, th->w.dst_throttled ? " THROTTLED" : "", th->w.dst_svc[0] ? th->w.dst_svc : "-");
+			loader_wp_line(l);
 		}
 	}
 	th->kind = 0;
@@ -695,6 +742,7 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 		struct wp_thr *th = NULL;
 		struct wp_wait w;
 		uint32_t state, cs, hint;
+		int16_t pri;
 		uint64_t tid = t->thread_id;
 		uint64_t ev, to_abs = 0;
 		uintptr_t cont;
@@ -720,6 +768,7 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 		thread_lock(t);
 		state = t->state;
 		cs = t->c_switch;
+		pri = t->sched_pri;
 		ev = (uint64_t)t->wait_event;
 		hint = t->block_hint;
 		cont = (uintptr_t)t->continuation;
@@ -780,6 +829,7 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 			th->ms_rdy += (uint32_t)dt_ms;
 			if (th->kind == 0) {
 				th->kind = 2;
+				th->pri = pri;
 				th->cs = cs;
 				th->began = now_ns;
 				bzero(&th->w, sizeof(th->w));
@@ -798,6 +848,7 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 				continue;       /* (it woke meanwhile: the reading is not of this wait) */
 			}
 			th->kind = 1;
+			th->pri = pri;
 			th->cs = cs;
 			th->ev = ev;
 			th->began = now_ns;
@@ -827,6 +878,7 @@ static void
 wp_report(struct wp_target *tg)
 {
 	bool used[WP_AGG];
+	uint64_t wp_now_s = 0;
 
 	bzero(used, sizeof(used));
 	WPSAY("waitprof: %s: %u samples in %us, kernel slide %#lx, %u waits not kept", tg->name, tg->samples, wp_secs,
@@ -838,14 +890,15 @@ wp_report(struct wp_target *tg)
 		uint64_t up_ns;
 
 		absolutetime_to_nanoseconds(mach_absolute_time(), &up_ns);
-		if (map != VM_MAP_NULL && !tg->slide_told && up_ns / NSEC_PER_SEC >= wp_after_s) {     /* (once, in the window: kept with wpm) */
+		if (map != VM_MAP_NULL && !tg->slide_told && up_ns / NSEC_PER_SEC >= wp_after_s) {     /* (once, in the window) */
 			tg->slide_told = 1;
 			if (tg->task->all_image_info_addr != 0 &&
 			    vm_map_read_user(map, tg->task->all_image_info_addr, &infos, sizeof(infos)) == KERN_SUCCESS) {
-				WPSAY("wpm cache %s: shared cache at %#llx slide %#llx", tg->name, infos.sharedCacheBaseAddress,
-				    infos.sharedCacheSlide);
+				WPKEEP("wpc %s: shared cache at %#llx slide %#llx kernel slide %#lx long %u ms", tg->name,
+				    infos.sharedCacheBaseAddress, infos.sharedCacheSlide, (unsigned long)vm_kernel_slide, wp_long_ms);
 			}
 		}
+		wp_now_s = up_ns / NSEC_PER_SEC;
 		if (map != VM_MAP_NULL) {
 			vm_map_deallocate(map);
 		}
@@ -875,6 +928,11 @@ wp_report(struct wp_target *tg)
 		if (th->tid != 0 && all != 0 && (th->ms_run + th->ms_rdy) * 100 / all >= 3) {
 			WPSAY("waitprof: %s tid %llu '%s' run %u%% runnable %u%% blocked %u%%", tg->name, th->tid, th->name,
 			    th->ms_run * 100 / all, th->ms_rdy * 100 / all, th->ms_blk * 100 / all);
+			/* (the period's shares of the threads that did something: "wps end tid 'name' run% runnable% ms") */
+			if (wp_now_s >= wp_after_s) {
+				WPKEEP("wps %llu %llu '%.20s' %u %u %u %.16s", wp_now_s, th->tid, th->name, th->ms_run * 100 / all,
+				    th->ms_rdy * 100 / all, all, tg->name);
+			}
 		}
 		th->ms_run = th->ms_rdy = th->ms_blk = 0;
 	}
