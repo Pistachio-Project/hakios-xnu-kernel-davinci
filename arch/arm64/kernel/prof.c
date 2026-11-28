@@ -354,6 +354,11 @@ struct wp_thr {
 	uint64_t ev;
 	uint32_t ms_run, ms_rdy, ms_blk;
 	int16_t pri;            /* (its scheduled priority when the episode began) */
+	/* a stay on a run queue: where it was queued, and which processors had nothing to do the whole time */
+	int8_t r_rq, r_bound, r_last;   /* (cpu numbers; -1: none) */
+	uint8_t r_bucket;
+	uint32_t r_state, r_idle_all, r_idle_any, r_rec;
+	uint64_t r_upc, r_trap;
 	struct wp_wait w;
 };
 
@@ -694,6 +699,14 @@ wp_end_episode(struct wp_target *tg, struct wp_thr *th)
 			    th->last % NSEC_PER_SEC / NSEC_PER_MSEC, th->tid, th->name, ms, th->kind == 1 ? 'B' : 'R', tg->name, th->pri);
 			if (th->kind == 1) {
 				at += (size_t)snprintf(l + at, sizeof(l) - at, " e%x t%lld", w->ec, (long long)w->trap);
+			} else {
+				/* state, bucket, the run queue's / the bound / the last processor, the processors idle for
+				 * the whole stay and at some time in it, the recommended ones, the user pc and x16 */
+				at += (size_t)snprintf(l + at, sizeof(l) - at, " s%x b%u rq%d bd%d lp%d ia%x io%x rec%x pc%llx x%lld", th->r_state,
+				    th->r_bucket, th->r_rq, th->r_bound, th->r_last, th->r_idle_all, th->r_idle_any, th->r_rec, th->r_upc,
+				    (long long)th->r_trap);
+			}
+			if (th->kind == 1) {
 				if (w->has_msg) {
 					at += (size_t)snprintf(l + at, sizeof(l) - at, " m%u w%x", w->msgid, w->word);
 				}
@@ -743,6 +756,10 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 		struct wp_wait w;
 		uint32_t state, cs, hint;
 		int16_t pri;
+		int8_t rq = -1, bound = -1, lastp = -1;
+		uint8_t bucket;
+		uint32_t idle = 0, rec = 0;
+		processor_t rqp;
 		uint64_t tid = t->thread_id;
 		uint64_t ev, to_abs = 0;
 		uintptr_t cont;
@@ -769,6 +786,11 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 		state = t->state;
 		cs = t->c_switch;
 		pri = t->sched_pri;
+		bucket = (uint8_t)t->th_sched_bucket;
+		rqp = thread_get_runq(t);
+		rq = rqp != PROCESSOR_NULL ? (int8_t)rqp->cpu_id : -1;
+		bound = t->bound_processor != PROCESSOR_NULL ? (int8_t)t->bound_processor->cpu_id : -1;
+		lastp = t->last_processor != PROCESSOR_NULL ? (int8_t)t->last_processor->cpu_id : -1;
 		ev = (uint64_t)t->wait_event;
 		hint = t->block_hint;
 		cont = (uintptr_t)t->continuation;
@@ -827,13 +849,36 @@ wp_sample(struct wp_target *tg, uint64_t now_ns, uint64_t dt_ms)
 		}
 		if (kind == 2) {
 			th->ms_rdy += (uint32_t)dt_ms;
+			/* (read without their locks: a look, as the amp: lines take) */
+			for (int cpu = 0; cpu <= ml_get_max_cpu_number() && cpu < 32; cpu++) {
+				processor_t pr = processor_array[cpu];
+
+				if (pr != PROCESSOR_NULL) {
+					idle |= (pr->state == PROCESSOR_IDLE) << cpu;
+					rec |= (uint32_t)pr->is_recommended << cpu;
+				}
+			}
 			if (th->kind == 0) {
+				const arm_saved_state_t *us = t->machine.upcb;
+
 				th->kind = 2;
 				th->pri = pri;
 				th->cs = cs;
 				th->began = now_ns;
 				bzero(&th->w, sizeof(th->w));
+				th->r_rq = rq;
+				th->r_bound = bound;
+				th->r_last = lastp;
+				th->r_bucket = bucket;
+				th->r_state = state;
+				th->r_idle_all = idle;
+				th->r_idle_any = 0;
+				th->r_rec = rec;
+				th->r_upc = us != NULL && is_saved_state64(us) ? get_saved_state_pc(us) & 0x0000ffffffffffffull : 0;
+				th->r_trap = us != NULL && is_saved_state64(us) ? get_saved_state_reg(us, 16) : 0;
 			}
+			th->r_idle_all &= idle;
+			th->r_idle_any |= idle;
 			th->last = now_ns;
 			continue;
 		}

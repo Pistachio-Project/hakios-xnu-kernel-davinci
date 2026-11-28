@@ -12,7 +12,8 @@ the "wpw" lines grouped by thread and by where the wait was made, the addresses 
   --min/--max  only waits of this many ms (default 100 .. 3000: longer ones are threads with nothing to do)
 
 A wpw line: wpw END TID 'NAME' MS B|R PROCESS pPRIORITY eEC tTRAP [mMSGID wWORD] hHINT evEVENT [toTIMEOUT] [rRCV utUTMO]
-u:PC,LR,FRAMES [cCONT] [k:KERNEL FRAMES] [dPID PEER HOW SVC]; "wps" lines are a thread's run% and runnable% of
+u:PC,LR,FRAMES [cCONT] [k:KERNEL FRAMES] [dPID PEER HOW SVC]; an R line has sSTATE bBUCKET rqCPU bdCPU lpCPU
+(run queue's, bound and last processor) iaMASK ioMASK (processors idle throughout / at some time) recMASK pcPC xX16; "wps" lines are a thread's run% and runnable% of
 a period, "wpc" the slides.
 """
 import argparse
@@ -183,6 +184,7 @@ def parse(line):
     w = {"end": int(m.group(1)) + int(m.group(2)) / 1000.0, "tid": int(m.group(3)), "name": m.group(4), "ms": int(m.group(5)),
          "kind": m.group(6), "u": [], "k": [], "trap": None, "msgid": None, "word": None, "to": None, "dst": None, "utmo": None,
          "ec": None, "ev": None, "proc": "", "pri": None}
+    w["rest"] = m.group(7) + " "
     rest = m.group(7).split()
     if len(rest) >= 2 and re.fullmatch(r"p-?\d+", rest[1]):       # (the process and the priority: kernels from 2026-11-28)
         w["proc"], w["pri"] = rest[0], int(rest[1][1:])
@@ -269,6 +271,10 @@ def main():
 
     def signature(w):
         if w["kind"] == "R":
+            m = re.search(r" rq(-?\d+) .* ia([0-9a-f]+) ", w["rest"])
+            if m:       # (the run queue's processor, and whether a processor was idle for the whole stay)
+                return "RUNNABLE priority %s on cpu %s's queue, %s" % (w["pri"], m.group(1),
+                                                                      "a processor idle throughout" if int(m.group(2), 16) else "no processor idle throughout")
             return "RUNNABLE (kept off the CPUs) priority %s" % w["pri"]
         frames = [uname(a) for a in w["u"]]
         shown = [f for f in frames if not any(b in f for b in BORING)][:3]
