@@ -388,7 +388,32 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
  	/*
  	 * All thread groups should be initialized to be interactive; this allows the newly launched
  	 * thread groups to fairly compete with already running thread groups.
-@@ -5038,9 +5060,11 @@ __enum_decl(sched_edge_stp_state_t, uint8_t, {
+@@ -4562,6 +4584,8 @@ sched_edge_update_pset_avg_execution_time(processor_set_t pset, uint64_t executi
+  * - 0: If there are idle CPUs in the pset or an empty runqueue; this allows threads
+  *   to be spread across the platform quickly for ncpu wide workloads.
+  */
++uint32_t hakios_amp_keep;        /* (boot-arg amp_keep=: buckets that stay on their P cluster; 0 until the edges are set up) */
++
+ static uint32_t
+ sched_edge_pset_load_metric(processor_set_t pset, sched_bucket_t sched_bucket)
+ {
+@@ -4732,6 +4756,15 @@ sched_edge_pset_steal_thread(
+ 		    sched_edge_steal_silo_from_pset_id(silo_id, &steal_from_pset->pset_clutch_root);
+ 		bitmap_t populated_queues = os_atomic_load(steal_silo->sess_populated_steal_queues, relaxed);
+ 		for (int bucket = lsb_first(populated_queues); bucket >= 0; bucket = lsb_next(populated_queues, bucket)) {
++			/*
++			 * hakios, amp_keep=: an idle E processor leaves the P cluster's threads of these buckets where they
++			 * are (it took the foreground's main threads whenever more than two threads were runnable there, and
++			 * the frames were made on A55 cores), and looks at the buckets below.
++			 */
++			if (((hakios_amp_keep >> bucket) & 1) && (idle_pset->pset_type == PSET_AMP_E) &&
++			    (pset_for_id((pset_id_t)silo_id)->pset_type == PSET_AMP_P)) {
++				continue;
++			}
+ 			sched_clutch_edge silo_edge = sched_edge_config_get(silo_id, idle_pset->pset_id, bucket);
+ 			if ((silo_edge.sce_steal_allowed == false) && (silo_id != idle_pset->pset_id)) {
+ 				/*
+@@ -5038,9 +5071,11 @@ __enum_decl(sched_edge_stp_state_t, uint8_t, {
  static_assert(SCHED_EDGE_STP_MAX <= bits_mask(SESTP_BITS_PER_CORE),
      "Per-core stir-the-pot request state must fit in per-core bits");
  
@@ -403,16 +428,15 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
  
  static cpumap_t sched_edge_p_core_map = 0ULL;
  static cpumap_t sched_edge_non_p_core_map = 0ULL;
-@@ -5934,6 +5958,8 @@ sched_edge_switch_pset_lock(processor_set_t selected_pset, processor_set_t locke
+@@ -5934,6 +5969,7 @@ sched_edge_switch_pset_lock(processor_set_t selected_pset, processor_set_t locke
  	}
  }
  
-+uint32_t hakios_amp_keep;        /* (boot-arg amp_keep=: buckets that stay on their P cluster; 0 until the edges are set up) */
 +
  /*
   * sched_edge_migrate_candidate()
   *
-@@ -6000,6 +6026,15 @@ sched_edge_migrate_candidate(processor_set_t _Nullable preferred_pset, thread_t
+@@ -6000,6 +6036,15 @@ sched_edge_migrate_candidate(processor_set_t _Nullable preferred_pset, thread_t
  		goto migrate_candidate_available_check;
  	}
  
@@ -428,7 +452,7 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
  	uint32_t preferred_pset_load = shared_rsrc_thread ? (uint32_t)sched_edge_pset_cluster_shared_rsrc_load(preferred_pset, shared_rsrc_type) : sched_edge_pset_load_metric(preferred_pset, thread->th_sched_bucket);
  	if (preferred_pset_load == 0) {
  		goto migrate_candidate_available_check;
-@@ -6353,6 +6388,25 @@ sched_edge_cpu_init_completed(void)
+@@ -6353,6 +6398,25 @@ sched_edge_cpu_init_completed(void)
  	sched_clutch_edge free_spill = (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 1, .sce_steal_allowed = 1};
  	sched_clutch_edge no_spill = (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 0, .sce_steal_allowed = 0};
  	sched_clutch_edge weighted_spill = (sched_clutch_edge){.sce_migration_weight = 64, .sce_migration_allowed = 1, .sce_steal_allowed = 1};
@@ -454,7 +478,7 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
  	/* P -> P */
  	edge_config_defaults[PSET_AMP_P][PSET_AMP_P] = free_spill;
  	/* E -> E */
-@@ -6444,6 +6498,10 @@ sched_edge_cpu_init_completed(void)
+@@ -6444,6 +6508,10 @@ sched_edge_cpu_init_completed(void)
  				 * values when deciding to enforce performance islands for certain buckets.
  				 */
  #endif /* CONFIG_SCHED_PERF_ISLANDS */
@@ -465,7 +489,7 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
  				sched_edge_config_set(src_pset_id, dst_pset_id, bucket, edge_config);
  				if (edge_config.sce_migration_allowed) {
  					src_pset->max_parallel_cores[bucket] += dst_pset->cpu_set_count;
-@@ -6464,6 +6522,33 @@ sched_edge_cpu_init_completed(void)
+@@ -6464,6 +6532,33 @@ sched_edge_cpu_init_completed(void)
  	splx(s);
  }
  

@@ -158,8 +158,9 @@ static volatile bool loader_keep_replaying;
 static bool
 loader_keep_wanted(const char *line)
 {
+	/* ("dprof: ": the sampling profiler's reports, hakios_prof=NAME -- 6 KB every ten seconds, gone from the ring otherwise) */
 	static const char *const prefixes[] = { "dtouch: ", "dgpu: ", "hakios26: ", "exec: ", "hakios: crash ", "hakios:   x0 ",
-		"hakios:   frame " };
+		"hakios:   frame ", "dprof: " };
 	static unsigned dyld_lines;
 
 	/* boot-arg keep_words="a,b": any line containing one of them (e.g. the wallpaper's: keep_words=oster,allpaper) */
