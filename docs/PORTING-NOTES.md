@@ -190,6 +190,17 @@ Look the equivalents up for your SoC; don't copy them.
     local symbols info at header 0x48, its entries keyed by the image's offset from 0x180000000.
   - davinci finding: CA's render server (`CA::Render::Server::server_thread`) waits long only right after
     unlock. During the benchmark's pauses it is idle, waiting for app commits, so look at the clients.
+- **The Edge scheduler's edges are never set up (`amp=1`).** Apple's kernels call `sched_edge_cpu_init_completed()`
+  through `ml_cpu_init_completed()` from AppleARMSMP; the processors here are registered by GenericARMPE, which
+  doesn't. Every edge stays zero: nothing migrates from the P cluster to E, no idle E core steals, `amp_spill` is
+  never read. waitprof showed it: user-initiated and default threads of SpringBoard and backboardd sat 100 ms to
+  seconds on the A76 queue beside idle A55 cores (40-75 s of thread time per ui_bench window), and widget
+  extensions were killed by chronod's 10 s watchdog having had no CPU (white widgets: `getTimelines` watchdogged,
+  28-31 kills a boot). `amp_edges=1` sets the edges up (only them: the rest of `sched_cpu_init_completed()` wants
+  every core online). Result on davinci: the long waits gone (1 for 115-207), pauses 8-10 s for 9-16 s, kills
+  14-22, but 31-32 fps for 35-38, because foreground work also runs on A55 cores; an idle E cluster is taken
+  before any edge weight is looked at, and `amp_keep` (placement at wake) did not stop it (steal? not found yet).
+  Off by default until that is tuned.
 - **Report flash as flash (`DKIOCISSOLIDSTATE`).** This was the post-unlock freeze, and it was ours. A block
   driver that doesn't answer this ioctl makes spec_vnops.c treat the device as a spinning disk, so low-priority I/O
   is throttled with the slow-disk periods (40-200 ms, windows up to 500 ms) instead of the flash ones (5-25 ms).

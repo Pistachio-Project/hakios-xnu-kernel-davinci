@@ -497,6 +497,11 @@ hakios_amp_start(void)
 	if (!hakios_amp_enabled) {
 		return;
 	}
+	{
+		extern void hakios_sched_edge_edges_init(void);        /* (sched_clutch.c: the P <-> E edges, never set up otherwise) */
+
+		hakios_sched_edge_edges_init();
+	}
 	PE_parse_boot_argn("amp_samp", &samp_ms, sizeof(samp_ms));
 	PE_parse_boot_argn("amp_ktop", &ktop_on, sizeof(ktop_on));
 	PE_parse_boot_argn("amp_ui", &ui_mode, sizeof(ui_mode));

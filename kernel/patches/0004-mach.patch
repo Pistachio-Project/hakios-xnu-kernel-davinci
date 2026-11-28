@@ -403,12 +403,47 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
  
  static cpumap_t sched_edge_p_core_map = 0ULL;
  static cpumap_t sched_edge_non_p_core_map = 0ULL;
-@@ -6353,6 +6377,15 @@ sched_edge_cpu_init_completed(void)
+@@ -5934,6 +5958,8 @@ sched_edge_switch_pset_lock(processor_set_t selected_pset, processor_set_t locke
+ 	}
+ }
+ 
++uint32_t hakios_amp_keep;        /* (boot-arg amp_keep=: buckets that stay on their P cluster; 0 until the edges are set up) */
++
+ /*
+  * sched_edge_migrate_candidate()
+  *
+@@ -6000,6 +6026,15 @@ sched_edge_migrate_candidate(processor_set_t _Nullable preferred_pset, thread_t
+ 		goto migrate_candidate_available_check;
+ 	}
+ 
++	/*
++	 * hakios, amp_keep=: a thread of these buckets is placed on its P cluster whatever the load. (The edge's weight
++	 * alone does not do it: an E cluster with nothing runnable at the thread's level is taken at once, before any
++	 * weight is looked at, as soon as the P cluster's load is not 0.)
++	 */
++	if (((hakios_amp_keep >> thread->th_sched_bucket) & 1) && preferred_pset->pset_type == PSET_AMP_P) {
++		goto migrate_candidate_available_check;
++	}
++
+ 	uint32_t preferred_pset_load = shared_rsrc_thread ? (uint32_t)sched_edge_pset_cluster_shared_rsrc_load(preferred_pset, shared_rsrc_type) : sched_edge_pset_load_metric(preferred_pset, thread->th_sched_bucket);
+ 	if (preferred_pset_load == 0) {
+ 		goto migrate_candidate_available_check;
+@@ -6353,6 +6388,25 @@ sched_edge_cpu_init_completed(void)
  	sched_clutch_edge free_spill = (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 1, .sce_steal_allowed = 1};
  	sched_clutch_edge no_spill = (sched_clutch_edge){.sce_migration_weight = 0, .sce_migration_allowed = 0, .sce_steal_allowed = 0};
  	sched_clutch_edge weighted_spill = (sched_clutch_edge){.sce_migration_weight = 64, .sce_migration_allowed = 1, .sce_steal_allowed = 1};
 +	/* hakios, boot-arg amp_spill=N: the P -> E edge's weight in us (the default 64); 0: nothing of the P cluster's overflow goes to E */
 +	uint32_t amp_spill = 64;
++	/*
++	 * hakios, boot-arg amp_keep=MASK (a bit per bucket: 1 the fixed priorities, 2 FG; default 3): those buckets'
++	 * P -> E edge gets a weight nothing reaches, so the window server's render threads and the foreground's main
++	 * threads stay on the A76 cores while user-initiated, default and lower work spills to the A55 ones. With the
++	 * same weight for all (the stock table) the frames themselves were drawn on A55 cores: 30.7 fps for 38-40.
++	 * (A weight, not "no spill": an edge allowed for a bucket has to be allowed for every bucket above it.)
++	 */
++	uint32_t amp_keep = 3;
++	PE_parse_boot_argn("amp_keep", &amp_keep, sizeof(amp_keep));
++	hakios_amp_keep = amp_keep;
 +	if (PE_parse_boot_argn("amp_spill", &amp_spill, sizeof(amp_spill))) {
 +		if (amp_spill == 0) {
 +			weighted_spill = no_spill;
@@ -419,6 +454,51 @@ diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
  	/* P -> P */
  	edge_config_defaults[PSET_AMP_P][PSET_AMP_P] = free_spill;
  	/* E -> E */
+@@ -6444,6 +6498,10 @@ sched_edge_cpu_init_completed(void)
+ 				 * values when deciding to enforce performance islands for certain buckets.
+ 				 */
+ #endif /* CONFIG_SCHED_PERF_ISLANDS */
++				if ((src_pset->pset_type == PSET_AMP_P) && (dst_pset->pset_type == PSET_AMP_E) && ((amp_keep >> bucket) & 1) &&
++				    edge_config.sce_migration_allowed) {
++					edge_config.sce_migration_weight = 1000000;     /* (hakios, amp_keep=: above) */
++				}
+ 				sched_edge_config_set(src_pset_id, dst_pset_id, bucket, edge_config);
+ 				if (edge_config.sce_migration_allowed) {
+ 					src_pset->max_parallel_cores[bucket] += dst_pset->cpu_set_count;
+@@ -6464,6 +6522,33 @@ sched_edge_cpu_init_completed(void)
+ 	splx(s);
+ }
+ 
++/*
++ * hakios: the edges between the clusters, set up. Apple's kernels reach sched_edge_cpu_init_completed() through
++ * ml_cpu_init_completed(), which AppleARMSMP calls once every processor is registered; the processors here are
++ * registered by GenericARMPE, which does not, so with amp=1 the Edge scheduler ran with every edge zero: nothing
++ * migrated from the P cluster to E and no idle E processor stole from it (waitprof 2026-11-28: default and
++ * user-initiated threads 100 ms to seconds on the A76 queue beside idle A55 cores; widget extensions killed by
++ * their watchdog having had no CPU), and amp_spill= was never read. Only the edges: the rest of
++ * sched_cpu_init_completed() expects every processor of the machine online, and the loader keeps one. Once,
++ * from hakios_amp_start(), with boot-arg amp_edges=1. Not the default yet: on davinci it ended the starving (one
++ * 107 ms stay on a run queue for 115-207 of them in a ui_bench window, the pauses 8-10 s for 9-16 s, fewer widget
++ * extensions killed) but the benchmark's frame rate fell from 35-38 to 31-32 fps, foreground work running on A55
++ * cores whatever amp_keep says (three runs, 2026-11-28, with a BackgroundShortcutRunner busy on 1.7 cores).
++ */
++void hakios_sched_edge_edges_init(void);
++
++void
++hakios_sched_edge_edges_init(void)
++{
++	static bool done;
++	uint32_t on = 0;
++
++	PE_parse_boot_argn("amp_edges", &on, sizeof(on));
++	if (on && !os_atomic_xchg(&done, true, relaxed)) {
++		sched_edge_cpu_init_completed();
++	}
++}
++
+ static bool
+ sched_edge_thread_eligible_for_pset(thread_t thread, processor_set_t pset)
+ {
 diff --git a/osfmk/kern/sched_common.c b/osfmk/kern/sched_common.c
 --- a/osfmk/kern/sched_common.c
 +++ b/osfmk/kern/sched_common.c
